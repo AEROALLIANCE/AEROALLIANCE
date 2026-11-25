@@ -1,0 +1,347 @@
+import { __, sprintf } from "../../lib/i18n";
+import {
+  applyCurrencyPosition,
+  formatYatraMoney,
+} from "../../lib/currency-display";
+import {
+  formatDate as formatGlobalDate,
+  parseDate,
+  toDateValue,
+} from "../../lib/dateFormat";
+
+function toBrowserLocaleTag(
+  locale: string | undefined | null,
+): string | undefined {
+  const raw = String(locale || "").trim();
+  if (!raw) return undefined;
+  // WP locales are often like "en_US"; Intl expects BCP47 like "en-US".
+  return raw.replace(/_/g, "-");
+}
+
+function getAccountLocale(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  const raw = (window as unknown as { yatraAccountPage?: { locale?: string } })
+    .yatraAccountPage?.locale;
+  return toBrowserLocaleTag(raw);
+}
+
+export const formatDate = (value: string | undefined | null) => {
+  if (!value) {
+    return __("N/A", "yatra");
+  }
+
+  // Render public account dates in the operator's configured global date
+  // format (Settings → General) via the shared formatter — not a hardcoded
+  // browser style. It also parses a date-only value (e.g. a booking's
+  // travel_date) in LOCAL time, so it no longer rolls back a day in behind-UTC
+  // timezones (Aug 1 → Jul 31).
+  if (!parseDate(value)) {
+    return __("Invalid date", "yatra");
+  }
+  return formatGlobalDate(value);
+};
+
+/** Leading Y-m-d from API datetime strings for stable range comparison. */
+function extractYmd(value: string | undefined | null): string | null {
+  if (!value) {
+    return null;
+  }
+  const m = String(value)
+    .trim()
+    .match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Format trip window for the account UI: one localized date, or start–end when different.
+ * translators: %1$s: trip start date, %2$s: trip end date (localized).
+ */
+export const formatTravelDateRange = (
+  travelDate?: string | null,
+  endDate?: string | null,
+): string => {
+  const startKey = extractYmd(travelDate);
+  const endKey = extractYmd(endDate);
+  if (!startKey) {
+    return formatDate(travelDate);
+  }
+  if (!endKey || endKey === startKey) {
+    return formatDate(travelDate);
+  }
+  return sprintf(
+    // translators: 1: start date, 2: end date. Joined with an en-dash for travel date ranges.
+    __("%1$s – %2$s", "yatra"),
+    formatDate(travelDate),
+    formatDate(endDate),
+  );
+};
+
+/**
+ * Translate a known booking/payment/ticket status to a localized label.
+ *
+ * The previous account-page code did `__(booking.status, booking.status)` which
+ * mis-uses the textdomain argument: WP's i18n runtime treats the second arg as
+ * the textdomain (defaulting to 'default'), so it never finds the translation
+ * and silently returns the raw English key like 'confirmed'/'pending'. Worse,
+ * because the first argument is a runtime variable, the WP-CLI i18n extractor
+ * skips it — those strings never reach the .pot file and Loco never gets a
+ * chance to translate them.
+ *
+ * Mapping each known status to a static `__('Foo', 'yatra')` call fixes both
+ * problems at once: extractor sees the literals, translators can localize, and
+ * unknown values fall back to a title-cased rendition of the raw key.
+ */
+export const getStatusLabel = (status: string | undefined | null): string => {
+  const raw = typeof status === "string" ? status.toLowerCase().trim() : "";
+  switch (raw) {
+    case "pending":
+      return __("Pending", "yatra");
+    case "confirmed":
+      return __("Confirmed", "yatra");
+    case "processing":
+      return __("Processing", "yatra");
+    case "completed":
+      return __("Completed", "yatra");
+    case "cancelled":
+      return __("Cancelled", "yatra");
+    case "refunded":
+      return __("Refunded", "yatra");
+    case "failed":
+      return __("Failed", "yatra");
+    case "on_hold":
+      return __("On hold", "yatra");
+    case "paid":
+      return __("Paid", "yatra");
+    case "partial":
+      return __("Partial", "yatra");
+    case "awaiting_response":
+      return __("Awaiting response", "yatra");
+    case "resolved":
+      return __("Resolved", "yatra");
+    case "closed":
+      return __("Closed", "yatra");
+    case "open":
+      return __("Open", "yatra");
+    case "":
+      return __("Pending", "yatra");
+    default:
+      // Unknown status — title-case it so admins can see what's coming through.
+      return raw.charAt(0).toUpperCase() + raw.slice(1).replace(/_/g, " ");
+  }
+};
+
+export const getBadge = (status: string | undefined | null) => {
+  const base = "px-2.5 py-0.5 rounded-full text-xs font-medium";
+
+  // Handle undefined/null/empty status
+  if (!status || typeof status !== "string") {
+    return `${base} bg-gray-100 text-gray-800 dark:bg-gray-900/30 dark:text-gray-300`;
+  }
+
+  switch (status.toLowerCase()) {
+    case "paid":
+    case "confirmed":
+    case "resolved":
+      return `${base} bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300`;
+    case "pending":
+    case "partial":
+    case "awaiting_response":
+      return `${base} bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300`;
+    case "failed":
+    case "cancelled":
+      return `${base} bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300`;
+    default:
+      return `${base} bg-yatra-chip-bg text-yatra-primary-darker dark:bg-yatra-surface-dark dark:text-yatra-primary-light`;
+  }
+};
+
+type PriceConfigWindow = Window & {
+  yatraAdmin?: Record<string, unknown>;
+  yatraAccountPage?: Record<string, unknown>;
+};
+
+function readPriceConfig() {
+  if (typeof window === "undefined") {
+    return {
+      globalCurrency: "USD",
+      currencyPosition: "before",
+      decimalPlaces: 2,
+      thousandSeparator: ",",
+      decimalSeparator: ".",
+    };
+  }
+  const w = window as PriceConfigWindow;
+  const a = (w.yatraAdmin || {}) as Record<string, unknown>;
+  const p = (w.yatraAccountPage || {}) as Record<string, unknown>;
+  return {
+    globalCurrency: (a.currency || p.currency || "USD") as string,
+    currencyPosition: (a.currencyPosition ||
+      a.currency_position ||
+      p.currencyPosition ||
+      p.currency_position ||
+      "before") as string,
+    decimalPlaces: Number(a.decimalPlaces ?? p.decimalPlaces ?? 2) || 2,
+    thousandSeparator: (a.thousandSeparator ||
+      p.thousandSeparator ||
+      ",") as string,
+    decimalSeparator: (a.decimalSeparator ||
+      p.decimalSeparator ||
+      ".") as string,
+  };
+}
+
+export const formatPrice = (price: number) => {
+  const {
+    globalCurrency,
+    currencyPosition,
+    decimalPlaces,
+    thousandSeparator,
+    decimalSeparator,
+  } = readPriceConfig();
+
+  if (!price || price === 0) {
+    return __("Contact for pricing", "yatra");
+  }
+
+  const formattedAmount = new Intl.NumberFormat(getAccountLocale(), {
+    minimumFractionDigits: decimalPlaces,
+    maximumFractionDigits: decimalPlaces,
+  })
+    .format(price)
+    .replace(/,/g, "TEMP_THOUSAND")
+    .replace(/\./g, decimalSeparator)
+    .replace(/TEMP_THOUSAND/g, thousandSeparator);
+
+  const currencySymbol = new Intl.NumberFormat(getAccountLocale(), {
+    style: "currency",
+    currency: globalCurrency,
+  })
+    .format(0)
+    .replace(/[\d\s.,]/g, "")
+    .trim();
+
+  return applyCurrencyPosition(
+    formattedAmount,
+    currencySymbol,
+    currencyPosition,
+  );
+};
+
+export const formatPriceForBooking = (price: number, currency?: string) => {
+  const cfg = readPriceConfig();
+  const globalCurrency = currency || cfg.globalCurrency;
+  const {
+    currencyPosition,
+    decimalPlaces,
+    thousandSeparator,
+    decimalSeparator,
+  } = cfg;
+
+  const currencyToUse = globalCurrency;
+
+  // Always format the price, even if 0 - don't show "Contact for pricing" for bookings
+  const numPrice = Number(price) || 0;
+
+  const formattedAmount = new Intl.NumberFormat(getAccountLocale(), {
+    minimumFractionDigits: decimalPlaces,
+    maximumFractionDigits: decimalPlaces,
+  })
+    .format(numPrice)
+    .replace(/,/g, "TEMP_THOUSAND")
+    .replace(/\./g, decimalSeparator)
+    .replace(/TEMP_THOUSAND/g, thousandSeparator);
+
+  const currencySymbol = new Intl.NumberFormat(getAccountLocale(), {
+    style: "currency",
+    currency: currencyToUse,
+  })
+    .format(0)
+    .replace(/[\d\s.,]/g, "")
+    .trim();
+
+  return applyCurrencyPosition(
+    formattedAmount,
+    currencySymbol,
+    currencyPosition,
+  );
+};
+
+export const currency = (value: number, currencyCode?: string) => {
+  const cfg = readPriceConfig();
+  const code = (currencyCode || cfg.globalCurrency || "USD") as string;
+  return formatYatraMoney(Number(value) || 0, code, { zeroAsUnknown: false });
+};
+
+/** Values from `wp_localize_script(…, 'yatraAccountPage', …)` on the account page. */
+export function getYatraAccountPageGlobals(): {
+  logoutUrl: string;
+  companyPhone: string;
+  companyName: string;
+  companyEmail: string;
+  locale: string;
+} {
+  if (typeof window === "undefined") {
+    return {
+      logoutUrl: "",
+      companyPhone: "",
+      companyName: "",
+      companyEmail: "",
+      locale: "",
+    };
+  }
+  const p = (window as unknown as { yatraAccountPage?: Record<string, string> })
+    .yatraAccountPage;
+  const raw = p || {};
+  return {
+    logoutUrl: String(raw.logoutUrl || "").trim(),
+    companyPhone: String(raw.companyPhone || "").trim(),
+    companyName: String(raw.companyName || "").trim(),
+    companyEmail: String(raw.companyEmail || "").trim(),
+    locale: String((raw as any).locale || "").trim(),
+  };
+}
+
+export function phoneToTelHref(phone: string): string {
+  const t = String(phone).trim();
+  if (!t) {
+    return "";
+  }
+  const compact = t.replace(/[^\d+]/g, "");
+  return compact ? `tel:${compact}` : `tel:${encodeURIComponent(t)}`;
+}
+
+/**
+ * Booking statuses that end a booking's life. A booking in one of these is
+ * never an upcoming trip, however far in the future its travel date is.
+ */
+const CLOSED_BOOKING_STATUSES = ["cancelled", "refunded", "failed"];
+
+/**
+ * Is this booking an upcoming trip?
+ *
+ * Travel date today or later, and the booking still live. The count used to
+ * look only at the date, so a cancelled trip kept inflating "Upcoming Trips",
+ * and the Dashboard and Bookings pages disagreed about a trip departing today
+ * because one compared with `>` and the other with `>=`. Both now call this.
+ */
+export function isUpcomingBooking(booking: {
+  travel_date?: string | null;
+  booking_status?: string | null;
+  status?: string | null;
+}): boolean {
+  const status = String(booking.booking_status ?? booking.status ?? "")
+    .trim()
+    .toLowerCase();
+  if (CLOSED_BOOKING_STATUSES.includes(status)) {
+    return false;
+  }
+
+  if (!booking.travel_date) {
+    return false;
+  }
+
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  return toDateValue(booking.travel_date) >= startOfToday;
+}

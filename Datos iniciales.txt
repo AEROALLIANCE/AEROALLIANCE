@@ -1,0 +1,10 @@
+Nombre de la base de datos: aeroalliance
+Nombre de usuario: root
+Contraseña:
+Servidor de la base de datos: localhost
+Prefijo de tabla: aa_
+
+Titulo del sitio: AEROALLIANCE SAS
+Nombre de usuario: aeroalliancesas
+Contraseña: A&A2017sas#27
+correo electronico: aeroalliancesas@gmail.com

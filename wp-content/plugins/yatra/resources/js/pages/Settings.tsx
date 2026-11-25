@@ -1,0 +1,9457 @@
+/**
+ * Settings Page
+ * Comprehensive settings page for trip booking software
+ * Left sidebar navigation + Right side form fields with detailed configurations
+ */
+
+import React, { useState, useEffect, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  Settings as SettingsIcon,
+  Save,
+  Loader2,
+  Building2,
+  Calendar,
+  DollarSign,
+  Mail,
+  MapPin,
+  SlidersHorizontal,
+  Users,
+  Star,
+  Receipt,
+  Globe,
+  Plug,
+  Shield,
+  Info,
+  ChevronDown,
+  GripVertical,
+  ArrowUp,
+  ArrowDown,
+  ClipboardList,
+  Plus,
+  Trash2,
+  Eye,
+  EyeOff,
+  Edit2,
+  Lock,
+  CheckCircle,
+  XCircle,
+  AlertCircle,
+  RefreshCw,
+  ExternalLink,
+  ChevronRight,
+  Check,
+  Image,
+  X,
+  TrendingUp,
+  BarChart3,
+  Palette,
+  Percent,
+} from "lucide-react";
+import { __, sprintf } from "../lib/i18n";
+import { prepareWordPressMediaFrameOpen } from "../lib/wp-media-open";
+import { usePermissions } from "../hooks/usePermissions";
+import { useToast } from "../components/ui/toast";
+import { navigateMenu } from "../hooks/useNavigate";
+import { apiClient, apiService } from "../lib/api-client";
+import {
+  fetchBookingPageShortcodeStatus,
+  fetchPaymentGatewayDefinitions,
+  fetchSettings,
+  fetchWordPressPages,
+  postFlushRewriteRules,
+  postInsertBookingShortcode,
+  saveSettings,
+} from "../api/settings-api";
+import {
+  fetchUsageTrackingStatus,
+  postUsageTrackingSettings,
+  postUsageTrackingSend,
+  type UsageTrackingStatus,
+} from "../api/usage-tracking-api";
+import { Button } from "../components/ui/button";
+import { ProFeature, ProBadge } from "../components/ProFeature";
+import { PremiumUpgradeDialog } from "../components/modules/PremiumUpgradeDialog";
+import { Input } from "../components/ui/input";
+import { Select } from "../components/ui/select";
+import { Label } from "../components/ui/label";
+import { PageHeader } from "../components/common/PageHeader";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardFooter,
+} from "../components/ui/card";
+import { ConditionalRender } from "../components/ui/conditional-render";
+import { ConfirmationDialog } from "../components/ui/confirmation-dialog";
+import {
+  buildYatraAccountViewUrl,
+  buildYatraListingPublicUrl,
+  isWordPressPlainPermalink,
+} from "../lib/frontend-permalink-urls";
+import { getCurrencyOptions } from "../data/currencies";
+import { SearchableSelect } from "../components/ui/searchable-select";
+import { MultiSelect, MultiSelectOption } from "../components/ui/multi-select";
+import type {
+  BookingFormConfig,
+  FormCondition,
+  FormFieldConfig,
+  FormSectionConfig,
+} from "../components/settings/booking-form-types";
+import { BookingFormFieldsEditor } from "../components/settings/BookingFormFieldsEditor";
+import {
+  BookingFormConditionsModal,
+  describeTargets,
+  useConditionTargets,
+} from "../components/settings/BookingFormConditionsModal";
+
+// Multiple Taxes Editor Component
+const MultipleTaxesEditor = React.memo(
+  ({
+    taxes,
+    onChange,
+  }: {
+    taxes: Array<{ name: string; rate: number }>;
+    onChange: (taxes: Array<{ name: string; rate: number }>) => void;
+  }) => {
+    const removeTax = (index: number) => {
+      onChange(taxes.filter((_, i) => i !== index));
+    };
+
+    const updateTax = (
+      index: number,
+      field: "name" | "rate",
+      value: string | number,
+    ) => {
+      const updated = [...taxes];
+      if (field === "rate") {
+        updated[index].rate = parseFloat(value as string) || 0;
+      } else {
+        updated[index].name = value as string;
+      }
+      onChange(updated);
+    };
+
+    return (
+      <div className="space-y-4">
+        {/* Tax Cards */}
+        <div className="space-y-3">
+          {taxes
+            .filter((tax) => tax.name && tax.name.trim() !== "")
+            .map((tax, index) => (
+              <div
+                key={index}
+                className="relative p-4 border rounded-lg bg-gray-50 dark:bg-gray-800 w-full"
+              >
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => removeTax(index)}
+                  className="absolute top-3 right-3 text-red-600 hover:text-red-700 p-2"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </Button>
+
+                <div className="flex items-center gap-3 pr-12">
+                  <div className="flex-1">
+                    <Input
+                      value={tax.name}
+                      onChange={(e) => updateTax(index, "name", e.target.value)}
+                      placeholder={__("Tax name (e.g., VAT, GST)", "yatra")}
+                      className="w-full"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-1">
+                      <Input
+                        type="number"
+                        value={tax.rate}
+                        onChange={(e) =>
+                          updateTax(index, "rate", e.target.value)
+                        }
+                        min="0"
+                        max="100"
+                        step="0.01"
+                        placeholder={__("Rate", "yatra")}
+                        className="w-full"
+                      />
+                      <span className="text-sm text-gray-500 dark:text-gray-400">
+                        %
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+        </div>
+      </div>
+    );
+  },
+);
+
+// Helper component for form field with description - MUST be outside component to prevent remounts
+const FormField = React.memo(
+  ({
+    id,
+    label,
+    description,
+    required = false,
+    actionButton,
+    children,
+  }: {
+    id: string;
+    label: string;
+    description?: React.ReactNode;
+    required?: boolean;
+    actionButton?: React.ReactNode;
+    children: React.ReactNode;
+  }) => (
+    <div className="space-y-2">
+      <Label htmlFor={id} className="flex items-center gap-1.5">
+        {label}
+        {required && <span className="text-red-500">*</span>}
+      </Label>
+      {description && (
+        <p className="text-xs text-gray-500 dark:text-gray-400 flex items-start gap-1.5">
+          <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+          <span className="min-w-0 leading-relaxed">{description}</span>
+        </p>
+      )}
+      {actionButton ? (
+        <div className="flex gap-2">
+          <div className="flex-1">{children}</div>
+          {actionButton}
+        </div>
+      ) : (
+        children
+      )}
+    </div>
+  ),
+);
+FormField.displayName = "FormField";
+
+// Google Calendar Integration Section - inline component to avoid lazy loading issues
+const GoogleCalendarIntegrationSection: React.FC<{
+  formData: SettingsData;
+  setFormData: React.Dispatch<React.SetStateAction<SettingsData | null>>;
+}> = ({ formData, setFormData }) => {
+  const yatraAdmin = (window as any).yatraAdmin || {};
+  const gcSettings = yatraAdmin.googleCalendar || {};
+  const siteUrl = yatraAdmin.siteUrl || "";
+  // Full URL to the dedicated Google Calendar dashboard subpage so the user can
+  // reach it from the UI (not just via the OAuth redirect / a direct link).
+  const gcDashboardUrl = `${yatraAdmin.adminUrl || "admin.php"}?page=yatra&subpage=google-calendar`;
+
+  // Use state from parent formData if available, otherwise use from yatraAdmin
+  const [clientId, setClientId] = useState(
+    formData.google_calendar_client_id || gcSettings.client_id || "",
+  );
+  const [clientSecret, setClientSecret] = useState(
+    formData.google_calendar_client_secret || gcSettings.client_secret || "",
+  );
+  const [calendarId, setCalendarId] = useState(
+    formData.google_calendar_calendar_id || gcSettings.calendar_id || "",
+  );
+  const [calendarName, setCalendarName] = useState(
+    formData.google_calendar_calendar_name || gcSettings.calendar_name || "",
+  );
+  const [connected, setConnected] = useState(
+    formData.google_calendar_connected || gcSettings.connected || false,
+  );
+  // Calendars the connected account can write to, for the picker. Stays empty
+  // (and the picker hidden) on a Yatra Pro without the listing endpoint, so
+  // the Calendar ID field below keeps working as before.
+  const [calendars, setCalendars] = useState<
+    Array<{ id: string; summary: string; primary?: boolean }>
+  >([]);
+
+  useEffect(() => {
+    if (!connected) {
+      setCalendars([]);
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .get("/google-calendar/calendars")
+      .then((response: any) => {
+        if (!cancelled && response?.success && Array.isArray(response.data)) {
+          setCalendars(response.data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setCalendars([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connected]);
+  const [connecting, setConnecting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [savingCalendar, setSavingCalendar] = useState(false);
+  const { showToast } = useToast();
+
+  const redirectUri =
+    yatraAdmin.googleCalendarRedirectUri ||
+    gcSettings.redirect_uri ||
+    `${siteUrl}/wp-json/yatra/v1/google-calendar/callback`;
+  const lastSync =
+    formData.google_calendar_last_sync || gcSettings.last_sync || null;
+
+  // Dynamic mapping of settings to formData
+  const syncSettingsToFormData = () => {
+    // Get all available settings from the backend
+    const allSettings = {
+      google_calendar_client_id: clientId,
+      google_calendar_client_secret: clientSecret,
+      google_calendar_enabled: true, // Enable by default when settings are provided
+      // Persist the target calendar through the MAIN page Save too (the option
+      // name matches what the sync path reads), so the user's natural action —
+      // clicking the page's Save button — keeps the chosen calendar.
+      google_calendar_calendar_id: calendarId,
+      google_calendar_calendar_name: calendarName,
+    };
+
+    // Update formData with all settings
+    setFormData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        ...allSettings,
+      };
+    });
+  };
+
+  // Update formData when any setting changes
+  useEffect(() => {
+    syncSettingsToFormData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId, clientSecret, calendarId, calendarName]);
+
+  const handleConnect = async () => {
+    setConnecting(true);
+    try {
+      const response = await apiClient.post("/google-calendar/connect");
+      if (response.data?.auth_url) {
+        window.open(response.data.auth_url, "_blank");
+      }
+    } catch (error) {
+      console.error("Failed to connect:", error);
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    if (
+      !confirm(
+        __(
+          "Are you sure you want to disconnect from Google Calendar?",
+          "yatra",
+        ),
+      )
+    ) {
+      return;
+    }
+    try {
+      await apiClient.post("/google-calendar/disconnect");
+
+      // Update settings state
+      setConnected(false);
+      setCalendarId("");
+      setCalendarName("");
+      showToast(__("Disconnected from Google Calendar.", "yatra"), "success");
+    } catch (error) {
+      showToast(
+        __("Failed to disconnect. Please try again.", "yatra"),
+        "error",
+      );
+    }
+  };
+
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      const res: any = await apiClient.post("/google-calendar/sync-all");
+      if (res && res.success === false) {
+        showToast(
+          res.message || __("Failed to sync bookings.", "yatra"),
+          "error",
+        );
+      } else {
+        showToast(
+          (res && res.message) ||
+            __("Bookings synced to Google Calendar.", "yatra"),
+          "success",
+        );
+      }
+    } catch (error) {
+      showToast(
+        __("Failed to sync bookings. Please try again.", "yatra"),
+        "error",
+      );
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Persist the target calendar to the Google Calendar module endpoint (the same
+  // store the sync path reads), so the value survives a page reload. A blank
+  // Calendar ID is allowed and resolves to the primary calendar at sync time.
+  const handleSaveCalendar = async () => {
+    setSavingCalendar(true);
+    try {
+      await apiClient.post("/google-calendar/settings", {
+        calendar_id: calendarId.trim(),
+        calendar_name: calendarName.trim(),
+      });
+      showToast(__("Calendar settings saved.", "yatra"), "success");
+    } catch (error) {
+      showToast(
+        __("Failed to save calendar settings. Please try again.", "yatra"),
+        "error",
+      );
+    } finally {
+      setSavingCalendar(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Settings Card */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardTitle className="text-lg flex items-center gap-2">
+            <Calendar className="w-5 h-5 text-blue-500" />
+            {__("Google Calendar Settings", "yatra")}
+          </CardTitle>
+          <div className="flex items-center gap-2">
+            {connected ? (
+              <div className="flex items-center gap-1 text-sm text-green-600 dark:text-green-400">
+                <CheckCircle className="w-4 h-4" />
+                {__("Connected", "yatra")}
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 text-sm text-gray-500 dark:text-gray-400">
+                <XCircle className="w-4 h-4" />
+                {__("Not Connected", "yatra")}
+              </div>
+            )}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            {__(
+              "Connect your Google Calendar to sync your bookings automatically. Each booking gets an event with the trip, date and traveller details, or, with \"One event per departure\" turned on in the Google Calendar dashboard, each departure gets one event listing its bookings.",
+              "yatra",
+            )}
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <FormField
+              id="gc_client_id"
+              label={__("Client ID", "yatra")}
+              description={
+                <>
+                  {__("Create an OAuth client in", "yatra")}{" "}
+                  <a
+                    href="https://console.cloud.google.com/apis/credentials"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline"
+                  >
+                    {__("Google Cloud Credentials", "yatra")}
+                  </a>
+                  {__(", then paste the OAuth 2.0 Client ID here.", "yatra")}{" "}
+                  {__("Example:", "yatra")}{" "}
+                  <code className="font-mono">
+                    123...apps.googleusercontent.com
+                  </code>
+                </>
+              }
+            >
+              <Input
+                id="gc_client_id"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="123456789-xxxxx.apps.googleusercontent.com"
+              />
+            </FormField>
+            <FormField
+              id="gc_client_secret"
+              label={__("Client Secret", "yatra")}
+              description={
+                <>
+                  {__(
+                    "Copy the Client Secret from the same OAuth client in",
+                    "yatra",
+                  )}{" "}
+                  <a
+                    href="https://console.cloud.google.com/apis/credentials"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline"
+                  >
+                    {__("Google Cloud Credentials", "yatra")}
+                  </a>
+                  {__(".", "yatra")} {__("Keep this private.", "yatra")}
+                </>
+              }
+            >
+              <Input
+                id="gc_client_secret"
+                type="password"
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+                placeholder="GOCSPX-xxxxxxxxxxxxxxxxxx"
+              />
+            </FormField>
+          </div>
+
+          <FormField
+            id="gc_redirect_uri"
+            label={__("Redirect URI (OAuth Callback URL)", "yatra")}
+            description={
+              <>
+                {__(
+                  'Add this to your OAuth client under "Authorized redirect URIs" in',
+                  "yatra",
+                )}{" "}
+                <a
+                  href="https://console.cloud.google.com/apis/credentials"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline"
+                >
+                  {__("Google Cloud Credentials", "yatra")}
+                </a>
+                {__(".", "yatra")} {__("Make sure the", "yatra")}{" "}
+                <a
+                  href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline"
+                >
+                  {__("Google Calendar API", "yatra")}
+                </a>{" "}
+                {__("is enabled.", "yatra")}
+              </>
+            }
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                id="gc_redirect_uri"
+                value={redirectUri}
+                readOnly
+                className="bg-gray-50 dark:bg-gray-900 font-mono text-sm"
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigator.clipboard.writeText(redirectUri)}
+              >
+                {__("Copy", "yatra")}
+              </Button>
+            </div>
+          </FormField>
+
+          <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-md">
+            <p className="text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+              <Shield className="w-4 h-4 mt-0.5 flex-shrink-0" />
+              <span className="min-w-0 leading-relaxed">
+                {__(
+                  "OAuth scopes required (add these on the Google OAuth consent screen):",
+                  "yatra",
+                )}{" "}
+                <a
+                  href="https://console.cloud.google.com/apis/credentials/consent"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-amber-900 dark:text-amber-200 underline"
+                >
+                  {__("OAuth Consent Screen", "yatra")}
+                </a>
+              </span>
+            </p>
+            <div className="mt-2 space-y-1">
+              <div className="text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+                <CheckCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <code className="text-[11px] bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">
+                  https://www.googleapis.com/auth/calendar
+                </code>
+              </div>
+              <div className="text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+                <CheckCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                <code className="text-[11px] bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded">
+                  https://www.googleapis.com/auth/calendar.events
+                </code>
+              </div>
+            </div>
+          </div>
+
+          {connected && (
+            <div className="p-4 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-md space-y-4">
+              <h4 className="font-medium text-sm text-green-800 dark:text-green-400 flex items-center gap-2">
+                <CheckCircle className="w-4 h-4" />
+                {__("Connected Calendar", "yatra")}
+              </h4>
+              {calendars.length > 0 && (
+                <FormField
+                  id="gc_calendar_pick"
+                  label={__("Choose a calendar", "yatra")}
+                  description={__(
+                    "Calendars this Google account can add events to. Picking one fills in the Calendar ID below — then click Save Calendar. Run Resync Everything afterwards to move existing events to it.",
+                    "yatra",
+                  )}
+                >
+                  <Select
+                    id="gc_calendar_pick"
+                    value={
+                      calendars.some((c) => c.id === calendarId)
+                        ? calendarId
+                        : calendarId === "" || calendarId === "primary"
+                          ? calendars.find((c) => c.primary)?.id || ""
+                          : ""
+                    }
+                    onChange={(e) => {
+                      const picked = calendars.find(
+                        (c) => c.id === e.target.value,
+                      );
+                      if (picked) {
+                        setCalendarId(picked.id);
+                        setCalendarName(picked.summary || "");
+                      }
+                    }}
+                  >
+                    <option value="">
+                      {__("— Select a calendar —", "yatra")}
+                    </option>
+                    {calendars.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.primary
+                          ? sprintf(__("%s (primary)", "yatra"), c.summary || c.id)
+                          : c.summary || c.id}
+                      </option>
+                    ))}
+                  </Select>
+                </FormField>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:items-end">
+                <FormField
+                  id="gc_calendar_id"
+                  label={__("Calendar ID", "yatra")}
+                  description={__(
+                    'The ID of the Google Calendar to sync events to. Use "primary" for your main calendar, or enter a specific calendar ID.',
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="gc_calendar_id"
+                    value={calendarId}
+                    onChange={(e) => setCalendarId(e.target.value)}
+                    placeholder="primary"
+                  />
+                </FormField>
+                <FormField
+                  id="gc_calendar_name"
+                  label={__("Calendar Name", "yatra")}
+                  description={__(
+                    "A friendly name for this calendar connection (for your reference only).",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="gc_calendar_name"
+                    value={calendarName}
+                    onChange={(e) => setCalendarName(e.target.value)}
+                    placeholder={__("My Booking Calendar", "yatra")}
+                  />
+                </FormField>
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-green-200 dark:border-green-800">
+                <p className="text-xs text-green-700 dark:text-green-400">
+                  {lastSync ? (
+                    <>
+                      {__("Last sync:", "yatra")}{" "}
+                      {new Date(lastSync).toLocaleString()}
+                    </>
+                  ) : (
+                    __("Never synced", "yatra")
+                  )}
+                </p>
+                <div className="flex items-center gap-2">
+                  <a
+                    href={gcDashboardUrl}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-green-300 dark:border-green-700 text-green-800 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/40"
+                  >
+                    <Calendar className="w-4 h-4" />
+                    {__("Open dashboard", "yatra")}
+                  </a>
+                  <Button
+                    size="sm"
+                    onClick={handleSaveCalendar}
+                    disabled={savingCalendar}
+                    className="flex items-center gap-2"
+                  >
+                    {savingCalendar ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <CheckCircle className="w-4 h-4" />
+                    )}
+                    {__("Save Calendar", "yatra")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleSync}
+                    disabled={syncing}
+                    className="flex items-center gap-2"
+                  >
+                    <RefreshCw
+                      className={`w-4 h-4 ${syncing ? "animate-spin" : ""}`}
+                    />
+                    {__("Sync Now", "yatra")}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="flex flex-wrap justify-between items-center gap-3 mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <div className="flex flex-wrap gap-3">
+              <a
+                href={gcDashboardUrl}
+                className="flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 text-sm font-medium"
+              >
+                <Calendar className="w-3.5 h-3.5" />
+                {__("Open Google Calendar dashboard", "yatra")}
+              </a>
+              <a
+                href="https://console.cloud.google.com/apis/credentials"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 text-sm"
+              >
+                <ExternalLink className="w-3 h-3" />
+                {__("Credentials", "yatra")}
+              </a>
+              <a
+                href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 text-sm"
+              >
+                <ExternalLink className="w-3 h-3" />
+                {__("Calendar API", "yatra")}
+              </a>
+              <a
+                href="https://console.cloud.google.com/apis/credentials/consent"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-blue-600 hover:text-blue-500 dark:text-blue-400 text-sm"
+              >
+                <ExternalLink className="w-3 h-3" />
+                {__("OAuth Consent", "yatra")}
+              </a>
+            </div>
+
+            {connected ? (
+              <Button
+                variant="destructive"
+                onClick={handleDisconnect}
+                className="flex items-center gap-2"
+              >
+                <XCircle className="w-4 h-4" />
+                {__("Disconnect", "yatra")}
+              </Button>
+            ) : (
+              <Button
+                onClick={handleConnect}
+                disabled={connecting || !clientId || !clientSecret}
+                className="flex items-center gap-2"
+              >
+                {connecting ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Calendar className="w-4 h-4" />
+                )}
+                {__("Connect to Google Calendar", "yatra")}
+              </Button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+};
+
+type SettingsSection =
+  | "general"
+  | "design"
+  | "booking"
+  | "booking_form"
+  | "payment"
+  | "pricing"
+  | "trip"
+  | "search"
+  | "customer"
+  | "review"
+  | "tax"
+  | "currency"
+  | "integration"
+  | "permalink"
+  | "seo"
+  | "advanced"
+  | "uninstall";
+
+// Form Builder Types
+// Booking form builder types live in components/settings/booking-form-types.ts
+// (shared with the per-trip Conditions popup).
+interface PaymentGatewayConfig {
+  enabled: boolean;
+  icon?: string;
+  title?: string;
+  description?: string;
+  [key: string]: any;
+}
+
+interface GatewayField {
+  id: string;
+  type: string;
+  label: string;
+  description?: string;
+  placeholder?: string;
+  default?: any;
+  options?: Record<string, string>;
+  condition?: string;
+  show_when?: Record<string, string>; // Conditional display based on other field values
+  min?: number;
+  max?: number;
+  readonly?: boolean;
+  help_text?: string;
+  help_url?: string;
+  help_url_test?: string;
+  help_url_live?: string;
+}
+
+interface GatewayDefinition {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  sandbox_url?: string;
+  is_offline: boolean;
+  supports: string[];
+  fields: GatewayField[];
+  config: PaymentGatewayConfig;
+  enabled: boolean;
+  is_premium?: boolean;
+  requires_pro?: boolean;
+}
+
+interface SettingsData {
+  // General Settings
+  company_name: string;
+  company_email: string;
+  company_phone: string;
+  company_address: string;
+  company_city: string;
+  company_state: string;
+  company_country: string;
+  company_zip: string;
+  company_website: string;
+  company_logo: string;
+  timezone: string;
+  date_format: string;
+  time_format: string;
+  /** Hex brand color for public trip/booking/listing UI (buttons, links, accents) */
+  frontend_primary_color: string;
+  /** CSS max width for Yatra containers; empty = follow theme / theme.json */
+  frontend_container_max_width: string;
+  /** Trip listing card density: "standard" | "compact_mobile" | "compact_all" */
+  frontend_listing_card_layout: string;
+
+  // Google Calendar Settings
+  google_calendar_client_id?: string;
+  google_calendar_client_secret?: string;
+  google_calendar_calendar_id?: string;
+  google_calendar_calendar_name?: string;
+  google_calendar_connected?: boolean;
+  google_calendar_last_sync?: string | null;
+  google_calendar_enabled?: boolean;
+
+  // Search & Listing storefront UX
+  search_show_keyword: boolean;
+  search_show_destination: boolean;
+  search_show_activities: boolean;
+  search_show_duration: boolean;
+  search_show_budget: boolean;
+  search_show_date: boolean;
+  collapse_filters_on_mobile: boolean;
+
+  // Booking Settings
+  booking_confirmation: boolean;
+  auto_confirm_bookings: boolean;
+  auto_confirm_mode: "none" | "online" | "all";
+  pending_payment_email: "confirmation" | "after_payment";
+  require_login: boolean;
+  allow_guest_checkout: boolean;
+  require_guest_email_verification: boolean;
+  booking_expiry_hours: number;
+  booking_reminder_days: number;
+  allow_waitlist: boolean;
+  waitlist_auto_confirm: boolean;
+  date_picker_as_dropdown: boolean;
+
+  // Payment Settings
+  currency: string;
+  payment_test_mode: boolean;
+  payment_gateways: string[];
+  payment_methods: string[];
+  partial_payment: boolean;
+  partial_payment_percentage: number;
+  deposit_required: boolean;
+  deposit_percentage: number;
+  auto_confirm_pay_later: boolean;
+  enable_scheduled_payments: boolean;
+  scheduled_payment_type: string;
+  scheduled_payment_days: number;
+  scheduled_payment_installments: number;
+  scheduled_payment_interval: number;
+  scheduled_payment_reminder_days: number;
+  balance_anchor: string;
+  balance_due_days: number;
+  gateway_configs: Record<string, PaymentGatewayConfig>;
+  gateway_order?: string[];
+
+  // Pricing Settings
+  // Controls how Advanced Discount + Dynamic Pricing combine on the same
+  // booking. Surfaced in Settings → Pricing only when BOTH modules are
+  // enabled; backend enforcement is also gated by both modules being on,
+  // so a stale 'discount_only' value on a site that disabled DP is inert.
+  discount_stacking_mode?:
+    | "both"
+    | "discount_only"
+    | "dynamic_pricing_only"
+    | "best_for_customer";
+
+  // Email Settings
+  admin_email: string;
+  from_email: string;
+  from_name: string;
+  email_template_booking: boolean;
+  email_template_confirmation: boolean;
+  email_template_cancellation: boolean;
+  email_template_reminder: boolean;
+  email_template_admin_new_booking: boolean;
+  email_template_admin_payment: boolean;
+  email_template_admin_cancellation: boolean;
+  email_template_trip_consent: boolean;
+  email_template_customer_verification: boolean;
+  email_template_guest_verification: boolean;
+  email_template_booking_completed: boolean;
+  email_template_booking_expired_customer: boolean;
+  email_template_admin_booking_expired: boolean;
+  email_template_scheduled_payment_reminder: boolean;
+  email_template_scheduled_payment_succeeded: boolean;
+  email_template_scheduled_payment_failed: boolean;
+  email_template_admin_scheduled_payment_failed: boolean;
+  email_template_enquiry_received: boolean;
+  email_template_enquiry_admin: boolean;
+  email_template_enquiry_response: boolean;
+  email_template_review_request: boolean;
+  email_template_abandoned_booking_recovery_first: boolean;
+  email_template_abandoned_booking_recovery_second: boolean;
+  email_template_abandoned_booking_recovery_final: boolean;
+  smtp_enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  smtp_password: string;
+  smtp_encryption: string;
+
+  email_tpl_booking_subject: string;
+  email_tpl_booking_body: string;
+  email_tpl_payment_subject: string;
+  email_tpl_payment_body: string;
+  email_tpl_cancellation_subject: string;
+  email_tpl_cancellation_body: string;
+  email_tpl_reminder_subject: string;
+  email_tpl_reminder_body: string;
+  email_tpl_admin_booking_subject: string;
+  email_tpl_admin_booking_body: string;
+  email_tpl_admin_payment_subject: string;
+  email_tpl_admin_payment_body: string;
+  email_tpl_admin_cancellation_subject: string;
+  email_tpl_admin_cancellation_body: string;
+  email_tpl_trip_consent_subject: string;
+  email_tpl_trip_consent_body: string;
+  email_tpl_customer_verification_subject: string;
+  email_tpl_customer_verification_body: string;
+  email_tpl_guest_verification_subject: string;
+  email_tpl_guest_verification_body: string;
+  email_tpl_booking_completed_subject: string;
+  email_tpl_booking_completed_body: string;
+  email_tpl_booking_expired_customer_subject: string;
+  email_tpl_booking_expired_customer_body: string;
+  email_tpl_admin_booking_expired_subject: string;
+  email_tpl_admin_booking_expired_body: string;
+  email_tpl_scheduled_payment_reminder_subject: string;
+  email_tpl_scheduled_payment_reminder_body: string;
+  email_tpl_scheduled_payment_succeeded_subject: string;
+  email_tpl_scheduled_payment_succeeded_body: string;
+  email_tpl_scheduled_payment_failed_subject: string;
+  email_tpl_scheduled_payment_failed_body: string;
+  email_tpl_admin_scheduled_payment_failed_subject: string;
+  email_tpl_admin_scheduled_payment_failed_body: string;
+  email_tpl_enquiry_received_subject: string;
+  email_tpl_enquiry_received_body: string;
+  email_tpl_enquiry_admin_subject: string;
+  email_tpl_enquiry_admin_body: string;
+  email_tpl_enquiry_response_subject: string;
+  email_tpl_enquiry_response_body: string;
+  email_tpl_review_request_subject: string;
+  email_tpl_review_request_body: string;
+  email_tpl_abandoned_booking_recovery_first_subject: string;
+  email_tpl_abandoned_booking_recovery_first_body: string;
+  email_tpl_abandoned_booking_recovery_second_subject: string;
+  email_tpl_abandoned_booking_recovery_second_body: string;
+  email_tpl_abandoned_booking_recovery_final_subject: string;
+  email_tpl_abandoned_booking_recovery_final_body: string;
+
+  // Customer Settings
+  customer_registration: boolean;
+  customer_fields: string[];
+  require_email_verification: boolean;
+  customer_account_page: string;
+  allow_customer_reviews: boolean;
+  customer_dashboard_enabled: boolean;
+  /** Wishlist / saved trips (Yatra Pro); toggled in Customer settings */
+  enable_wishlist?: boolean;
+  /** Keep sold-out departure dates visible on the storefront (default true) */
+  show_sold_out?: boolean;
+  /** How many months ahead customers can see and book (1–36, default 12) */
+  availability_horizon_months?: number;
+
+  // Review Settings
+  enable_reviews: boolean;
+  require_booking: boolean;
+  auto_approve_reviews: boolean;
+  review_moderation: boolean;
+  min_rating: number;
+  allow_anonymous_reviews: boolean;
+  review_reminder_days: number;
+  review_reminder_max_age_days: number;
+
+  // Tax Settings
+  enable_tax: boolean;
+  tax_name: string;
+  tax_rate: number;
+  tax_inclusive: boolean;
+  vat_number: string;
+  tax_by_country: boolean;
+  tax_rates: Record<string, number>;
+  multiple_taxes_enabled: boolean;
+  multiple_taxes: Array<{ name: string; rate: number }>;
+  multiple_taxes_by_country: Record<
+    string,
+    Array<{ name: string; rate: number }>
+  >;
+
+  // Currency Settings
+  default_currency: string;
+  multi_currency: boolean;
+  currency_position: string;
+  currency_decimals: number;
+  thousand_separator: string;
+  decimal_separator: string;
+
+  // Notification Settings (SMS; booking emails use Email → Templates)
+  sms_notifications: boolean;
+  sms_provider: string;
+  sms_api_key: string;
+
+  // Integration Settings
+  google_analytics: string;
+  facebook_pixel: string;
+  recaptcha_enabled: boolean;
+  recaptcha_site_key: string;
+  recaptcha_secret_key: string;
+  recaptcha_score_threshold: number;
+  recaptcha_protect_enquiry: boolean;
+  recaptcha_protect_booking: boolean;
+  recaptcha_protect_registration: boolean;
+
+  // Mailchimp Integration (Pro)
+  mailchimp_api_key?: string;
+  mailchimp_list_id?: string;
+  mailchimp_list_name?: string;
+  mailchimp_sync_on_booking?: boolean;
+  mailchimp_sync_on_payment?: boolean;
+  mailchimp_double_optin?: boolean;
+  mailchimp_add_tags?: boolean;
+  mailchimp_default_tags?: string[];
+  mailchimp_field_mapping?: Record<string, string>;
+
+  // Facebook Pixel Enhanced (Pro)
+  facebook_pixel_id?: string;
+  fb_track_view_content?: boolean;
+  fb_track_initiate_checkout?: boolean;
+  fb_track_purchase?: boolean;
+  fb_track_add_to_cart?: boolean;
+  fb_use_conversions_api?: boolean;
+  facebook_access_token?: string;
+  fb_test_event_code?: string;
+  fb_event_config?: Record<
+    string,
+    { enabled: boolean; custom_params?: string[] }
+  >;
+  fb_parameter_mapping?: Record<string, string>;
+
+  // Google Analytics 4 Enhanced (Pro)
+  ga4_measurement_id?: string;
+  ga4_track_view_item?: boolean;
+  ga4_track_add_to_cart?: boolean;
+  ga4_track_begin_checkout?: boolean;
+  ga4_track_purchase?: boolean;
+  ga4_use_measurement_protocol?: boolean;
+  ga4_require_consent?: boolean;
+  ga4_api_secret?: string;
+  ga4_debug_mode?: boolean;
+  ga4_custom_dimensions?: Array<{
+    name: string;
+    yatra_field: string;
+    scope?: string;
+  }>;
+  ga4_event_config?: Record<
+    string,
+    { enabled: boolean; custom_params?: string[] }
+  >;
+
+  // Permalink Settings
+  trip_base: string;
+  destination_base: string;
+  activity_base: string;
+  trip_category_base: string;
+  booking_base: string;
+
+  // Booking Page Settings
+  use_booking_page: boolean;
+  booking_page_id: number;
+  terms_page_id: number;
+  privacy_policy_page_id: number;
+
+  // Advanced Settings
+  debug_mode: boolean;
+  enable_logging: boolean;
+  delete_data_on_uninstall: boolean;
+  cache_enabled: boolean;
+  api_key: string;
+  api_rate_limit: number;
+  session_timeout: number;
+
+  // Booking Form Builder
+  booking_form_config: BookingFormConfig;
+
+  // SEO Settings
+  seo_trip_meta_title: string;
+  seo_trip_meta_description: string;
+  seo_trip_meta_keywords: string;
+  seo_trip_meta_image: number;
+  enable_sitemap: boolean;
+  sitemap_types: string[];
+  sitemap_noindex_excluded: boolean;
+}
+
+// Form Builder Component
+type BookingFormSubTab =
+  | "contact_form"
+  | "emergency_contact_form"
+  | "traveler_form";
+
+interface BookingFormBuilderProps {
+  formData: SettingsData;
+  setFormData: React.Dispatch<React.SetStateAction<SettingsData | null>>;
+}
+
+// Get initial sub-tab from localStorage
+const getInitialFormSubTab = (): BookingFormSubTab => {
+  if (typeof window !== "undefined") {
+    const saved = localStorage.getItem("yatra_settings_booking_form_subtab");
+    if (
+      saved &&
+      ["contact_form", "emergency_contact_form", "traveler_form"].includes(
+        saved,
+      )
+    ) {
+      return saved as BookingFormSubTab;
+    }
+  }
+  return "contact_form";
+};
+
+const BookingFormBuilder: React.FC<BookingFormBuilderProps> = ({
+  formData,
+  setFormData,
+}) => {
+  const [activeFormTab, setActiveFormTab] =
+    useState<BookingFormSubTab>(getInitialFormSubTab);
+
+  // Check if Dynamic Form Field module is enabled via modules API.
+  // NOTE: the key must differ from useModulesQuery()'s ["modules"] — this
+  // query caches the RAW { success, data } envelope, and the Modules page
+  // reads the same cache entry expecting a plain array. Sharing the key made
+  // Modules crash with "modules.forEach is not a function" after visiting
+  // Settings → Booking Form. The "modules" prefix keeps it invalidated by the
+  // module toggles.
+  const { data: modulesData } = useQuery({
+    queryKey: ["modules", "raw-envelope"],
+    queryFn: async () => {
+      const response = await apiService.getModules();
+      return response;
+    },
+    staleTime: 30000, // Cache for 30 seconds
+  });
+
+  // Check if module is enabled from API response or fallback to yatraAdmin
+  const isDynamicFormFieldEnabled = React.useMemo(() => {
+    if (modulesData?.data) {
+      const module = modulesData.data.find(
+        (m: any) => m.slug === "dynamic_form_field",
+      );
+      return module?.enabled === true && module?.is_available === true;
+    }
+    // Fallback to yatraAdmin if modules API hasn't loaded yet.
+    // Truthy check (not `=== true`) because wp_localize_script
+    // serialises every scalar to a string before exposing it to JS —
+    // true becomes "1", false becomes "". Same gotcha that bit the
+    // Discount Stacking tab visibility earlier this session.
+    return !!window.yatraAdmin?.dynamicFormFieldEnabled;
+  }, [modulesData]);
+
+  // Per-trip "Conditions" popup for the active form. Needs the module on AND a
+  // Pro build that resolves conditions at checkout (older Pro builds set the
+  // module flag but not this one — offering the popup there would save rules
+  // that never apply). Target names (trips / categories) are only fetched when
+  // there is something to label.
+  const conditionsSupported =
+    isDynamicFormFieldEnabled &&
+    !!window.yatraAdmin?.bookingFormConditionsEnabled;
+  const [conditionsOpen, setConditionsOpen] = useState(false);
+  const hasAnyConditions = React.useMemo(() => {
+    const cfg = formData?.booking_form_config;
+    return !!cfg && Object.values(cfg).some(
+      (s: any) => Array.isArray(s?.conditions) && s.conditions.length > 0,
+    );
+  }, [formData?.booking_form_config]);
+  const { options: conditionTargetOptions } = useConditionTargets(
+    conditionsSupported && hasAnyConditions,
+  );
+
+  // Save sub-tab to localStorage when it changes
+  const handleSubTabChange = (tab: BookingFormSubTab) => {
+    setActiveFormTab(tab);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("yatra_settings_booking_form_subtab", tab);
+    }
+  };
+  // Traveler-section "Applies to" choices (only shown on the Traveler tab).
+  const appliesToOptions: { value: "all" | "lead"; label: string }[] = [
+    { value: "all", label: __("All travelers", "yatra") },
+    { value: "lead", label: __("Lead traveler only", "yatra") },
+  ];
+
+
+  const formTabs = [
+    {
+      id: "contact_form" as const,
+      label: __("Contact Form", "yatra"),
+      description: "Lead traveler contact details",
+    },
+    {
+      id: "emergency_contact_form" as const,
+      label: __("Emergency Contact", "yatra"),
+      description: "Emergency contact information",
+    },
+    {
+      id: "traveler_form" as const,
+      label: __("Traveler Form", "yatra"),
+      description: "Individual traveler details",
+    },
+  ];
+
+  const fieldTypes = [
+    { value: "text", label: __("Text", "yatra") },
+    { value: "email", label: __("Email", "yatra") },
+    { value: "tel", label: __("Phone", "yatra") },
+    { value: "date", label: __("Date", "yatra") },
+    { value: "select", label: __("Dropdown", "yatra") },
+    { value: "country", label: __("Country Selector", "yatra") },
+    { value: "textarea", label: __("Text Area", "yatra") },
+    { value: "number", label: __("Number", "yatra") },
+    { value: "checkbox", label: __("Checkbox", "yatra") },
+    { value: "text_block", label: __("Text Block (display only)", "yatra") },
+  ];
+
+  const widthOptions = [
+    { value: "full", label: "Full Width" },
+    { value: "half", label: "Half Width" },
+    { value: "third", label: "One Third" },
+  ];
+
+  const getCurrentFormConfig = () => {
+    return (
+      formData?.booking_form_config?.[activeFormTab] || {
+        title: "",
+        description: "",
+        enabled: true,
+        fields: [],
+      }
+    );
+  };
+
+  // Booking confirmation, the customer account and the voucher all need an email.
+  // Warn the operator when neither the Contact nor the Traveler form will capture
+  // one (section disabled, or its email field disabled) — checkout enforces the
+  // same rule (lead-traveler email is used as a fallback when Contact is off).
+  const bookingFormCapturesEmail = (() => {
+    const cfg = formData?.booking_form_config;
+    if (!cfg) return true;
+    const sectionHasEnabledEmail = (section?: FormSectionConfig): boolean => {
+      if (!section || section.enabled === false) return false;
+      return (section.fields || []).some(
+        (f) => (f.type === "email" || f.id === "email") && f.enabled !== false,
+      );
+    };
+    return (
+      sectionHasEnabledEmail(cfg.contact_form) ||
+      sectionHasEnabledEmail(cfg.traveler_form)
+    );
+  })();
+
+  const updateFormConfig = (updates: Partial<FormSectionConfig>) => {
+    setFormData((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        booking_form_config: {
+          ...prev.booking_form_config,
+          [activeFormTab]: {
+            ...prev.booking_form_config[activeFormTab],
+            ...updates,
+          },
+        },
+      };
+    });
+  };
+
+
+  const currentConfig = getCurrentFormConfig();
+
+  return (
+    <div className="space-y-6">
+      <ProFeature
+        title={__("Dynamic Form Field", "yatra")}
+        description={__(
+          "customize your booking forms with drag-and-drop field builder",
+          "yatra",
+        )}
+        moduleName="Dynamic Form Field"
+        pricingUrl="https://wpyatra.com/pricing?module=dynamic-form-field"
+        isProActive={(window as any).yatraAdmin?.isPro}
+        isModuleEnabled={isDynamicFormFieldEnabled}
+      >
+        {/* Form Type Tabs */}
+        <div className="border-b border-gray-200 dark:border-gray-700">
+          <nav className="flex gap-4" aria-label="Form Types">
+            {formTabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => handleSubTabChange(tab.id)}
+                className={`pb-3 px-1 border-b-2 font-medium text-sm transition-colors ${
+                  activeFormTab === tab.id
+                    ? "border-blue-500 text-blue-600 dark:text-blue-400"
+                    : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300 dark:text-gray-400 dark:hover:text-gray-300"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </nav>
+        </div>
+
+        {/* No-email warning — booking confirmation/account/voucher all need one */}
+        {!bookingFormCapturesEmail && (
+          <div className="flex items-start gap-2 p-3 rounded-md border border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-300">
+            <span className="font-semibold">⚠</span>
+            <span>
+              {__(
+                "No form is set to collect an email address. An email is required for booking confirmation, the customer account and the voucher. Please enable an email field on the Contact or Traveler form — otherwise customers can't complete checkout.",
+                "yatra",
+              )}
+            </span>
+          </div>
+        )}
+
+        {/* Form Section Settings */}
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle className="text-base">
+                {__("Form Section Settings", "yatra")}
+              </CardTitle>
+              {conditionsSupported && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConditionsOpen(true)}
+                  className="border-purple-300 text-purple-700 hover:bg-purple-50 dark:border-purple-700 dark:text-purple-300 dark:hover:bg-purple-900/20"
+                  title={__(
+                    "Give some trips their own version of this form",
+                    "yatra",
+                  )}
+                  data-testid="open-conditions"
+                >
+                  <SlidersHorizontal className="w-4 h-4 mr-1.5" />
+                  {__("Conditions", "yatra")}
+                  {(currentConfig.conditions?.length ?? 0) > 0 && (
+                    <span className="ml-1.5 text-[11px] px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300 font-semibold">
+                      {currentConfig.conditions?.length}
+                    </span>
+                  )}
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+              <input
+                type="checkbox"
+                id="form_section_enabled"
+                checked={currentConfig.enabled !== false}
+                onChange={(e) =>
+                  updateFormConfig({ enabled: e.target.checked })
+                }
+                className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              <Label
+                htmlFor="form_section_enabled"
+                className="font-medium cursor-pointer"
+              >
+                {__("Enable this form section", "yatra")}
+              </Label>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="form_title">
+                  {__("Section Title", "yatra")}
+                </Label>
+                <Input
+                  id="form_title"
+                  value={currentConfig.title || ""}
+                  onChange={(e) => updateFormConfig({ title: e.target.value })}
+                  placeholder="Enter section title"
+                  className="mt-1"
+                />
+              </div>
+              <div>
+                <Label htmlFor="form_description">
+                  {__("Section Description", "yatra")}
+                </Label>
+                <Input
+                  id="form_description"
+                  value={currentConfig.description || ""}
+                  onChange={(e) =>
+                    updateFormConfig({ description: e.target.value })
+                  }
+                  placeholder="Enter description"
+                  className="mt-1"
+                />
+              </div>
+            </div>
+
+            {/* Per-trip conditions summary (Pro) */}
+            {conditionsSupported &&
+              (currentConfig.conditions?.length ?? 0) > 0 && (
+                <div className="space-y-2" data-testid="conditions-summary">
+                  {currentConfig.conditions?.map((c, i) => (
+                    <div
+                      key={c.id || i}
+                      className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-md border border-dashed border-gray-300 dark:border-gray-600 text-sm"
+                    >
+                      <span className="text-gray-500">{__("On", "yatra")}</span>
+                      <span className="font-medium">
+                        {describeTargets(c.targets, conditionTargetOptions) ||
+                          __("(no trips selected)", "yatra")}
+                      </span>
+                      <span className="text-gray-500">
+                        {sprintf(
+                          __("→ “%1$s” · %2$d fields", "yatra"),
+                          c.title,
+                          c.fields.filter((f) => f.enabled !== false).length,
+                        )}
+                      </span>
+                      <span className="flex-1" />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setConditionsOpen(true)}
+                      >
+                        {__("Edit", "yatra")}
+                      </Button>
+                    </div>
+                  ))}
+                  <div className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-md bg-gray-50 dark:bg-gray-800 text-sm">
+                    <span className="font-medium">
+                      {__("All other trips", "yatra")}
+                    </span>
+                    <span className="text-gray-500">
+                      {__("use this form (below)", "yatra")}
+                    </span>
+                  </div>
+                </div>
+              )}
+          </CardContent>
+        </Card>
+
+        {conditionsSupported && (
+          <BookingFormConditionsModal
+            isOpen={conditionsOpen}
+            onClose={() => setConditionsOpen(false)}
+            formType={activeFormTab}
+            formLabel={
+              formTabs.find((t) => t.id === activeFormTab)?.label || ""
+            }
+            section={currentConfig}
+            onSave={(conditions) =>
+              updateFormConfig({
+                conditions: conditions.length > 0 ? conditions : undefined,
+              })
+            }
+            fieldTypes={fieldTypes}
+            widthOptions={widthOptions}
+            appliesToOptions={appliesToOptions}
+          />
+        )}
+
+        {/* Form Fields — shared builder (also used by the Conditions popup) */}
+        <BookingFormFieldsEditor
+          formType={activeFormTab}
+          fields={currentConfig.fields}
+          onChange={(fields) => updateFormConfig({ fields })}
+          fieldTypes={fieldTypes}
+          widthOptions={widthOptions}
+          appliesToOptions={appliesToOptions}
+        />
+
+
+        {/* Preview */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">
+              {__("Preview", "yatra")}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
+              <h3 className="font-semibold text-lg mb-1">
+                {currentConfig.title || "Form Section"}
+              </h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+                {currentConfig.description}
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                {currentConfig.fields
+                  ?.filter((f) => f.enabled)
+                  .map((field) => (
+                    <div
+                      key={field.id}
+                      className={
+                        field.width === "full"
+                          ? "col-span-2"
+                          : field.width === "third"
+                            ? "col-span-1"
+                            : "col-span-1"
+                      }
+                    >
+                      {field.type === "text_block" ? (
+                        <div className="yatra-form-text-block text-sm text-gray-600 dark:text-gray-300 whitespace-pre-line">
+                          {(field.content || "").replace(/<[^>]*>/g, "")}
+                        </div>
+                      ) : (
+                        <>
+                          <Label className="text-sm">
+                            {field.label}
+                            {field.required && (
+                              <span className="text-red-500 ml-1">*</span>
+                            )}
+                          </Label>
+                          {field.type === "select" ||
+                          field.type === "country" ? (
+                            <Select disabled className="mt-1 w-full">
+                              <option>
+                                {field.placeholder || "Select..."}
+                              </option>
+                            </Select>
+                          ) : field.type === "textarea" ? (
+                            <textarea
+                              disabled
+                              placeholder={field.placeholder}
+                              className="mt-1 w-full px-3 py-2 border border-gray-300 rounded-md bg-white dark:bg-gray-700 text-sm"
+                              rows={2}
+                            />
+                          ) : (
+                            <Input
+                              disabled
+                              type={field.type}
+                              placeholder={field.placeholder}
+                              className="mt-1"
+                            />
+                          )}
+                        </>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </ProFeature>
+    </div>
+  );
+};
+
+const Settings: React.FC = () => {
+  const queryClient = useQueryClient();
+  const { can } = usePermissions();
+  const { showToast } = useToast();
+
+  // Get active section from localStorage or default to 'general'
+  const getInitialActiveSection = (): SettingsSection => {
+    const VALID_SECTIONS = [
+      "general",
+      "design",
+      "booking",
+      "booking_form",
+      "payment",
+      "trip",
+      "customer",
+      "review",
+      "tax",
+      "currency",
+      "integration",
+      "permalink",
+      "seo",
+      "advanced",
+      "uninstall",
+    ];
+    if (typeof window !== "undefined") {
+      // Allow deep-linking a section via ?section=… (e.g. the Google Calendar
+      // dashboard's "Back to Settings → Integration" link).
+      const fromUrl = new URLSearchParams(window.location.search).get(
+        "section",
+      );
+      if (fromUrl && VALID_SECTIONS.includes(fromUrl)) {
+        return fromUrl as SettingsSection;
+      }
+      const saved = localStorage.getItem("yatra_settings_active_section");
+      if (saved === "email" || saved === "notification") {
+        return "general";
+      }
+      if (
+        saved &&
+        [
+          "general",
+          "design",
+          "booking",
+          "booking_form",
+          "payment",
+          "trip",
+          "customer",
+          "review",
+          "tax",
+          "currency",
+          "integration",
+          "permalink",
+          "seo",
+          "advanced",
+          "uninstall",
+        ].includes(saved)
+      ) {
+        return saved as SettingsSection;
+      }
+    }
+    return "general";
+  };
+
+  const [activeSection, setActiveSection] = useState<SettingsSection>(
+    getInitialActiveSection(),
+  );
+  // Temporary viewing section that changes on tab click, but only becomes activeSection on save
+  const [viewingSection, setViewingSection] = useState<SettingsSection>(
+    getInitialActiveSection(),
+  );
+  const [isSaving, setIsSaving] = useState(false);
+  const [expandedGateways, setExpandedGateways] = useState<
+    Record<string, boolean>
+  >({});
+  const [gatewayOrder, setGatewayOrder] = useState<string[]>([]);
+  const [draggedGateway, setDraggedGateway] = useState<string | null>(null);
+  const [usageStatus, setUsageStatus] = useState<UsageTrackingStatus | null>(
+    null,
+  );
+  const [usageBusy, setUsageBusy] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState<string>("");
+
+  // Initialize viewingSection from activeSection on mount
+  useEffect(() => {
+    setViewingSection(activeSection);
+  }, [activeSection]);
+
+  // Fetch settings
+  const {
+    data: settings,
+    isLoading,
+    error,
+  } = useQuery({
+    queryKey: ["settings"],
+    queryFn: async () => {
+      try {
+        return await fetchSettings();
+      } catch (error: any) {
+        console.error("Error fetching settings:", error);
+        showToast(
+          error?.message || __("Failed to load settings", "yatra"),
+          "error",
+        );
+        throw error;
+      }
+    },
+    enabled: can("yatra_manage_settings"),
+    // Avoid overwriting in-progress edits due to background refetches
+  });
+
+  // Cancellation settings are now saved with main settings
+
+  // Fetch payment gateway definitions from server
+  const { data: gatewayDefinitions } = useQuery<
+    Record<string, GatewayDefinition>
+  >({
+    queryKey: ["payment-gateways-definitions"],
+    queryFn: async () => {
+      try {
+        const response = (await fetchPaymentGatewayDefinitions()) as {
+          gateways?: Record<string, GatewayDefinition>;
+        };
+        return response.gateways || {};
+      } catch (error: any) {
+        console.error("Failed to load gateway definitions:", error);
+        return {};
+      }
+    },
+    enabled: can("yatra_manage_settings"),
+    staleTime: Infinity,
+  });
+
+  useEffect(() => {
+    if (viewingSection !== "advanced" || !can("yatra_manage_settings")) {
+      return;
+    }
+    let cancelled = false;
+    setUsageLoading(true);
+    setUsageError("");
+    (async () => {
+      try {
+        const s = await fetchUsageTrackingStatus();
+        if (!cancelled) {
+          setUsageStatus(s);
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          setUsageStatus(null);
+          const status =
+            e?.response?.status != null ? ` (HTTP ${e.response.status})` : "";
+          const msg =
+            (typeof e?.message === "string" && e.message.trim() !== ""
+              ? e.message
+              : __("Failed to load usage tracking status", "yatra")) + status;
+          setUsageError(msg);
+        }
+      } finally {
+        // Always clear loading — otherwise a strict-mode remount / dependency churn can leave the spinner stuck.
+        setUsageLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [viewingSection, can]);
+
+  // Default settings fallback
+  const defaultSettings: SettingsData = useMemo<SettingsData>(
+    () => ({
+      company_name: "Yatra Travel Agency",
+      company_email: "info@wpyatra.com",
+      company_phone: "+1-234-567-8900",
+      company_address: "123 Travel Street",
+      company_city: "Kathmandu",
+      company_state: "Bagmati",
+      company_country: "Nepal",
+      company_zip: "44600",
+      company_website: "https://wpyatra.com",
+      company_logo: "",
+      timezone: "Asia/Kathmandu",
+      date_format: "Y-m-d",
+      time_format: "H:i",
+      frontend_primary_color: "#3b82f6",
+      frontend_container_max_width: "",
+      frontend_listing_card_layout: "standard",
+      // Search & Listing — defaults match current behaviour (all fields shown,
+      // mobile filters expanded) so existing sites are unchanged.
+      search_show_keyword: true,
+      search_show_destination: true,
+      search_show_activities: true,
+      search_show_duration: true,
+      search_show_budget: true,
+      search_show_date: false,
+      collapse_filters_on_mobile: false,
+      booking_confirmation: true,
+      auto_confirm_bookings: false,
+      auto_confirm_mode: "online",
+      pending_payment_email: "confirmation",
+      require_login: false,
+      allow_guest_checkout: true,
+      require_guest_email_verification: false,
+      booking_expiry_hours: 24,
+      booking_reminder_days: 3,
+      allow_waitlist: true,
+      waitlist_auto_confirm: false,
+      date_picker_as_dropdown: false,
+
+      currency: "USD",
+      payment_test_mode: true,
+      payment_gateways: ["pay_later"],
+      payment_methods: ["credit_card", "paypal", "bank_transfer"],
+      partial_payment: true,
+      partial_payment_percentage: 30,
+      deposit_required: true,
+      deposit_percentage: 20,
+      auto_confirm_pay_later: true,
+      enable_scheduled_payments: false,
+      scheduled_payment_type: "single",
+      scheduled_payment_days: 15,
+      scheduled_payment_installments: 1,
+      discount_stacking_mode: "both",
+      scheduled_payment_interval: 30,
+      scheduled_payment_reminder_days: 3,
+      balance_anchor: "booking",
+      balance_due_days: 14,
+      gateway_configs: {
+        stripe: {
+          enabled: true,
+          title: "Stripe",
+          description: "Accept credit and debit cards",
+          api_key: "",
+          api_secret: "",
+          webhook_secret: "",
+        },
+        paypal: {
+          enabled: true,
+          title: "PayPal",
+          description: "Accept PayPal payments",
+          client_id: "",
+          client_secret: "",
+        },
+        razorpay: {
+          enabled: false,
+          title: "Razorpay",
+          description: "Accept payments via Razorpay",
+          api_key: "",
+          api_secret: "",
+        },
+        square: {
+          enabled: false,
+          title: "Square",
+          description: "Accept payments via Square",
+          api_key: "",
+          api_secret: "",
+        },
+        authorize_net: {
+          enabled: false,
+          title: "Authorize.net",
+          description: "Accept payments via Authorize.net",
+          api_key: "",
+          api_secret: "",
+        },
+        bank_transfer: {
+          enabled: false,
+          title: "Bank Transfer",
+          description: "Accept manual bank transfer payments",
+          api_key: "", // Used for bank account name
+          api_secret: "", // Used for bank account number
+          public_key: "", // Used for bank name
+          private_key: "", // Used for routing/SWIFT code
+        },
+        esewa: {
+          enabled: false,
+          title: "eSewa",
+          description: "Accept payments via eSewa (Nepal)",
+          api_key: "",
+          api_secret: "",
+        },
+        khalti: {
+          enabled: false,
+          title: "Khalti",
+          description: "Accept payments via Khalti (Nepal)",
+          api_key: "",
+          api_secret: "",
+        },
+        pay_later: {
+          enabled: false,
+          title: "Book Now, Pay Later",
+          description: "Allow customers to reserve now and pay before the trip",
+          api_key: "", // Used for payment deadline days
+          api_secret: "", // Used for auto-cancel days
+        },
+      },
+      gateway_order: [
+        "pay_later",
+        "stripe",
+        "paypal",
+        "razorpay",
+        "square",
+        "authorize_net",
+        "bank_transfer",
+        "esewa",
+        "khalti",
+      ],
+      admin_email: "admin@wpyatra.com",
+      from_email: "noreply@wpyatra.com",
+      from_name: "Yatra Travel",
+      email_template_booking: true,
+      email_template_confirmation: true,
+      email_template_cancellation: true,
+      email_template_reminder: true,
+      email_template_admin_new_booking: true,
+      email_template_admin_payment: true,
+      email_template_admin_cancellation: true,
+      email_template_trip_consent: true,
+      email_template_customer_verification: true,
+      email_template_guest_verification: true,
+      email_template_booking_completed: true,
+      email_template_booking_expired_customer: true,
+      email_template_admin_booking_expired: true,
+      email_template_scheduled_payment_reminder: true,
+      email_template_scheduled_payment_succeeded: true,
+      email_template_scheduled_payment_failed: true,
+      email_template_admin_scheduled_payment_failed: true,
+      email_template_enquiry_received: true,
+      email_template_enquiry_admin: true,
+      email_template_enquiry_response: true,
+      email_template_review_request: false,
+      email_template_abandoned_booking_recovery_first: true,
+      email_template_abandoned_booking_recovery_second: true,
+      email_template_abandoned_booking_recovery_final: true,
+      smtp_enabled: false,
+      smtp_host: "smtp.gmail.com",
+      smtp_port: 587,
+      smtp_username: "",
+      smtp_password: "",
+      smtp_encryption: "tls",
+      email_tpl_booking_subject: "",
+      email_tpl_booking_body: "",
+      email_tpl_payment_subject: "",
+      email_tpl_payment_body: "",
+      email_tpl_cancellation_subject: "",
+      email_tpl_cancellation_body: "",
+      email_tpl_reminder_subject: "",
+      email_tpl_reminder_body: "",
+      email_tpl_admin_booking_subject: "",
+      email_tpl_admin_booking_body: "",
+      email_tpl_admin_payment_subject: "",
+      email_tpl_admin_payment_body: "",
+      email_tpl_admin_cancellation_subject: "",
+      email_tpl_admin_cancellation_body: "",
+      email_tpl_trip_consent_subject: "",
+      email_tpl_trip_consent_body: "",
+      email_tpl_customer_verification_subject: "",
+      email_tpl_customer_verification_body: "",
+      email_tpl_guest_verification_subject: "",
+      email_tpl_guest_verification_body: "",
+      email_tpl_booking_completed_subject: "",
+      email_tpl_booking_completed_body: "",
+      email_tpl_booking_expired_customer_subject: "",
+      email_tpl_booking_expired_customer_body: "",
+      email_tpl_admin_booking_expired_subject: "",
+      email_tpl_admin_booking_expired_body: "",
+      email_tpl_scheduled_payment_reminder_subject: "",
+      email_tpl_scheduled_payment_reminder_body: "",
+      email_tpl_scheduled_payment_succeeded_subject: "",
+      email_tpl_scheduled_payment_succeeded_body: "",
+      email_tpl_scheduled_payment_failed_subject: "",
+      email_tpl_scheduled_payment_failed_body: "",
+      email_tpl_admin_scheduled_payment_failed_subject: "",
+      email_tpl_admin_scheduled_payment_failed_body: "",
+      email_tpl_enquiry_received_subject: "",
+      email_tpl_enquiry_received_body: "",
+      email_tpl_enquiry_admin_subject: "",
+      email_tpl_enquiry_admin_body: "",
+      email_tpl_enquiry_response_subject: "",
+      email_tpl_enquiry_response_body: "",
+      email_tpl_review_request_subject: "",
+      email_tpl_review_request_body: "",
+      email_tpl_abandoned_booking_recovery_first_subject: "",
+      email_tpl_abandoned_booking_recovery_first_body: "",
+      email_tpl_abandoned_booking_recovery_second_subject: "",
+      email_tpl_abandoned_booking_recovery_second_body: "",
+      email_tpl_abandoned_booking_recovery_final_subject: "",
+      email_tpl_abandoned_booking_recovery_final_body: "",
+      customer_registration: true,
+      customer_fields: ["name", "email", "phone", "address"],
+      require_email_verification: false,
+      customer_account_page: "/my-account",
+      allow_customer_reviews: true,
+      customer_dashboard_enabled: true,
+      enable_reviews: true,
+      require_booking: true,
+      auto_approve_reviews: false,
+      review_moderation: true,
+      min_rating: 1,
+      allow_anonymous_reviews: false,
+      review_reminder_days: 3,
+      review_reminder_max_age_days: 14,
+      enable_tax: true,
+      tax_name: __("Tax", "yatra"),
+      tax_rate: 10,
+      tax_inclusive: false,
+      vat_number: "",
+      tax_by_country: false,
+      tax_rates: {},
+      multiple_taxes_enabled: false,
+      multiple_taxes: [],
+      multiple_taxes_by_country: {},
+      default_currency: "USD",
+      multi_currency: false,
+      currency_position: "left",
+      currency_decimals: 2,
+      thousand_separator: ",",
+      decimal_separator: ".",
+      sms_notifications: false,
+      sms_provider: "twilio",
+      sms_api_key: "",
+      google_analytics: "",
+      facebook_pixel: "",
+      recaptcha_enabled: false,
+      recaptcha_site_key: "",
+      recaptcha_secret_key: "",
+      recaptcha_score_threshold: 0.5,
+      recaptcha_protect_enquiry: false,
+      recaptcha_protect_booking: false,
+      recaptcha_protect_registration: false,
+      trip_base: "trip",
+      destination_base: "destination",
+      activity_base: "activity",
+      trip_category_base: "trip-category",
+      booking_base: "book",
+      enable_wishlist: false,
+      show_sold_out: true,
+      availability_horizon_months: 12,
+      use_booking_page: false,
+      booking_page_id: 0,
+      terms_page_id: 0,
+      privacy_policy_page_id: 0,
+      debug_mode: false,
+      enable_logging: false,
+      delete_data_on_uninstall: false,
+      cache_enabled: true,
+      api_key: "",
+      api_rate_limit: 100,
+      session_timeout: 3600,
+
+      // Booking Form Builder
+      booking_form_config: {
+        contact_form: {
+          title: "Lead Traveler / Contact Information",
+          description: "Primary contact person for this booking",
+          enabled: true,
+          fields: [
+            {
+              id: "first_name",
+              type: "text",
+              label: "First Name",
+              placeholder: "Enter first name",
+              required: true,
+              enabled: true,
+              order: 1,
+              width: "half",
+              locked: true,
+            },
+            {
+              id: "last_name",
+              type: "text",
+              label: "Last Name",
+              placeholder: "Enter last name",
+              required: true,
+              enabled: true,
+              order: 2,
+              width: "half",
+              locked: true,
+            },
+            {
+              id: "email",
+              type: "email",
+              label: "Email Address",
+              placeholder: "your@email.com",
+              required: true,
+              enabled: true,
+              order: 3,
+              width: "half",
+              locked: true,
+            },
+            {
+              id: "phone",
+              type: "tel",
+              label: "Phone Number",
+              placeholder: "+1 234 567 8900",
+              required: true,
+              enabled: true,
+              order: 4,
+              width: "half",
+              locked: true,
+            },
+            {
+              id: "country",
+              type: "country",
+              label: "Country",
+              placeholder: "Select Country",
+              required: true,
+              enabled: true,
+              order: 5,
+              width: "half",
+              locked: true,
+            },
+            {
+              id: "nationality",
+              type: "country",
+              label: "Nationality",
+              placeholder: "Select Nationality",
+              required: false,
+              enabled: true,
+              order: 6,
+              width: "half",
+            },
+            {
+              id: "address",
+              type: "text",
+              label: "Address",
+              placeholder: "Street address (optional)",
+              required: false,
+              enabled: true,
+              order: 7,
+              width: "full",
+            },
+          ],
+        },
+        emergency_contact_form: {
+          title: "Emergency Contact",
+          description: "Person to contact in case of emergency",
+          enabled: true,
+          fields: [
+            {
+              id: "name",
+              type: "text",
+              label: "Contact Name",
+              placeholder: "Full name",
+              required: true,
+              enabled: true,
+              order: 1,
+              width: "half",
+            },
+            {
+              id: "phone",
+              type: "tel",
+              label: "Contact Phone",
+              placeholder: "+1 234 567 8900",
+              required: true,
+              enabled: true,
+              order: 2,
+              width: "half",
+            },
+            {
+              id: "relationship",
+              type: "select",
+              label: "Relationship",
+              placeholder: "Select Relationship",
+              required: false,
+              enabled: true,
+              order: 3,
+              width: "full",
+              options: [
+                { value: "spouse", label: "Spouse/Partner" },
+                { value: "parent", label: "Parent" },
+                { value: "sibling", label: "Sibling" },
+                { value: "child", label: "Child" },
+                { value: "friend", label: "Friend" },
+                { value: "other", label: "Other" },
+              ],
+            },
+          ],
+        },
+        traveler_form: {
+          title: "Traveler Information",
+          description: "Please provide details for each traveler",
+          enabled: true,
+          fields: [
+            {
+              id: "first_name",
+              type: "text",
+              label: "First Name",
+              placeholder: "Legal first name",
+              required: true,
+              enabled: true,
+              order: 1,
+              width: "half",
+            },
+            {
+              id: "last_name",
+              type: "text",
+              label: "Last Name",
+              placeholder: "Legal last name",
+              required: true,
+              enabled: true,
+              order: 2,
+              width: "half",
+            },
+            {
+              id: "date_of_birth",
+              type: "date",
+              label: "Date of Birth",
+              placeholder: "",
+              required: true,
+              enabled: true,
+              order: 3,
+              width: "half",
+            },
+            {
+              id: "gender",
+              type: "select",
+              label: "Gender",
+              placeholder: "Select Gender",
+              required: true,
+              enabled: true,
+              order: 4,
+              width: "half",
+              options: [
+                { value: "male", label: "Male" },
+                { value: "female", label: "Female" },
+                { value: "other", label: "Other" },
+              ],
+            },
+            {
+              id: "nationality",
+              type: "country",
+              label: "Nationality",
+              placeholder: "Select Nationality",
+              required: true,
+              enabled: true,
+              order: 5,
+              width: "full",
+            },
+            {
+              id: "dietary",
+              type: "select",
+              label: "Dietary Requirements",
+              placeholder: "Select",
+              required: false,
+              enabled: true,
+              order: 6,
+              width: "half",
+              section: "dietary_medical",
+              options: [
+                { value: "none", label: "No special requirements" },
+                { value: "vegetarian", label: "Vegetarian" },
+                { value: "vegan", label: "Vegan" },
+                { value: "halal", label: "Halal" },
+                { value: "kosher", label: "Kosher" },
+                { value: "gluten_free", label: "Gluten Free" },
+                { value: "lactose_free", label: "Lactose Free" },
+                { value: "other", label: "Other (specify in notes)" },
+              ],
+            },
+            {
+              id: "medical",
+              type: "text",
+              label: "Medical Conditions / Allergies",
+              placeholder: "Any allergies or conditions",
+              required: false,
+              enabled: true,
+              order: 7,
+              width: "half",
+              section: "dietary_medical",
+            },
+          ],
+        },
+      },
+
+      // SEO Settings
+      seo_trip_meta_title: "",
+      seo_trip_meta_description: "",
+      seo_trip_meta_keywords: "",
+      seo_trip_meta_image: 0,
+      enable_sitemap: true,
+      sitemap_types: ["archive", "trip", "destination", "activity", "category"],
+      sitemap_noindex_excluded: false,
+    }),
+    [],
+  );
+
+  const [formData, setFormData] = useState<SettingsData | null>(null);
+  const isInitializedRef = React.useRef(false);
+
+  // Mailchimp state
+  const [mailchimpConnectionStatus, setMailchimpConnectionStatus] = useState<{
+    connected: boolean;
+    error?: string;
+  } | null>(null);
+  const [mailchimpLists, setMailchimpLists] = useState<
+    Array<{
+      id: string;
+      name: string;
+    }>
+  >([]);
+  const [mailchimpMergeFields, setMailchimpMergeFields] = useState<
+    Array<{
+      tag: string;
+      name: string;
+      type: string;
+      required: boolean;
+    }>
+  >([]);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [validatingApiKey, setValidatingApiKey] = useState(false);
+  const [showFacebookToken, setShowFacebookToken] = useState(false);
+  const [showGa4ApiSecret, setShowGa4ApiSecret] = useState(false);
+  const [seoImageUrl, setSeoImageUrl] = useState<string>("");
+  const [seoImageLoading, setSeoImageLoading] = useState<boolean>(false);
+  const [seoImageError, setSeoImageError] = useState<string>("");
+
+  const [newTaxName, setNewTaxName] = useState("");
+  const [newTaxRate, setNewTaxRate] = useState("");
+
+  // Premium upgrade dialog state
+  const [showPremiumDialog, setShowPremiumDialog] = useState(false);
+  const [selectedPremiumGateway, setSelectedPremiumGateway] =
+    useState<string>("");
+
+  // Facebook Pixel validation state
+  const [validatingPixel, setValidatingPixel] = useState(false);
+  const [validatingToken, setValidatingToken] = useState(false);
+
+  // Google Analytics validation state
+  const [validatingMeasurementId, setValidatingMeasurementId] = useState(false);
+  const [validatingApiSecret, setValidatingApiSecret] = useState(false);
+
+  // Mailchimp functions
+  const validateMailchimpApiKey = async () => {
+    if (!formData?.mailchimp_api_key) return;
+
+    setValidatingApiKey(true);
+    try {
+      const response = await apiClient.post("/mailchimp/test", {
+        api_key: formData.mailchimp_api_key,
+      });
+
+      if (response.success) {
+        // Update the yatraAdmin object with new connection status
+        const updatedMailchimpData = {
+          ...((window as any).yatraAdmin?.mailchimp || {}),
+          connectionStatus: {
+            connected: true,
+            error: null,
+          },
+        };
+
+        // Update the global yatraAdmin object
+        if ((window as any).yatraAdmin) {
+          (window as any).yatraAdmin.mailchimp = updatedMailchimpData;
+        }
+
+        // Update local connection status
+        setMailchimpConnectionStatus({
+          connected: true,
+          error: undefined,
+        });
+
+        // Load lists after successful validation
+        await loadMailchimpLists();
+      }
+    } catch (error: any) {
+      // Update connection status with error
+      const updatedMailchimpData = {
+        ...((window as any).yatraAdmin?.mailchimp || {}),
+        connectionStatus: {
+          connected: false,
+          error: error.message || __("Invalid API key", "yatra"),
+        },
+      };
+
+      if ((window as any).yatraAdmin) {
+        (window as any).yatraAdmin.mailchimp = updatedMailchimpData;
+      }
+
+      // Update local connection status
+      setMailchimpConnectionStatus({
+        connected: false,
+        error: error.message || __("Invalid API key", "yatra"),
+      });
+
+      console.error("API key validation failed:", error);
+    } finally {
+      setValidatingApiKey(false);
+    }
+  };
+
+  const loadMailchimpLists = async () => {
+    try {
+      const response = await apiClient.get("/mailchimp/lists");
+
+      if (response.success && response.data) {
+        setMailchimpLists(response.data);
+
+        // Update the yatraAdmin object with available lists
+        const updatedMailchimpData = {
+          ...((window as any).yatraAdmin?.mailchimp || {}),
+          availableLists: response.data,
+        };
+
+        if ((window as any).yatraAdmin) {
+          (window as any).yatraAdmin.mailchimp = updatedMailchimpData;
+        }
+      }
+    } catch (error: any) {
+      console.error("Error loading Mailchimp lists:", error);
+      setMailchimpLists([]);
+    }
+  };
+
+  const loadMailchimpMergeFields = async (listId: string) => {
+    if (!listId) {
+      setMailchimpMergeFields([]);
+      return;
+    }
+
+    try {
+      const response = await apiClient.get(
+        `/mailchimp/lists/${listId}/merge-fields`,
+      );
+
+      if (response.success && response.data) {
+        setMailchimpMergeFields(response.data);
+
+        // Update the yatraAdmin object with merge fields
+        const updatedMailchimpData = {
+          ...((window as any).yatraAdmin?.mailchimp || {}),
+          mergeFields: response.data,
+        };
+
+        if ((window as any).yatraAdmin) {
+          (window as any).yatraAdmin.mailchimp = updatedMailchimpData;
+        }
+      }
+    } catch (error: any) {
+      console.error("Error loading Mailchimp merge fields:", error);
+      setMailchimpMergeFields([]);
+    }
+  };
+
+  // Load merge fields when list is selected
+  React.useEffect(() => {
+    if (formData?.mailchimp_list_id && mailchimpConnectionStatus?.connected) {
+      loadMailchimpMergeFields(formData.mailchimp_list_id);
+    }
+  }, [formData?.mailchimp_list_id, mailchimpConnectionStatus?.connected]);
+
+  // Initialize local connection status from global state
+  React.useEffect(() => {
+    if ((window as any).yatraAdmin?.mailchimp?.connectionStatus) {
+      setMailchimpConnectionStatus(
+        (window as any).yatraAdmin.mailchimp.connectionStatus,
+      );
+    }
+  }, []);
+
+  // Google Analytics validation functions
+  const validateMeasurementId = async () => {
+    if (!formData?.ga4_measurement_id) return;
+
+    setValidatingMeasurementId(true);
+    try {
+      const raw = (await apiService.validateGoogleAnalyticsMeasurementId(
+        formData.ga4_measurement_id,
+      )) as { success?: boolean; message?: string };
+
+      if (raw?.success) {
+        showToast(
+          __("Measurement ID validated successfully!", "yatra"),
+          "success",
+        );
+      } else {
+        showToast(
+          raw?.message || __("Measurement ID validation failed.", "yatra"),
+          "error",
+        );
+      }
+    } catch (error: any) {
+      showToast(
+        error.message || __("Failed to validate Measurement ID.", "yatra"),
+        "error",
+      );
+    } finally {
+      setValidatingMeasurementId(false);
+    }
+  };
+
+  const validateApiSecret = async () => {
+    if (!formData?.ga4_measurement_id || !formData?.ga4_api_secret) return;
+
+    setValidatingApiSecret(true);
+    try {
+      const raw = (await apiService.validateGoogleAnalyticsApiSecret(
+        formData.ga4_measurement_id,
+        formData.ga4_api_secret,
+      )) as { success?: boolean; message?: string };
+
+      if (raw?.success) {
+        showToast(__("API Secret validated successfully!", "yatra"), "success");
+      } else {
+        showToast(
+          raw?.message || __("API Secret validation failed.", "yatra"),
+          "error",
+        );
+      }
+    } catch (error: any) {
+      showToast(
+        error.message || __("Failed to validate API Secret.", "yatra"),
+        "error",
+      );
+    } finally {
+      setValidatingApiSecret(false);
+    }
+  };
+
+  // Facebook Pixel validation functions
+  const validateFacebookPixel = async () => {
+    if (!formData?.facebook_pixel_id) return;
+
+    setValidatingPixel(true);
+    try {
+      const response = await apiClient.post("/facebook-pixel/test", {
+        pixel_id: formData.facebook_pixel_id,
+      });
+
+      if (response.success) {
+        // Update the yatraAdmin object with new connection status
+        const updatedFacebookPixelData = {
+          ...((window as any).yatraAdmin?.facebookPixel || {}),
+          connectionStatus: {
+            ...((window as any).yatraAdmin?.facebookPixel?.connectionStatus ||
+              {}),
+            pixelConnected: true,
+            pixelError: null,
+          },
+        };
+
+        if ((window as any).yatraAdmin) {
+          (window as any).yatraAdmin.facebookPixel = updatedFacebookPixelData;
+        }
+      }
+    } catch (error: any) {
+      // Update connection status with error
+      const updatedFacebookPixelData = {
+        ...((window as any).yatraAdmin?.facebookPixel || {}),
+        connectionStatus: {
+          ...((window as any).yatraAdmin?.facebookPixel?.connectionStatus ||
+            {}),
+          pixelConnected: false,
+          pixelError: error.message || __("Invalid Pixel ID", "yatra"),
+        },
+      };
+
+      if ((window as any).yatraAdmin) {
+        (window as any).yatraAdmin.facebookPixel = updatedFacebookPixelData;
+      }
+
+      console.error("Pixel validation failed:", error);
+    } finally {
+      setValidatingPixel(false);
+    }
+  };
+
+  const validateFacebookToken = async () => {
+    if (!formData?.facebook_access_token) return;
+
+    setValidatingToken(true);
+    try {
+      const response = await apiClient.post("/facebook-pixel/test-token", {
+        access_token: formData.facebook_access_token,
+      });
+
+      if (response.success) {
+        // Update the yatraAdmin object with new connection status
+        const updatedFacebookPixelData = {
+          ...((window as any).yatraAdmin?.facebookPixel || {}),
+          connectionStatus: {
+            ...((window as any).yatraAdmin?.facebookPixel?.connectionStatus ||
+              {}),
+            tokenConnected: true,
+            tokenError: null,
+          },
+        };
+
+        if ((window as any).yatraAdmin) {
+          (window as any).yatraAdmin.facebookPixel = updatedFacebookPixelData;
+        }
+      }
+    } catch (error: any) {
+      // Update connection status with error
+      const updatedFacebookPixelData = {
+        ...((window as any).yatraAdmin?.facebookPixel || {}),
+        connectionStatus: {
+          ...((window as any).yatraAdmin?.facebookPixel?.connectionStatus ||
+            {}),
+          tokenConnected: false,
+          tokenError: error.message || __("Invalid access token", "yatra"),
+        },
+      };
+
+      if ((window as any).yatraAdmin) {
+        (window as any).yatraAdmin.facebookPixel = updatedFacebookPixelData;
+      }
+
+      console.error("Access token validation failed:", error);
+    } finally {
+      setValidatingToken(false);
+    }
+  };
+
+  // Initialize form data only once - merge API settings with defaults
+  React.useEffect(() => {
+    if (isInitializedRef.current) return;
+
+    if (settings) {
+      // Merge settings with defaults, especially for gateway_configs
+      const mergedSettings = {
+        ...defaultSettings,
+        ...settings,
+        // Ensure gateway_configs from defaults are merged with any saved configs
+        gateway_configs: {
+          ...defaultSettings.gateway_configs,
+          ...(settings.gateway_configs || {}),
+        },
+      };
+      setFormData(mergedSettings);
+      isInitializedRef.current = true;
+    } else if (!isLoading && !settings) {
+      // Use default settings if API fails or returns empty
+      setFormData(defaultSettings);
+      isInitializedRef.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings, isLoading]);
+
+  // Fetch SEO image URL when image ID changes with performance optimization
+  React.useEffect(() => {
+    let isMounted = true;
+    const controller = new AbortController();
+
+    const fetchSeoImageUrl = async () => {
+      const imageId = formData?.seo_trip_meta_image;
+
+      if (!imageId || imageId <= 0) {
+        if (isMounted) {
+          setSeoImageUrl("");
+          setSeoImageLoading(false);
+          setSeoImageError("");
+        }
+        return;
+      }
+
+      if (isMounted) {
+        setSeoImageLoading(true);
+        setSeoImageError("");
+      }
+
+      try {
+        const siteUrl = window.yatraAdmin?.siteUrl || "";
+        const response = await fetch(
+          `${siteUrl}/wp-json/wp/v2/media/${imageId}`,
+          {
+            signal: controller.signal,
+            headers: {
+              Accept: "application/json",
+            },
+          },
+        );
+
+        if (!isMounted) return;
+
+        if (response.ok) {
+          const mediaData = await response.json();
+          const imageUrl = mediaData?.source_url;
+
+          if (imageUrl && typeof imageUrl === "string") {
+            setSeoImageUrl(imageUrl);
+            setSeoImageError("");
+          } else {
+            setSeoImageUrl("");
+            setSeoImageError("Image not found");
+          }
+        } else {
+          setSeoImageUrl("");
+          setSeoImageError(`Failed to load image (${response.status})`);
+        }
+      } catch (error) {
+        if (isMounted) {
+          console.error("Error fetching SEO image:", error);
+          setSeoImageUrl("");
+          setSeoImageError(
+            error instanceof Error ? error.message : "Unknown error",
+          );
+        }
+      } finally {
+        if (isMounted) {
+          setSeoImageLoading(false);
+        }
+      }
+    };
+
+    fetchSeoImageUrl();
+
+    return () => {
+      isMounted = false;
+      controller.abort();
+    };
+  }, [formData?.seo_trip_meta_image]);
+
+  // Initialize gateway order ONCE, and only after BOTH the gateway definitions
+  // AND the settings have loaded. These are two independent queries. The old
+  // guard (`gatewayOrder.length === 0`) initialized as soon as the definitions
+  // arrived — if that happened before `settings` resolved, `savedOrder` was
+  // still undefined, so it fell back to the DEFAULT order; the length guard then
+  // permanently shadowed the saved order once it arrived. That was the "payment
+  // option order is not saved" bug: the order persisted fine in the DB but the
+  // UI reverted to default on reload. Waiting for `settings` to resolve, tracked
+  // by a run-once ref, fixes it without clobbering in-progress drag reordering.
+  const gatewayOrderInitialized = React.useRef(false);
+  React.useEffect(() => {
+    if (gatewayOrderInitialized.current) return;
+    if (!gatewayDefinitions || Object.keys(gatewayDefinitions).length === 0) {
+      return;
+    }
+    // Wait for the settings query to resolve so the saved order is available.
+    if (settings === undefined) return;
+
+    const allGateways = Object.keys(gatewayDefinitions);
+    const savedOrder = settings?.gateway_order as string[] | undefined;
+    if (Array.isArray(savedOrder) && savedOrder.length > 0) {
+      // Keep the saved order, appending any gateways added since it was saved.
+      const validSavedOrder = savedOrder.filter((id) =>
+        allGateways.includes(id),
+      );
+      const newGateways = allGateways.filter(
+        (id) => !validSavedOrder.includes(id),
+      );
+      setGatewayOrder([...validSavedOrder, ...newGateways]);
+    } else {
+      setGatewayOrder(allGateways);
+    }
+    gatewayOrderInitialized.current = true;
+  }, [gatewayDefinitions, settings]);
+
+  // Single stable onChange handler that reads field name from input's name or id attribute
+  const handleFieldChange = React.useCallback(
+    (
+      e: React.ChangeEvent<
+        HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+      >,
+    ) => {
+      const field = (e.target.name || e.target.id) as keyof SettingsData;
+      let value: any;
+
+      if (e.target.type === "checkbox") {
+        value = (e.target as HTMLInputElement).checked;
+      } else if (e.target.type === "number") {
+        // Keep an empty field empty while editing so the user can clear the
+        // last character and retype. Previously empty coerced to 0, which
+        // "stuck" and blocked re-entry (deleting the last digit snapped a value
+        // back). The empty string is coerced to a number server-side on save.
+        const raw = e.target.value;
+        if (raw === "") {
+          value = "";
+        } else {
+          const numValue = parseFloat(raw);
+          value = isNaN(numValue) ? 0 : numValue;
+        }
+      } else {
+        value = e.target.value;
+      }
+
+      setFormData((prev) => {
+        if (!prev) return prev;
+        return { ...prev, [field]: value };
+      });
+    },
+    [],
+  );
+
+  const timeZoneSelectOptions = useMemo(() => {
+    const ya = (window as any).yatraAdmin || {};
+    const raw = ya.timeZoneIdentifiers;
+    let ids: string[] = [];
+    if (
+      Array.isArray(raw) &&
+      raw.length > 0 &&
+      raw.every((x: unknown) => typeof x === "string")
+    ) {
+      ids = raw as string[];
+    } else {
+      ids = [
+        "UTC",
+        "America/New_York",
+        "America/Los_Angeles",
+        "Europe/London",
+        "Europe/Paris",
+        "Asia/Dubai",
+        "Asia/Kolkata",
+        "Asia/Kathmandu",
+        "Australia/Sydney",
+      ];
+    }
+    const set = new Set(ids);
+    const wpTz =
+      typeof ya.wordPressTimezone === "string"
+        ? ya.wordPressTimezone.trim()
+        : "";
+    if (wpTz) {
+      set.add(wpTz);
+    }
+    const current = formData?.timezone?.trim();
+    if (current) {
+      set.add(current);
+    }
+    return Array.from(set)
+      .sort((a, b) => a.localeCompare(b))
+      .map((z) => ({ value: z, label: z }));
+  }, [formData?.timezone]);
+
+  const handleGatewayConfigChange = React.useCallback(
+    (gateway: string, field: keyof PaymentGatewayConfig, value: any) => {
+      setFormData((prev) => {
+        if (!prev) return prev;
+        const configs = { ...(prev.gateway_configs || {}) };
+        const existingConfig = configs[gateway] || {
+          enabled: false,
+          title: gateway,
+          description: "",
+        };
+        configs[gateway] = { ...existingConfig, [field]: value };
+        return { ...prev, gateway_configs: configs };
+      });
+
+      // Auto-expand when enabling a gateway
+      if (field === "enabled" && value === true) {
+        setExpandedGateways((prev) => ({ ...prev, [gateway]: true }));
+      }
+      // Auto-collapse when disabling a gateway
+      if (field === "enabled" && value === false) {
+        setExpandedGateways((prev) => ({ ...prev, [gateway]: false }));
+      }
+    },
+    [],
+  );
+
+  const toggleGatewayExpanded = (gateway: string) => {
+    setExpandedGateways((prev) => ({ ...prev, [gateway]: !prev[gateway] }));
+  };
+
+  // Gateway sorting functions
+  const moveGatewayUp = (gatewayId: string) => {
+    setGatewayOrder((prev) => {
+      const index = prev.indexOf(gatewayId);
+      if (index <= 0) return prev;
+      const newOrder = [...prev];
+      [newOrder[index - 1], newOrder[index]] = [
+        newOrder[index],
+        newOrder[index - 1],
+      ];
+      // Save order to formData
+      setFormData((current) =>
+        current ? { ...current, gateway_order: newOrder } : current,
+      );
+      return newOrder;
+    });
+  };
+
+  const moveGatewayDown = (gatewayId: string) => {
+    setGatewayOrder((prev) => {
+      const index = prev.indexOf(gatewayId);
+      if (index < 0 || index >= prev.length - 1) return prev;
+      const newOrder = [...prev];
+      [newOrder[index], newOrder[index + 1]] = [
+        newOrder[index + 1],
+        newOrder[index],
+      ];
+      // Save order to formData
+      setFormData((current) =>
+        current ? { ...current, gateway_order: newOrder } : current,
+      );
+      return newOrder;
+    });
+  };
+
+  // Drag and drop handlers
+  const handleDragStart = (e: React.DragEvent, gatewayId: string) => {
+    setDraggedGateway(gatewayId);
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  };
+
+  const handleDrop = (e: React.DragEvent, targetGatewayId: string) => {
+    e.preventDefault();
+    if (!draggedGateway || draggedGateway === targetGatewayId) {
+      setDraggedGateway(null);
+      return;
+    }
+
+    setGatewayOrder((prev) => {
+      const dragIndex = prev.indexOf(draggedGateway);
+      const dropIndex = prev.indexOf(targetGatewayId);
+      if (dragIndex < 0 || dropIndex < 0) return prev;
+
+      const newOrder = [...prev];
+      newOrder.splice(dragIndex, 1);
+      newOrder.splice(dropIndex, 0, draggedGateway);
+
+      // Save order to formData
+      setFormData((current) =>
+        current ? { ...current, gateway_order: newOrder } : current,
+      );
+      return newOrder;
+    });
+    setDraggedGateway(null);
+  };
+
+  const handleDragEnd = () => {
+    setDraggedGateway(null);
+  };
+
+  const saveMutation = useMutation({
+    mutationFn: async (data: SettingsData) => {
+      try {
+        await saveSettings(data as unknown as Record<string, unknown>);
+        return data;
+      } catch (error: any) {
+        showToast(
+          error?.message || __("Failed to save settings", "yatra"),
+          "error",
+        );
+        throw error;
+      }
+    },
+    onSuccess: (savedData) => {
+      queryClient.setQueryData(["settings"], savedData);
+      showToast(__("Settings saved successfully", "yatra"), "success");
+      setIsSaving(false);
+      setFormData(savedData);
+      isInitializedRef.current = true; // Keep initialized after save
+    },
+    onError: (error: any) => {
+      setIsSaving(false);
+      const errorMessage =
+        error?.message || __("Error saving settings", "yatra");
+      showToast(errorMessage, "error");
+    },
+  });
+
+  // Flush rewrite rules mutation - must be at top level
+  const flushRewriteRulesMutation = useMutation({
+    mutationFn: async () => {
+      return await postFlushRewriteRules();
+    },
+    onSuccess: () => {
+      showToast(__("Rewrite rules flushed successfully", "yatra"), "success");
+    },
+    onError: (error: any) => {
+      showToast(
+        error?.message || __("Failed to flush rewrite rules", "yatra"),
+        "error",
+      );
+    },
+  });
+
+  // Fetch WordPress pages for booking page selection (without shortcode check for performance)
+  const { data: pagesData } = useQuery({
+    queryKey: ["wordpress-pages"],
+    queryFn: async () => {
+      const response = await fetchWordPressPages();
+      return response as Array<{
+        id: number;
+        title: string;
+        slug: string;
+        url: string;
+      }>;
+    },
+    // Used by multiple sections (Booking page, Legal pages, etc.), so keep it available
+    // whenever the user can manage Yatra settings.
+    enabled: can("yatra_manage_settings"),
+  });
+
+  // Check shortcode on-demand when user selects a page
+  const checkShortcodeMutation = useMutation({
+    mutationFn: async (pageId: number) => {
+      const response = await fetchBookingPageShortcodeStatus(pageId);
+      return response as {
+        has_shortcode: boolean;
+        page_title: string;
+        page_url: string;
+        edit_url: string;
+      };
+    },
+  });
+
+  // Insert shortcode mutation
+  const insertShortcodeMutation = useMutation({
+    mutationFn: async (pageId: number) => {
+      return await postInsertBookingShortcode(pageId);
+    },
+    onSuccess: () => {
+      showToast(__("Shortcode added successfully", "yatra"), "success");
+      queryClient.invalidateQueries({ queryKey: ["wordpress-pages"] });
+    },
+    onError: (error: any) => {
+      showToast(
+        error?.message || __("Failed to add shortcode", "yatra"),
+        "error",
+      );
+    },
+  });
+
+  // State for shortcode dialog
+  const [showShortcodeDialog, setShowShortcodeDialog] = useState(false);
+  const [selectedPageForShortcode, setSelectedPageForShortcode] = useState<{
+    id: number;
+    title: string;
+  } | null>(null);
+  const [isCheckingShortcode, setIsCheckingShortcode] = useState(false);
+
+  // Handle booking page selection - checks shortcode in real-time
+  const handleBookingPageChange = async (pageId: number) => {
+    if (pageId === 0) {
+      handleFieldChange({
+        target: { name: "booking_page_id", value: 0 },
+      } as any);
+      handleFieldChange({
+        target: { name: "use_booking_page", value: false },
+      } as any);
+      return;
+    }
+
+    const page = pagesData?.find((p) => p.id === pageId);
+    if (!page) return;
+
+    // Check shortcode in real-time
+    setIsCheckingShortcode(true);
+    try {
+      const result = await checkShortcodeMutation.mutateAsync(pageId);
+
+      if (result.has_shortcode) {
+        // Page has shortcode - save directly
+        handleFieldChange({
+          target: { name: "booking_page_id", value: pageId },
+        } as any);
+        handleFieldChange({
+          target: { name: "use_booking_page", value: true },
+        } as any);
+        showToast(__("Booking page selected successfully", "yatra"), "success");
+      } else {
+        // Page doesn't have shortcode - show dialog
+        setSelectedPageForShortcode({ id: pageId, title: page.title });
+        setShowShortcodeDialog(true);
+      }
+    } catch (error: any) {
+      showToast(error?.message || __("Failed to check page", "yatra"), "error");
+    } finally {
+      setIsCheckingShortcode(false);
+    }
+  };
+
+  const handleConfirmInsertShortcode = async () => {
+    if (!selectedPageForShortcode) return;
+
+    try {
+      await insertShortcodeMutation.mutateAsync(selectedPageForShortcode.id);
+      handleFieldChange({
+        target: { name: "booking_page_id", value: selectedPageForShortcode.id },
+      } as any);
+      handleFieldChange({
+        target: { name: "use_booking_page", value: true },
+      } as any);
+      setShowShortcodeDialog(false);
+      setSelectedPageForShortcode(null);
+    } catch (error) {
+      // Error handled by mutation
+    }
+  };
+
+  const handleSave = () => {
+    if (formData) {
+      setIsSaving(true);
+
+      // Include cancellation settings in formData if needed
+      let updatedFormData: any = { ...formData };
+
+      // Single API call to save all settings
+      saveMutation.mutate(updatedFormData, {
+        onSuccess: () => {
+          // Update activeSection to the current viewingSection when save is successful
+          setActiveSection(viewingSection);
+          // Save to localStorage
+          if (typeof window !== "undefined") {
+            localStorage.setItem(
+              "yatra_settings_active_section",
+              viewingSection,
+            );
+          }
+        },
+        onSettled: () => {
+          setIsSaving(false);
+        },
+      });
+    }
+  };
+
+  const settingsSections = [
+    {
+      id: "general" as SettingsSection,
+      label: __("General", "yatra"),
+      icon: Building2,
+    },
+    {
+      id: "design" as SettingsSection,
+      label: __("Design", "yatra"),
+      icon: Palette,
+    },
+    {
+      id: "booking" as SettingsSection,
+      label: __("Booking", "yatra"),
+      icon: Calendar,
+    },
+    {
+      id: "booking_form" as SettingsSection,
+      label: __("Booking Form", "yatra"),
+      icon: ClipboardList,
+    },
+    {
+      id: "search" as SettingsSection,
+      label: __("Search & Listing", "yatra"),
+      icon: SlidersHorizontal,
+    },
+    {
+      id: "payment" as SettingsSection,
+      label: __("Payment", "yatra"),
+      icon: DollarSign,
+    },
+    // Pricing tab — visible on every Pro install so the Discount
+    // Stacking control is *discoverable*. The setting itself only
+    // takes effect when BOTH Advanced Discount and Dynamic Pricing
+    // are enabled; the case "pricing" render gives a clear status
+    // banner + disables the dropdown when prerequisites are missing.
+    //
+    // Truthy check (not `=== true`) because some WP installs end up
+    // with `isPro` serialized as `1` instead of `true` through the
+    // PHP→JSON→JS pipeline. Free installs serialize false (or omit
+    // the key), which stays falsy and correctly hides the tab.
+    ...((window as any)?.yatraAdmin?.isPro
+      ? [
+          {
+            id: "pricing" as SettingsSection,
+            label: __("Pricing", "yatra"),
+            icon: Percent,
+          },
+        ]
+      : []),
+    {
+      id: "customer" as SettingsSection,
+      label: __("Customer", "yatra"),
+      icon: Users,
+    },
+    {
+      id: "review" as SettingsSection,
+      label: __("Review", "yatra"),
+      icon: Star,
+    },
+    { id: "tax" as SettingsSection, label: __("Tax", "yatra"), icon: Receipt },
+    {
+      id: "currency" as SettingsSection,
+      label: __("Currency", "yatra"),
+      icon: Globe,
+    },
+    {
+      id: "integration" as SettingsSection,
+      label: __("Integration", "yatra"),
+      icon: Plug,
+    },
+    {
+      id: "permalink" as SettingsSection,
+      label: __("Permalink", "yatra"),
+      icon: Globe,
+    },
+    {
+      id: "seo" as SettingsSection,
+      label: __("SEO", "yatra"),
+      icon: TrendingUp,
+    },
+    {
+      id: "advanced" as SettingsSection,
+      label: __("Advanced", "yatra"),
+      icon: Shield,
+    },
+    {
+      id: "uninstall" as SettingsSection,
+      label: __("Uninstall", "yatra"),
+      icon: Trash2,
+    },
+  ];
+
+  // Helper component for section divider
+  const SectionDivider = ({ title }: { title: string }) => (
+    <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mt-6">
+      <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+        {title}
+      </h3>
+    </div>
+  );
+
+  const renderSettingsContent = () => {
+    if (!formData) return null;
+
+    switch (viewingSection) {
+      case "general":
+        return (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                {__("Company Information", "yatra")}
+              </h3>
+              <div className="space-y-4">
+                <FormField
+                  id="company_name"
+                  label={__("Company Name", "yatra")}
+                  description={__(
+                    "Your travel agency or company name",
+                    "yatra",
+                  )}
+                  required
+                >
+                  <Input
+                    id="company_name"
+                    name="company_name"
+                    value={formData.company_name || ""}
+                    onChange={handleFieldChange}
+                    placeholder={__("Enter company name", "yatra")}
+                  />
+                </FormField>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    id="company_email"
+                    label={__("Company Email", "yatra")}
+                    description={__("Primary contact email address", "yatra")}
+                    required
+                  >
+                    <Input
+                      id="company_email"
+                      name="company_email"
+                      type="email"
+                      value={formData.company_email || ""}
+                      onChange={handleFieldChange}
+                      placeholder={__("company@example.com", "yatra")}
+                    />
+                  </FormField>
+
+                  <FormField
+                    id="company_phone"
+                    label={__("Company Phone", "yatra")}
+                    description={__("Primary contact phone number", "yatra")}
+                  >
+                    <Input
+                      id="company_phone"
+                      name="company_phone"
+                      value={formData.company_phone || ""}
+                      onChange={handleFieldChange}
+                      placeholder={__("+1-234-567-8900", "yatra")}
+                    />
+                  </FormField>
+                </div>
+
+                <FormField
+                  id="company_address"
+                  label={__("Street Address", "yatra")}
+                  description={__("Street address of your company", "yatra")}
+                >
+                  <Input
+                    id="company_address"
+                    name="company_address"
+                    value={formData.company_address || ""}
+                    onChange={handleFieldChange}
+                    placeholder={__("123 Main Street", "yatra")}
+                  />
+                </FormField>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField id="company_city" label={__("City", "yatra")}>
+                    <Input
+                      id="company_city"
+                      name="company_city"
+                      value={formData.company_city || ""}
+                      onChange={handleFieldChange}
+                      placeholder={__("City", "yatra")}
+                    />
+                  </FormField>
+
+                  <FormField
+                    id="company_state"
+                    label={__("State/Province", "yatra")}
+                  >
+                    <Input
+                      id="company_state"
+                      name="company_state"
+                      value={formData.company_state || ""}
+                      onChange={handleFieldChange}
+                      placeholder={__("State or Province", "yatra")}
+                    />
+                  </FormField>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    id="company_country"
+                    label={__("Country", "yatra")}
+                  >
+                    <Input
+                      id="company_country"
+                      name="company_country"
+                      value={formData.company_country || ""}
+                      onChange={handleFieldChange}
+                      placeholder={__("Country", "yatra")}
+                    />
+                  </FormField>
+
+                  <FormField
+                    id="company_zip"
+                    label={__("ZIP/Postal Code", "yatra")}
+                  >
+                    <Input
+                      id="company_zip"
+                      value={formData.company_zip}
+                      name="company_zip"
+                      onChange={handleFieldChange}
+                      placeholder={__("ZIP Code", "yatra")}
+                    />
+                  </FormField>
+                </div>
+
+                <FormField
+                  id="company_website"
+                  label={__("Website URL", "yatra")}
+                  description={__("Your company website address", "yatra")}
+                >
+                  <Input
+                    id="company_website"
+                    type="url"
+                    value={formData.company_website}
+                    name="company_website"
+                    onChange={handleFieldChange}
+                    placeholder={__("https://example.com", "yatra")}
+                  />
+                </FormField>
+              </div>
+            </div>
+
+            <SectionDivider title={__("Regional Settings", "yatra")} />
+
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <FormField
+                  id="timezone"
+                  label={__("Timezone", "yatra")}
+                  description={__(
+                    "Used for booking logic, emails, and date display. Search the full IANA list (same identifiers PHP uses).",
+                    "yatra",
+                  )}
+                >
+                  <div className="space-y-2">
+                    {(window as any).yatraAdmin?.wordPressTimezone ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full sm:w-auto"
+                        onClick={() =>
+                          handleFieldChange({
+                            target: {
+                              name: "timezone",
+                              id: "timezone",
+                              value: String(
+                                (window as any).yatraAdmin.wordPressTimezone,
+                              ),
+                              type: "select-one",
+                            },
+                          } as React.ChangeEvent<HTMLSelectElement>)
+                        }
+                      >
+                        {__("Use WordPress site timezone", "yatra")}
+                        {": "}
+                        <span className="font-mono text-xs">
+                          {(window as any).yatraAdmin.wordPressTimezone}
+                        </span>
+                      </Button>
+                    ) : null}
+                    <SearchableSelect
+                      value={formData.timezone}
+                      onChange={(val) =>
+                        handleFieldChange({
+                          target: {
+                            name: "timezone",
+                            id: "timezone",
+                            value: val,
+                            type: "select-one",
+                          },
+                        } as React.ChangeEvent<HTMLSelectElement>)
+                      }
+                      options={timeZoneSelectOptions}
+                      searchPlaceholder={__(
+                        "Search by city, region, or code…",
+                        "yatra",
+                      )}
+                      placeholder={__("Select timezone…", "yatra")}
+                      showValueId={false}
+                    />
+                  </div>
+                </FormField>
+
+                <FormField
+                  id="date_format"
+                  label={__("Date Format", "yatra")}
+                  description={__("How dates are displayed", "yatra")}
+                >
+                  <Select
+                    id="date_format"
+                    value={formData.date_format}
+                    name="date_format"
+                    onChange={handleFieldChange}
+                  >
+                    <option value="Y-m-d">
+                      {new Date().toLocaleDateString("en-CA")} (YYYY-MM-DD)
+                    </option>
+                    <option value="Y/m/d">
+                      {`${new Date().getFullYear()}/${String(new Date().getMonth() + 1).padStart(2, "0")}/${String(new Date().getDate()).padStart(2, "0")}`}{" "}
+                      (YYYY/MM/DD)
+                    </option>
+                    <option value="m/d/Y">
+                      {`${String(new Date().getMonth() + 1).padStart(2, "0")}/${String(new Date().getDate()).padStart(2, "0")}/${new Date().getFullYear()}`}{" "}
+                      (MM/DD/YYYY)
+                    </option>
+                    <option value="d/m/Y">
+                      {`${String(new Date().getDate()).padStart(2, "0")}/${String(new Date().getMonth() + 1).padStart(2, "0")}/${new Date().getFullYear()}`}{" "}
+                      (DD/MM/YYYY)
+                    </option>
+                    <option value="d-m-Y">
+                      {`${String(new Date().getDate()).padStart(2, "0")}-${String(new Date().getMonth() + 1).padStart(2, "0")}-${new Date().getFullYear()}`}{" "}
+                      (DD-MM-YYYY)
+                    </option>
+                    <option value="d.m.Y">
+                      {`${String(new Date().getDate()).padStart(2, "0")}.${String(new Date().getMonth() + 1).padStart(2, "0")}.${new Date().getFullYear()}`}{" "}
+                      (DD.MM.YYYY)
+                    </option>
+                    <option value="M j, Y">
+                      {new Date().toLocaleDateString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                        year: "numeric",
+                      })}{" "}
+                      (Mon D, YYYY)
+                    </option>
+                    <option value="F j, Y">
+                      {new Date().toLocaleDateString("en-US", {
+                        month: "long",
+                        day: "numeric",
+                        year: "numeric",
+                      })}{" "}
+                      (Month D, YYYY)
+                    </option>
+                    <option value="j M Y">
+                      {`${new Date().getDate()} ${new Date().toLocaleDateString("en-US", { month: "short" })} ${new Date().getFullYear()}`}{" "}
+                      (D Mon YYYY)
+                    </option>
+                    <option value="j F Y">
+                      {`${new Date().getDate()} ${new Date().toLocaleDateString("en-US", { month: "long" })} ${new Date().getFullYear()}`}{" "}
+                      (D Month YYYY)
+                    </option>
+                    <option value="Y M j">
+                      {`${new Date().getFullYear()} ${new Date().toLocaleDateString("en-US", { month: "short" })} ${new Date().getDate()}`}{" "}
+                      (YYYY Mon D)
+                    </option>
+                    <option value="Y F j">
+                      {`${new Date().getFullYear()} ${new Date().toLocaleDateString("en-US", { month: "long" })} ${new Date().getDate()}`}{" "}
+                      (YYYY Month D)
+                    </option>
+                    <option value="l, F j, Y">
+                      {new Date().toLocaleDateString("en-US", {
+                        weekday: "long",
+                        month: "long",
+                        day: "numeric",
+                        year: "numeric",
+                      })}{" "}
+                      (Day, Month D, YYYY)
+                    </option>
+                    <option value="D, M j, Y">
+                      {new Date().toLocaleDateString("en-US", {
+                        weekday: "short",
+                        month: "short",
+                        day: "numeric",
+                        year: "numeric",
+                      })}{" "}
+                      (Day, Mon D, YYYY)
+                    </option>
+                  </Select>
+                </FormField>
+
+                <FormField
+                  id="time_format"
+                  label={__("Time Format", "yatra")}
+                  description={__("12-hour or 24-hour format", "yatra")}
+                >
+                  <Select
+                    id="time_format"
+                    value={formData.time_format}
+                    name="time_format"
+                    onChange={handleFieldChange}
+                  >
+                    <option value="H:i">24 Hour (14:30)</option>
+                    <option value="h:i A">12 Hour (2:30 PM)</option>
+                  </Select>
+                </FormField>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "design":
+        return (
+          <div className="space-y-6">
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              {__(
+                "Control how Yatra looks on the public site (trip pages, booking, listings, and shortcodes). These options complement your WordPress theme.",
+                "yatra",
+              )}
+            </p>
+            <div className="space-y-4">
+              <FormField
+                id="frontend_primary_color"
+                label={__("Primary brand color", "yatra")}
+                description={__(
+                  "Buttons, links, and highlights. Default is the standard Yatra blue; choose a hex color that matches your brand or theme accent.",
+                  "yatra",
+                )}
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <input
+                    type="color"
+                    id="frontend_primary_color_picker"
+                    aria-label={__("Pick primary color", "yatra")}
+                    className="h-10 w-14 cursor-pointer rounded border border-gray-300 bg-white p-0.5 dark:border-gray-600"
+                    value={
+                      /^#[0-9A-Fa-f]{6}$/.test(
+                        (formData.frontend_primary_color || "").trim(),
+                      )
+                        ? (formData.frontend_primary_color || "").trim()
+                        : "#3b82f6"
+                    }
+                    onChange={(e) =>
+                      handleFieldChange({
+                        target: {
+                          name: "frontend_primary_color",
+                          id: "frontend_primary_color",
+                          value: e.target.value,
+                          type: "text",
+                        },
+                      } as React.ChangeEvent<HTMLInputElement>)
+                    }
+                  />
+                  <Input
+                    id="frontend_primary_color"
+                    name="frontend_primary_color"
+                    className="max-w-[10rem] font-mono text-sm"
+                    value={formData.frontend_primary_color || ""}
+                    onChange={handleFieldChange}
+                    placeholder="#3b82f6"
+                    spellCheck={false}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      handleFieldChange({
+                        target: {
+                          name: "frontend_primary_color",
+                          id: "frontend_primary_color",
+                          value: "#3b82f6",
+                          type: "text",
+                        },
+                      } as React.ChangeEvent<HTMLInputElement>)
+                    }
+                  >
+                    {__("Reset to default", "yatra")}
+                  </Button>
+                </div>
+              </FormField>
+
+              <FormField
+                id="frontend_container_max_width"
+                label={__("Container max width", "yatra")}
+                description={__(
+                  "Optional. CSS width for trip listings, booking flow, and shortcode layouts (e.g. 1200px, 72rem, min(100%,80rem)). Leave empty to use your block theme layout (theme.json) or theme content width.",
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="frontend_container_max_width"
+                  name="frontend_container_max_width"
+                  className="max-w-md font-mono text-sm"
+                  value={formData.frontend_container_max_width || ""}
+                  onChange={handleFieldChange}
+                  placeholder="1200px"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </FormField>
+
+              <FormField
+                id="frontend_listing_card_layout"
+                label={__("Listing card layout", "yatra")}
+                description={__(
+                  "How trip cards appear in listings and search results. Compact shows a dense card — image, title, price and a View Details button only — so several trips fit per screen. Ideal for phones. Existing sites keep the Standard card.",
+                  "yatra",
+                )}
+              >
+                <div
+                  role="radiogroup"
+                  aria-label={__("Listing card layout", "yatra")}
+                  className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-2xl"
+                >
+                  {(
+                    [
+                      {
+                        value: "standard",
+                        label: __("Standard", "yatra"),
+                        sub: __("Full card (default)", "yatra"),
+                        svg: (
+                          <svg
+                            viewBox="0 0 160 100"
+                            className="w-full h-full"
+                            fill="none"
+                          >
+                            <rect x="46" y="6" width="68" height="88" rx="6" fill="#ffffff" stroke="#cbd5e1" strokeWidth="2" />
+                            <rect x="52" y="12" width="56" height="30" rx="3" fill="#60a5fa" />
+                            <rect x="52" y="49" width="44" height="5" rx="2.5" fill="#94a3b8" />
+                            <rect x="52" y="59" width="34" height="3" rx="1.5" fill="#cbd5e1" />
+                            <rect x="52" y="66" width="50" height="3" rx="1.5" fill="#e2e8f0" />
+                            <rect x="52" y="73" width="50" height="3" rx="1.5" fill="#e2e8f0" />
+                            <rect x="52" y="82" width="18" height="6" rx="2" fill="#475569" />
+                            <rect x="86" y="81" width="22" height="8" rx="3" fill="#3b82f6" />
+                          </svg>
+                        ),
+                      },
+                      {
+                        value: "compact_mobile",
+                        label: __("Compact — mobile", "yatra"),
+                        sub: __("Dense on phones · desktop unchanged", "yatra"),
+                        svg: (
+                          <svg
+                            viewBox="0 0 160 100"
+                            className="w-full h-full"
+                            fill="none"
+                          >
+                            <rect x="50" y="4" width="60" height="92" rx="9" fill="#ffffff" stroke="#cbd5e1" strokeWidth="2" />
+                            <rect x="72" y="8" width="16" height="3" rx="1.5" fill="#e2e8f0" />
+                            {[0, 26, 52].map((dy) => (
+                              <g key={dy} transform={`translate(0,${dy})`}>
+                                <rect x="56" y="16" width="48" height="22" rx="3" fill="#f1f5f9" />
+                                <rect x="59" y="19" width="16" height="16" rx="2" fill="#60a5fa" />
+                                <rect x="79" y="21" width="20" height="3" rx="1.5" fill="#94a3b8" />
+                                <rect x="79" y="27" width="12" height="2.5" rx="1.25" fill="#cbd5e1" />
+                                <rect x="79" y="32" width="9" height="3" rx="1.5" fill="#475569" />
+                                <rect x="93" y="31.5" width="6" height="4" rx="1.5" fill="#3b82f6" />
+                              </g>
+                            ))}
+                          </svg>
+                        ),
+                      },
+                      {
+                        value: "compact_all",
+                        label: __("Compact — everywhere", "yatra"),
+                        sub: __("Dense on mobile & desktop", "yatra"),
+                        svg: (
+                          <svg
+                            viewBox="0 0 160 100"
+                            className="w-full h-full"
+                            fill="none"
+                          >
+                            <rect x="10" y="12" width="98" height="58" rx="4" fill="#ffffff" stroke="#cbd5e1" strokeWidth="2" />
+                            <rect x="51" y="70" width="16" height="8" fill="#cbd5e1" />
+                            <rect x="39" y="78" width="40" height="4" rx="2" fill="#cbd5e1" />
+                            {[0, 24].map((dy) => (
+                              <g key={dy} transform={`translate(0,${dy})`}>
+                                <rect x="16" y="18" width="86" height="20" rx="3" fill="#f1f5f9" />
+                                <rect x="19" y="21" width="14" height="14" rx="2" fill="#60a5fa" />
+                                <rect x="37" y="23" width="34" height="3" rx="1.5" fill="#94a3b8" />
+                                <rect x="37" y="29" width="20" height="2.5" rx="1.25" fill="#cbd5e1" />
+                                <rect x="86" y="27" width="12" height="6" rx="2" fill="#3b82f6" />
+                              </g>
+                            ))}
+                            <rect x="120" y="26" width="30" height="62" rx="5" fill="#ffffff" stroke="#cbd5e1" strokeWidth="2" />
+                            {[0, 18, 36].map((dy) => (
+                              <g key={dy} transform={`translate(0,${dy})`}>
+                                <rect x="124" y="32" width="22" height="14" rx="2" fill="#f1f5f9" />
+                                <rect x="126" y="34" width="10" height="10" rx="1.5" fill="#60a5fa" />
+                                <rect x="138" y="36" width="7" height="2" rx="1" fill="#94a3b8" />
+                                <rect x="138" y="40" width="5" height="2" rx="1" fill="#cbd5e1" />
+                              </g>
+                            ))}
+                          </svg>
+                        ),
+                      },
+                    ] as const
+                  ).map((opt) => {
+                    const selected =
+                      (formData.frontend_listing_card_layout || "standard") ===
+                      opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() =>
+                          handleFieldChange({
+                            target: {
+                              name: "frontend_listing_card_layout",
+                              id: "frontend_listing_card_layout",
+                              value: opt.value,
+                              type: "text",
+                            },
+                          } as React.ChangeEvent<HTMLInputElement>)
+                        }
+                        className={`relative rounded-lg border-2 p-2.5 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                          selected
+                            ? "border-blue-600 ring-1 ring-blue-600 bg-blue-50/60 dark:bg-blue-900/20"
+                            : "border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600"
+                        }`}
+                      >
+                        <div className="aspect-[8/5] w-full overflow-hidden rounded-md bg-gray-50 dark:bg-gray-800/60">
+                          {opt.svg}
+                        </div>
+                        <div className="mt-2 text-sm font-medium text-gray-900 dark:text-white">
+                          {opt.label}
+                        </div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">
+                          {opt.sub}
+                        </div>
+                        {selected && (
+                          <span className="absolute top-2 right-2 inline-flex h-5 w-5 items-center justify-center rounded-full bg-blue-600 text-white">
+                            <svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor">
+                              <path d="M16.7 5.3a1 1 0 010 1.4l-7 7a1 1 0 01-1.4 0l-3-3a1 1 0 011.4-1.4L9 11.6l6.3-6.3a1 1 0 011.4 0z" />
+                            </svg>
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </FormField>
+            </div>
+          </div>
+        );
+
+      case "booking_form":
+        return (
+          <BookingFormBuilder formData={formData} setFormData={setFormData} />
+        );
+
+      case "payment":
+        return (
+          <>
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                  {__("Flexible Payments", "yatra")}
+                  <ProBadge isProActive={(window as any).yatraAdmin?.isPro} />
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                  {__(
+                    "Enable deposit and partial payment options for bookings. Allow customers to pay a percentage upfront and the rest later.",
+                    "yatra",
+                  )}
+                </p>
+
+                <ProFeature
+                  title={__("Flexible Payments", "yatra")}
+                  description={__(
+                    "offer deposit and partial payment options to your customers",
+                    "yatra",
+                  )}
+                  moduleName="Flexible Payments"
+                  pricingUrl="https://wpyatra.com/pricing?module=flexible-payments"
+                  isProActive={(window as any).yatraAdmin?.isPro}
+                  isModuleEnabled={
+                    (window as any).yatraAdmin?.flexiblePaymentsEnabled
+                  }
+                >
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <input
+                        type="checkbox"
+                        id="partial_payment"
+                        checked={formData.partial_payment}
+                        name="partial_payment"
+                        onChange={handleFieldChange}
+                        className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="partial_payment"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Enable Partial Payment", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__(
+                            "Allow customers to pay a portion now and the rest later",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    {formData.partial_payment && (
+                      <FormField
+                        id="partial_payment_percentage"
+                        label={__("Partial Payment Percentage", "yatra")}
+                        description={__(
+                          "Percentage of total amount required for partial payment",
+                          "yatra",
+                        )}
+                      >
+                        <div className="flex items-center gap-2">
+                          <Input
+                            id="partial_payment_percentage"
+                            type="number"
+                            value={formData.partial_payment_percentage}
+                            name="partial_payment_percentage"
+                            onChange={handleFieldChange}
+                            min="0"
+                            max="100"
+                            className="flex-1"
+                          />
+                          <span className="text-sm text-gray-500 dark:text-gray-400">
+                            %
+                          </span>
+                        </div>
+                      </FormField>
+                    )}
+
+                    <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <input
+                        type="checkbox"
+                        id="deposit_required"
+                        checked={formData.deposit_required}
+                        name="deposit_required"
+                        onChange={handleFieldChange}
+                        className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="deposit_required"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Require Deposit", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__("Require a deposit to confirm bookings", "yatra")}
+                        </p>
+                      </div>
+                    </div>
+
+                    {formData.deposit_required && (
+                      <FormField
+                        id="deposit_percentage"
+                        label={__("Deposit Percentage", "yatra")}
+                        description={__(
+                          "Percentage of total amount required as deposit",
+                          "yatra",
+                        )}
+                      >
+                        <div className="flex items-center gap-2">
+                          <Input
+                            id="deposit_percentage"
+                            type="number"
+                            value={formData.deposit_percentage}
+                            name="deposit_percentage"
+                            onChange={handleFieldChange}
+                            min="0"
+                            max="100"
+                            className="flex-1"
+                          />
+                          <span className="text-sm text-gray-500 dark:text-gray-400">
+                            %
+                          </span>
+                        </div>
+                      </FormField>
+                    )}
+                  </div>
+                </ProFeature>
+              </div>
+
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                  {__("Scheduled balance payments", "yatra")}
+                  <ProBadge isProActive={(window as any).yatraAdmin?.isPro} />
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                  {__(
+                    "After a deposit or partial payment, automatically schedule the remaining balance with your gateway (Stripe invoices or subscription schedules). Requires a gateway customer and payment method from checkout.",
+                    "yatra",
+                  )}
+                </p>
+                <ProFeature
+                  title={__("Scheduled Payments", "yatra")}
+                  description={__(
+                    "schedule the remaining balance after partial or deposit payments",
+                    "yatra",
+                  )}
+                  moduleName="Scheduled Payments"
+                  pricingUrl="https://wpyatra.com/pricing?module=scheduled-payments"
+                  isProActive={(window as any).yatraAdmin?.isPro}
+                  isModuleEnabled={
+                    (window as any).yatraAdmin?.scheduledPaymentsEnabled
+                  }
+                >
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <input
+                        type="checkbox"
+                        id="enable_scheduled_payments"
+                        checked={formData.enable_scheduled_payments}
+                        name="enable_scheduled_payments"
+                        onChange={handleFieldChange}
+                        className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="enable_scheduled_payments"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Enable scheduled balance payments", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__(
+                            "When a booking still has an amount due after checkout, create gateway-side schedules using the rules below.",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    {formData.enable_scheduled_payments && (
+                      <>
+                        <FormField
+                          id="balance_anchor"
+                          label={__("Balance schedule", "yatra")}
+                          description={__(
+                            "Whether the remaining balance is scheduled a fixed number of days after the deposit, or relative to the tour start date.",
+                            "yatra",
+                          )}
+                        >
+                          <Select
+                            id="balance_anchor"
+                            name="balance_anchor"
+                            value={formData.balance_anchor}
+                            onChange={handleFieldChange}
+                          >
+                            <option value="booking">
+                              {__("A fixed number of days after the deposit", "yatra")}
+                            </option>
+                            <option value="tour">
+                              {__("A number of days before the tour date", "yatra")}
+                            </option>
+                          </Select>
+                        </FormField>
+
+                        {formData.balance_anchor === "tour" && (
+                          <FormField
+                            id="balance_due_days"
+                            label={__("Days before tour", "yatra")}
+                            description={__(
+                              "The balance is collected this many days before the tour starts. Bookings made inside this window must pay in full up front.",
+                              "yatra",
+                            )}
+                          >
+                            <Input
+                              id="balance_due_days"
+                              type="number"
+                              min={1}
+                              max={365}
+                              value={formData.balance_due_days}
+                              name="balance_due_days"
+                              onChange={handleFieldChange}
+                              className="max-w-xs"
+                            />
+                          </FormField>
+                        )}
+
+                        <FormField
+                          id="scheduled_payment_type"
+                          label={__("Schedule type", "yatra")}
+                          description={__(
+                            "Single final charge on a date, or multiple installments.",
+                            "yatra",
+                          )}
+                        >
+                          <Select
+                            id="scheduled_payment_type"
+                            name="scheduled_payment_type"
+                            value={formData.scheduled_payment_type}
+                            onChange={handleFieldChange}
+                          >
+                            <option value="single">
+                              {__("Single balance payment", "yatra")}
+                            </option>
+                            <option value="installments">
+                              {__("Multiple installments", "yatra")}
+                            </option>
+                          </Select>
+                        </FormField>
+
+                        {formData.balance_anchor !== "tour" && (
+                          <FormField
+                            id="scheduled_payment_days"
+                            label={__("Days until first charge", "yatra")}
+                            description={__(
+                              "How many days after the initial payment to schedule the first balance collection.",
+                              "yatra",
+                            )}
+                          >
+                            <Input
+                              id="scheduled_payment_days"
+                              type="number"
+                              min={0}
+                              max={365}
+                              value={formData.scheduled_payment_days}
+                              name="scheduled_payment_days"
+                              onChange={handleFieldChange}
+                              className="max-w-xs"
+                            />
+                          </FormField>
+                        )}
+
+                        {formData.scheduled_payment_type === "installments" && (
+                          <>
+                            <FormField
+                              id="scheduled_payment_installments"
+                              label={__("Number of installments", "yatra")}
+                              description={__(
+                                "Total installments including the scheduled balance (Stripe subscription schedule).",
+                                "yatra",
+                              )}
+                            >
+                              <Input
+                                id="scheduled_payment_installments"
+                                type="number"
+                                min={2}
+                                max={24}
+                                value={formData.scheduled_payment_installments}
+                                name="scheduled_payment_installments"
+                                onChange={handleFieldChange}
+                                className="max-w-xs"
+                              />
+                            </FormField>
+                            <FormField
+                              id="scheduled_payment_interval"
+                              label={__("Days between installments", "yatra")}
+                              description={__(
+                                "Spacing between installment charges when using multiple installments.",
+                                "yatra",
+                              )}
+                            >
+                              <Input
+                                id="scheduled_payment_interval"
+                                type="number"
+                                min={1}
+                                max={365}
+                                value={formData.scheduled_payment_interval}
+                                name="scheduled_payment_interval"
+                                onChange={handleFieldChange}
+                                className="max-w-xs"
+                              />
+                            </FormField>
+                          </>
+                        )}
+
+                        <FormField
+                          id="scheduled_payment_reminder_days"
+                          label={__("Payment reminder (days before)", "yatra")}
+                          description={__(
+                            "Send the scheduled payment reminder email this many days before the due date (0 to disable reminders).",
+                            "yatra",
+                          )}
+                        >
+                          <Input
+                            id="scheduled_payment_reminder_days"
+                            type="number"
+                            min={0}
+                            max={30}
+                            value={formData.scheduled_payment_reminder_days}
+                            name="scheduled_payment_reminder_days"
+                            onChange={handleFieldChange}
+                            className="max-w-xs"
+                          />
+                        </FormField>
+                      </>
+                    )}
+                  </div>
+                </ProFeature>
+              </div>
+
+              {/* Auto-confirm Pay Later Bookings - Available in Free version */}
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="auto_confirm_pay_later"
+                  checked={formData.auto_confirm_pay_later}
+                  name="auto_confirm_pay_later"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="auto_confirm_pay_later"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__('Auto-confirm "Pay Later" Bookings', "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      'Automatically confirm bookings when "Book Now, Pay Later" is selected. If disabled, bookings will remain pending until payment is received.',
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <SectionDivider title={__("Payment Gateways", "yatra")} />
+
+              {/* Global Test Mode Toggle */}
+              <div className="flex items-center gap-3 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg mb-4">
+                <input
+                  type="checkbox"
+                  id="payment_test_mode"
+                  checked={formData.payment_test_mode}
+                  name="payment_test_mode"
+                  onChange={handleFieldChange}
+                  className="w-5 h-5 rounded border-gray-300 text-amber-600 focus:ring-amber-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="payment_test_mode"
+                    className="font-semibold cursor-pointer text-amber-800 dark:text-amber-200"
+                  >
+                    {__("Test Mode", "yatra")}
+                  </Label>
+                  <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
+                    {__(
+                      "Enable test/sandbox mode for all payment gateways. Use test API keys for development and testing. Disable this for live payments.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+                {formData.payment_test_mode && (
+                  <span className="px-2 py-1 text-xs font-semibold bg-amber-200 dark:bg-amber-800 text-amber-800 dark:text-amber-200 rounded">
+                    {__("TEST", "yatra")}
+                  </span>
+                )}
+              </div>
+
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4 flex items-center gap-1">
+                <Info className="w-3.5 h-3.5" />
+                {__(
+                  "Drag and drop to reorder gateways. Use arrows for precise positioning.",
+                  "yatra",
+                )}
+              </p>
+
+              <div className="space-y-3">
+                {/* Dynamic Payment Gateway Rendering from Server - Sorted */}
+                {gatewayDefinitions &&
+                  gatewayOrder
+                    .filter((id) => gatewayDefinitions[id])
+                    .map((gatewayId, index) => {
+                      const gateway = gatewayDefinitions[gatewayId];
+                      const config = formData.gateway_configs?.[gatewayId] ||
+                        gateway.config || { enabled: false };
+                      const isExpanded = expandedGateways[gatewayId];
+                      const isDragging = draggedGateway === gatewayId;
+
+                      const isPremium = gateway.requires_pro || false;
+
+                      return (
+                        <Card
+                          key={gatewayId}
+                          className={`relative border transition-all !py-0 ${
+                            isDragging
+                              ? "border-blue-400 bg-blue-50 dark:bg-blue-900/20 opacity-75"
+                              : config.enabled
+                                ? "border-green-200 dark:border-green-800"
+                                : "border-gray-200 dark:border-gray-700"
+                          }`}
+                          draggable={!isPremium}
+                          onDragStart={(e) =>
+                            !isPremium && handleDragStart(e, gatewayId)
+                          }
+                          onDragOver={!isPremium ? handleDragOver : undefined}
+                          onDrop={(e) => !isPremium && handleDrop(e, gatewayId)}
+                          onDragEnd={!isPremium ? handleDragEnd : undefined}
+                        >
+                          <CardHeader className="pb-3">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-3">
+                                {/* Drag handle */}
+                                <div className="cursor-grab active:cursor-grabbing p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                                  <GripVertical className="w-4 h-4" />
+                                </div>
+
+                                {/* Sort arrows */}
+                                <div className="flex flex-col gap-0.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => moveGatewayUp(gatewayId)}
+                                    disabled={index === 0}
+                                    className="p-0.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                                    title={__("Move up", "yatra")}
+                                  >
+                                    <ArrowUp className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => moveGatewayDown(gatewayId)}
+                                    disabled={index === gatewayOrder.length - 1}
+                                    className="p-0.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                                    title={__("Move down", "yatra")}
+                                  >
+                                    <ArrowDown className="w-3 h-3" />
+                                  </button>
+                                </div>
+
+                                <input
+                                  type="checkbox"
+                                  id={`gateway_enable_${gatewayId}`}
+                                  checked={config.enabled || false}
+                                  onChange={(e) => {
+                                    // Show Pro popup if trying to enable a premium gateway
+                                    if (
+                                      gateway.requires_pro &&
+                                      e.target.checked
+                                    ) {
+                                      e.preventDefault();
+                                      const pricingUrl =
+                                        (window as any).yatraAdmin
+                                          ?.pricingUrl ||
+                                        "https://wpyatra.com/pricing";
+                                      window.open(pricingUrl, "_blank");
+                                      return;
+                                    }
+                                    handleGatewayConfigChange(
+                                      gatewayId,
+                                      "enabled",
+                                      e.target.checked,
+                                    );
+                                  }}
+                                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <div className="flex items-center gap-2">
+                                  {gateway.icon && (
+                                    <img
+                                      src={gateway.icon}
+                                      alt={gateway.title}
+                                      className="w-10 h-10 object-contain"
+                                    />
+                                  )}
+                                  <div>
+                                    <CardTitle className="text-sm font-semibold flex items-center gap-2">
+                                      {gateway.title}
+                                      {config.enabled && (
+                                        <span className="text-xs font-normal px-1.5 py-0.5 bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 rounded">
+                                          {__("Active", "yatra")}
+                                        </span>
+                                      )}
+                                      {formData.payment_test_mode &&
+                                        gateway.sandbox_url && (
+                                          <a
+                                            href={gateway.sandbox_url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-xs font-normal px-1.5 py-0.5 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 rounded hover:bg-amber-200 dark:hover:bg-amber-800/40 transition-colors"
+                                            onClick={(e) => e.stopPropagation()}
+                                          >
+                                            {__("Sandbox Docs →", "yatra")}
+                                          </a>
+                                        )}
+                                    </CardTitle>
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                      {gateway.description}
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                {gateway.requires_pro && (
+                                  <span className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-gradient-to-r from-purple-500 to-blue-500 text-white shadow-sm">
+                                    PRO
+                                  </span>
+                                )}
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() =>
+                                    toggleGatewayExpanded(gatewayId)
+                                  }
+                                  className="h-8"
+                                  disabled={!gateway.fields?.length}
+                                >
+                                  {isExpanded ? (
+                                    <ChevronDown className="w-4 h-4" />
+                                  ) : (
+                                    <ChevronRight className="w-4 h-4" />
+                                  )}
+                                </Button>
+                              </div>
+                            </div>
+                          </CardHeader>
+                          {isExpanded && (
+                            <CardContent className="pt-4 space-y-4 border-t border-gray-100 dark:border-gray-700">
+                              {/* Info banner for offline gateways */}
+                              {gateway.is_offline && (
+                                <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-md mb-4">
+                                  <p className="text-sm text-blue-700 dark:text-blue-300">
+                                    {gateway.id === "pay_later"
+                                      ? __(
+                                          "Allow customers to book now and pay later. Payment must be completed before the trip date.",
+                                          "yatra",
+                                        )
+                                      : __(
+                                          "This is an offline payment method. Customers will be shown these details after booking.",
+                                          "yatra",
+                                        )}
+                                  </p>
+                                </div>
+                              )}
+
+                              {/* Frontend Display Settings */}
+                              <div className="space-y-4">
+                                <h4 className="text-sm font-semibold text-gray-900 dark:text-white">
+                                  {__("Frontend Display Settings", "yatra")}
+                                </h4>
+
+                                <FormField
+                                  id={`${gatewayId}_icon`}
+                                  label={__("Gateway Icon", "yatra")}
+                                  description={__(
+                                    "Icon URL or path displayed on the booking page",
+                                    "yatra",
+                                  )}
+                                >
+                                  <div className="flex items-center gap-3">
+                                    <Input
+                                      type="text"
+                                      value={config.icon || gateway.icon || ""}
+                                      onChange={(e) =>
+                                        handleGatewayConfigChange(
+                                          gatewayId,
+                                          "icon",
+                                          e.target.value,
+                                        )
+                                      }
+                                      placeholder={__(
+                                        "Enter icon URL or leave empty to use default",
+                                        "yatra",
+                                      )}
+                                      className="flex-1"
+                                    />
+                                    {config.icon || gateway.icon ? (
+                                      <img
+                                        src={config.icon || gateway.icon}
+                                        alt={gateway.title}
+                                        className="w-10 h-10 object-contain border border-gray-300 dark:border-gray-600 rounded p-1 bg-white dark:bg-gray-800"
+                                        onError={(e) => {
+                                          (
+                                            e.target as HTMLImageElement
+                                          ).style.display = "none";
+                                        }}
+                                      />
+                                    ) : null}
+                                  </div>
+                                </FormField>
+
+                                <FormField
+                                  id={`${gatewayId}_title`}
+                                  label={__("Gateway Title", "yatra")}
+                                  description={__(
+                                    "Title displayed on the booking page",
+                                    "yatra",
+                                  )}
+                                >
+                                  <Input
+                                    type="text"
+                                    value={config.title || gateway.title || ""}
+                                    onChange={(e) =>
+                                      handleGatewayConfigChange(
+                                        gatewayId,
+                                        "title",
+                                        e.target.value,
+                                      )
+                                    }
+                                    placeholder={
+                                      gateway.title ||
+                                      __("Enter gateway title", "yatra")
+                                    }
+                                  />
+                                </FormField>
+
+                                <FormField
+                                  id={`${gatewayId}_description`}
+                                  label={__("Gateway Description", "yatra")}
+                                  description={__(
+                                    "Description displayed below the title on the booking page",
+                                    "yatra",
+                                  )}
+                                >
+                                  <textarea
+                                    value={
+                                      config.description ||
+                                      gateway.description ||
+                                      ""
+                                    }
+                                    onChange={(e) =>
+                                      handleGatewayConfigChange(
+                                        gatewayId,
+                                        "description",
+                                        e.target.value,
+                                      )
+                                    }
+                                    placeholder={
+                                      gateway.description ||
+                                      __("Enter gateway description", "yatra")
+                                    }
+                                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                                    rows={2}
+                                  />
+                                </FormField>
+                              </div>
+
+                              {/* Dynamic field rendering */}
+                              {gateway.fields && gateway.fields.length > 0 && (
+                                <div className="space-y-4">
+                                  {gateway.fields.map((field: GatewayField) => {
+                                    // Check conditional visibility (legacy condition)
+                                    if (
+                                      field.condition &&
+                                      !config[field.condition]
+                                    ) {
+                                      return null;
+                                    }
+
+                                    // Check show_when conditional visibility
+                                    if (field.show_when) {
+                                      const shouldShow = Object.entries(
+                                        field.show_when,
+                                      ).every(
+                                        ([key, value]) =>
+                                          (config[key] ||
+                                            gateway.fields.find(
+                                              (f) => f.id === key,
+                                            )?.default) === value,
+                                      );
+                                      if (!shouldShow) {
+                                        return null;
+                                      }
+                                    }
+
+                                    // Read-only webhook endpoint URL for THIS
+                                    // site, with a copy button + setup steps.
+                                    // The operator pastes this into the gateway
+                                    // dashboard; it is display-only (never saved).
+                                    if (field.type === "webhook_url") {
+                                      const webhookUrl = String(
+                                        field.default || config[field.id] || "",
+                                      );
+                                      const stripeSetupUrl =
+                                        formData.payment_test_mode
+                                          ? field.help_url_test ||
+                                            field.help_url_live
+                                          : field.help_url_live ||
+                                            field.help_url_test;
+                                      return (
+                                        <FormField
+                                          key={field.id}
+                                          id={`${gatewayId}_${field.id}`}
+                                          label={field.label}
+                                        >
+                                          <div className="flex gap-2">
+                                            <Input
+                                              readOnly
+                                              value={webhookUrl}
+                                              onFocus={(e) =>
+                                                e.currentTarget.select()
+                                              }
+                                              className="font-mono text-xs"
+                                            />
+                                            <Button
+                                              type="button"
+                                              variant="outline"
+                                              size="sm"
+                                              onClick={(e) => {
+                                                const btn = e.currentTarget;
+                                                const input =
+                                                  btn.parentElement?.querySelector(
+                                                    "input",
+                                                  );
+                                                let copied = false;
+                                                // execCommand path works even on
+                                                // non-HTTPS admin origins where the
+                                                // async Clipboard API is unavailable.
+                                                try {
+                                                  if (input) {
+                                                    input.focus();
+                                                    input.select();
+                                                    input.setSelectionRange(
+                                                      0,
+                                                      webhookUrl.length,
+                                                    );
+                                                    copied =
+                                                      document.execCommand(
+                                                        "copy",
+                                                      );
+                                                  }
+                                                } catch {
+                                                  /* ignore */
+                                                }
+                                                if (
+                                                  navigator.clipboard?.writeText
+                                                ) {
+                                                  navigator.clipboard
+                                                    .writeText(webhookUrl)
+                                                    .catch(() => {});
+                                                  copied = true;
+                                                }
+                                                const orig = __(
+                                                  "Copy",
+                                                  "yatra",
+                                                );
+                                                btn.textContent = copied
+                                                  ? __("Copied!", "yatra")
+                                                  : __(
+                                                      "Select & copy",
+                                                      "yatra",
+                                                    );
+                                                window.setTimeout(() => {
+                                                  btn.textContent = orig;
+                                                }, 1500);
+                                              }}
+                                            >
+                                              {__("Copy", "yatra")}
+                                            </Button>
+                                          </div>
+                                          {field.description && (
+                                            <p className="mt-1.5 text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+                                              {field.description}
+                                            </p>
+                                          )}
+                                          {stripeSetupUrl && (
+                                            <a
+                                              href={stripeSetupUrl}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="mt-1.5 inline-block text-xs font-medium text-blue-600 dark:text-blue-400 border-b border-blue-600 dark:border-blue-400 hover:border-transparent"
+                                            >
+                                              {field.help_text ||
+                                                __(
+                                                  "Open Stripe → Webhooks",
+                                                  "yatra",
+                                                )}{" "}
+                                              →
+                                            </a>
+                                          )}
+                                        </FormField>
+                                      );
+                                    }
+
+                                    // Render checkbox fields differently
+                                    if (field.type === "checkbox") {
+                                      return (
+                                        <div
+                                          key={field.id}
+                                          className="flex items-center gap-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-md"
+                                        >
+                                          <input
+                                            type="checkbox"
+                                            id={`${gatewayId}_${field.id}`}
+                                            checked={config[field.id] || false}
+                                            onChange={(e) =>
+                                              handleGatewayConfigChange(
+                                                gatewayId,
+                                                field.id,
+                                                e.target.checked,
+                                              )
+                                            }
+                                            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                          />
+                                          <Label
+                                            htmlFor={`${gatewayId}_${field.id}`}
+                                            className="font-normal cursor-pointer"
+                                          >
+                                            {field.label}{" "}
+                                            {field.description &&
+                                              `- ${field.description}`}
+                                          </Label>
+                                        </div>
+                                      );
+                                    }
+
+                                    // Render textarea
+                                    if (field.type === "textarea") {
+                                      return (
+                                        <FormField
+                                          key={field.id}
+                                          id={`${gatewayId}_${field.id}`}
+                                          label={field.label}
+                                          description={field.description}
+                                        >
+                                          <textarea
+                                            value={
+                                              config[field.id] ||
+                                              field.default ||
+                                              ""
+                                            }
+                                            onChange={(e) =>
+                                              handleGatewayConfigChange(
+                                                gatewayId,
+                                                field.id,
+                                                e.target.value,
+                                              )
+                                            }
+                                            placeholder={field.placeholder}
+                                            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                                            rows={3}
+                                          />
+                                        </FormField>
+                                      );
+                                    }
+
+                                    // Special handling for Stripe enabled payment methods (multi-select UI)
+                                    if (
+                                      gateway.id === "stripe" &&
+                                      field.id === "enabled_methods"
+                                    ) {
+                                      const rawValue = config[field.id];
+                                      const selectedValues = Array.isArray(
+                                        rawValue,
+                                      )
+                                        ? rawValue
+                                        : typeof rawValue === "string" &&
+                                            rawValue.length > 0
+                                          ? rawValue
+                                              .split(",")
+                                              .map((val) => val.trim())
+                                              .filter(Boolean)
+                                          : ["card", "google_pay", "apple_pay"];
+
+                                      const methodOptions: MultiSelectOption[] =
+                                        [
+                                          {
+                                            value: "card",
+                                            label: __(
+                                              "Card (Stripe Elements)",
+                                              "yatra",
+                                            ),
+                                          },
+                                          {
+                                            value: "google_pay",
+                                            label: __(
+                                              "Google Pay (Payment Request Button)",
+                                              "yatra",
+                                            ),
+                                          },
+                                          {
+                                            value: "apple_pay",
+                                            label: __(
+                                              "Apple Pay (Payment Request Button)",
+                                              "yatra",
+                                            ),
+                                          },
+                                        ];
+
+                                      const handleStripeMethodsChange = (
+                                        values: (string | number)[],
+                                      ) => {
+                                        handleGatewayConfigChange(
+                                          gatewayId,
+                                          field.id,
+                                          values.join(","),
+                                        );
+                                      };
+
+                                      return (
+                                        <div
+                                          key={field.id}
+                                          className="space-y-2"
+                                        >
+                                          <FormField
+                                            id={`${gatewayId}_${field.id}`}
+                                            label={field.label}
+                                            description={field.description}
+                                          >
+                                            <MultiSelect
+                                              value={selectedValues}
+                                              onChange={
+                                                handleStripeMethodsChange
+                                              }
+                                              options={methodOptions}
+                                              placeholder={__(
+                                                "Select payment methods...",
+                                                "yatra",
+                                              )}
+                                            />
+                                          </FormField>
+                                          <p className="text-xs text-gray-500 dark:text-gray-400">
+                                            {__(
+                                              "Apple Pay requires domain verification inside your Stripe Dashboard.",
+                                              "yatra",
+                                            )}
+                                            {(field.help_url ||
+                                              field.help_url_test ||
+                                              field.help_url_live) && (
+                                              <a
+                                                href={
+                                                  formData.payment_test_mode
+                                                    ? field.help_url_test ||
+                                                      field.help_url
+                                                    : field.help_url_live ||
+                                                      field.help_url
+                                                }
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="ml-1 border-b border-blue-600 dark:border-blue-400 hover:border-transparent"
+                                              >
+                                                {__("Learn more →", "yatra")}
+                                              </a>
+                                            )}
+                                          </p>
+                                        </div>
+                                      );
+                                    }
+
+                                    // Render multiselect fields (for Mollie, Paystack, etc.)
+                                    if (
+                                      field.type === "multiselect" &&
+                                      field.options
+                                    ) {
+                                      const rawValue = config[field.id];
+                                      const selectedValues = Array.isArray(
+                                        rawValue,
+                                      )
+                                        ? rawValue
+                                        : typeof rawValue === "string" &&
+                                            rawValue.length > 0
+                                          ? rawValue
+                                              .split(",")
+                                              .map((val: string) => val.trim())
+                                              .filter(Boolean)
+                                          : Array.isArray(field.default)
+                                            ? field.default
+                                            : [];
+
+                                      const methodOptions: MultiSelectOption[] =
+                                        Object.entries(field.options).map(
+                                          ([value, label]) => ({
+                                            value,
+                                            label: String(label),
+                                          }),
+                                        );
+
+                                      const handleMultiSelectChange = (
+                                        values: (string | number)[],
+                                      ) => {
+                                        handleGatewayConfigChange(
+                                          gatewayId,
+                                          field.id,
+                                          values,
+                                        );
+                                      };
+
+                                      return (
+                                        <div
+                                          key={field.id}
+                                          className="space-y-2"
+                                        >
+                                          <FormField
+                                            id={`${gatewayId}_${field.id}`}
+                                            label={field.label}
+                                            description={field.description}
+                                          >
+                                            <MultiSelect
+                                              value={selectedValues}
+                                              onChange={handleMultiSelectChange}
+                                              options={methodOptions}
+                                              placeholder={__(
+                                                "Select options...",
+                                                "yatra",
+                                              )}
+                                            />
+                                          </FormField>
+                                          {field.help_text && (
+                                            <p className="text-xs text-blue-600 dark:text-blue-400">
+                                              {field.help_text}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    }
+
+                                    // Render select/dropdown fields
+                                    if (
+                                      field.type === "select" &&
+                                      field.options
+                                    ) {
+                                      return (
+                                        <div
+                                          key={field.id}
+                                          className="space-y-2"
+                                        >
+                                          <FormField
+                                            id={`${gatewayId}_${field.id}`}
+                                            label={field.label}
+                                            description={field.description}
+                                          >
+                                            <Select
+                                              value={
+                                                config[field.id] ??
+                                                field.default ??
+                                                ""
+                                              }
+                                              onChange={(e) =>
+                                                handleGatewayConfigChange(
+                                                  gatewayId,
+                                                  field.id,
+                                                  e.target.value,
+                                                )
+                                              }
+                                            >
+                                              {Object.entries(
+                                                field.options,
+                                              ).map(([value, label]) => (
+                                                <option
+                                                  key={value}
+                                                  value={value}
+                                                >
+                                                  {label}
+                                                </option>
+                                              ))}
+                                            </Select>
+                                          </FormField>
+                                          {field.help_text && (
+                                            <p className="text-xs text-blue-600 dark:text-blue-400">
+                                              {field.help_text}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    }
+
+                                    // Read-only display field (e.g. PayPal webhook URL): show the
+                                    // value with a Copy button; not editable, never saved.
+                                    if (field.readonly) {
+                                      const roValue = String(
+                                        config[field.id] ?? field.default ?? "",
+                                      );
+                                      return (
+                                        <div
+                                          key={field.id}
+                                          className="space-y-2"
+                                        >
+                                          <FormField
+                                            id={`${gatewayId}_${field.id}`}
+                                            label={field.label}
+                                            description={field.description}
+                                          >
+                                            <div className="flex items-center gap-2">
+                                              <Input
+                                                id={`${gatewayId}_${field.id}`}
+                                                value={roValue}
+                                                readOnly
+                                                className="bg-gray-50 dark:bg-gray-900 font-mono text-sm"
+                                              />
+                                              <Button
+                                                variant="outline"
+                                                size="sm"
+                                                onClick={() =>
+                                                  navigator.clipboard.writeText(
+                                                    roValue,
+                                                  )
+                                                }
+                                              >
+                                                {__("Copy", "yatra")}
+                                              </Button>
+                                            </div>
+                                          </FormField>
+                                          {field.help_text && (
+                                            <p className="text-xs text-blue-600 dark:text-blue-400">
+                                              {field.help_text}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    }
+
+                                    // Render text, password, number, email inputs
+                                    return (
+                                      <div key={field.id} className="space-y-2">
+                                        <FormField
+                                          id={`${gatewayId}_${field.id}`}
+                                          label={field.label}
+                                          description={field.description}
+                                        >
+                                          <Input
+                                            type={
+                                              field.type === "email"
+                                                ? "email"
+                                                : field.type
+                                            }
+                                            value={
+                                              config[field.id] ??
+                                              field.default ??
+                                              ""
+                                            }
+                                            onChange={(e) =>
+                                              handleGatewayConfigChange(
+                                                gatewayId,
+                                                field.id,
+                                                // Keep an empty field empty while
+                                                // editing so the last character can
+                                                // be cleared and retyped. Coercing
+                                                // "" to 0 (parseFloat("") || 0) made
+                                                // the field snap back and blocked
+                                                // re-entry. Numbers are coerced on
+                                                // save; "" persists harmlessly.
+                                                field.type === "number"
+                                                  ? e.target.value === ""
+                                                    ? ""
+                                                    : parseFloat(
+                                                        e.target.value,
+                                                      ) || 0
+                                                  : e.target.value,
+                                              )
+                                            }
+                                            placeholder={field.placeholder}
+                                            min={field.min}
+                                            max={field.max}
+                                          />
+                                        </FormField>
+                                        {field.help_text && (
+                                          <p className="text-xs text-blue-600 dark:text-blue-400">
+                                            {field.help_text}
+                                            {(field.help_url ||
+                                              field.help_url_test ||
+                                              field.help_url_live) && (
+                                              <a
+                                                href={
+                                                  formData.payment_test_mode
+                                                    ? field.help_url_test ||
+                                                      field.help_url
+                                                    : field.help_url_live ||
+                                                      field.help_url
+                                                }
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="ml-1 border-b border-blue-600 dark:border-blue-400 hover:border-transparent transition-colors"
+                                              >
+                                                {__("Learn more →", "yatra")}
+                                              </a>
+                                            )}
+                                          </p>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </CardContent>
+                          )}
+                          {/* Clean overlay for premium gateways */}
+                          {isPremium && (
+                            <div
+                              className="absolute inset-0 bg-gradient-to-br from-purple-500/5 to-blue-500/5 dark:from-purple-500/10 dark:to-blue-500/10 rounded-lg cursor-pointer hover:from-purple-500/10 hover:to-blue-500/10 dark:hover:from-purple-500/15 dark:hover:to-blue-500/15 transition-all duration-200"
+                              onClick={() => {
+                                setSelectedPremiumGateway(gateway.title);
+                                setShowPremiumDialog(true);
+                              }}
+                            />
+                          )}
+                        </Card>
+                      );
+                    })}
+
+                {/* Show message if no gateways loaded */}
+                {(!gatewayDefinitions ||
+                  Object.keys(gatewayDefinitions).length === 0) && (
+                  <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+                    <p>{__("Loading payment gateways...", "yatra")}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        );
+
+      case "search":
+        return (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-1">
+                {__("Search Bar Fields", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Choose which fields appear in the trip search bar. Turn off the ones you don't need for a cleaner search.",
+                  "yatra",
+                )}
+              </p>
+              <div className="space-y-4">
+                {[
+                  {
+                    key: "search_show_keyword" as const,
+                    label: __("Keyword search", "yatra"),
+                    description: __(
+                      "Free-text field to search by trip name or keyword.",
+                      "yatra",
+                    ),
+                  },
+                  {
+                    key: "search_show_destination" as const,
+                    label: __("Destination", "yatra"),
+                    description: __(
+                      "Dropdown to filter trips by destination.",
+                      "yatra",
+                    ),
+                  },
+                  {
+                    key: "search_show_activities" as const,
+                    label: __("Activities", "yatra"),
+                    description: __(
+                      "Dropdown to filter trips by activity.",
+                      "yatra",
+                    ),
+                  },
+                  {
+                    key: "search_show_duration" as const,
+                    label: __("Duration", "yatra"),
+                    description: __(
+                      "Range slider to filter trips by number of days.",
+                      "yatra",
+                    ),
+                  },
+                  {
+                    key: "search_show_budget" as const,
+                    label: __("Budget", "yatra"),
+                    description: __(
+                      "Dropdown to filter trips by price range.",
+                      "yatra",
+                    ),
+                  },
+                  {
+                    key: "search_show_date" as const,
+                    label: __("Date", "yatra"),
+                    description: __(
+                      "Date picker to find trips with a departure on a specific date.",
+                      "yatra",
+                    ),
+                  },
+                ].map((row) => (
+                  <div
+                    key={row.key}
+                    className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md"
+                  >
+                    <input
+                      type="checkbox"
+                      id={row.key}
+                      checked={!!formData[row.key]}
+                      name={row.key}
+                      onChange={handleFieldChange}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div className="flex-1">
+                      <Label
+                        htmlFor={row.key}
+                        className="font-medium cursor-pointer"
+                      >
+                        {row.label}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {row.description}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-1">
+                {__("Mobile Filters", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Controls the filter sidebar on the trip listing page on mobile devices.",
+                  "yatra",
+                )}
+              </p>
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="collapse_filters_on_mobile"
+                  checked={!!formData.collapse_filters_on_mobile}
+                  name="collapse_filters_on_mobile"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="collapse_filters_on_mobile"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Collapse filters by default on mobile", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "On mobile, show filter sections collapsed so trip listings are visible right away. Visitors tap a section to expand it. Desktop is unaffected.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      // Continue with other sections... (I'll add the most important ones)
+      case "booking":
+        return (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="booking_confirmation"
+                  checked={formData.booking_confirmation}
+                  name="booking_confirmation"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="booking_confirmation"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Send Booking Confirmation Email", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Send a confirmation email to the customer immediately after a successful booking. The post-checkout page is always shown; this toggle only controls the email.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="font-medium">
+                  {__("Auto-Confirm Bookings", "yatra")}
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 mb-2">
+                  {__(
+                    "Choose when a booking is automatically set to Confirmed. Offline methods (bank transfer, pay later) stay pending until you confirm them.",
+                    "yatra",
+                  )}
+                </p>
+                <div role="radiogroup" className="flex flex-col gap-2">
+                  {[
+                    {
+                      value: "none",
+                      label: __("Don't auto-confirm", "yatra"),
+                      sub: __(
+                        "Every booking stays Pending until you confirm it manually.",
+                        "yatra",
+                      ),
+                    },
+                    {
+                      value: "online",
+                      label: __("Auto-confirm online payments only", "yatra"),
+                      sub: __(
+                        "When an online payment (Stripe, PayPal, Razorpay…) pays the balance in full, the booking is confirmed. Deposits/partial payments and offline methods stay Pending.",
+                        "yatra",
+                      ),
+                    },
+                    {
+                      value: "all",
+                      label: __("Auto-confirm all bookings", "yatra"),
+                      sub: __(
+                        "Every booking is confirmed at checkout, whether or not it was paid.",
+                        "yatra",
+                      ),
+                    },
+                  ].map((opt) => (
+                    <label
+                      key={opt.value}
+                      htmlFor={`auto_confirm_mode_${opt.value}`}
+                      className="flex items-start gap-2 cursor-pointer"
+                    >
+                      <input
+                        type="radio"
+                        id={`auto_confirm_mode_${opt.value}`}
+                        name="auto_confirm_mode"
+                        value={opt.value}
+                        checked={
+                          (formData.auto_confirm_mode || "none") === opt.value
+                        }
+                        onChange={() =>
+                          setFormData((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  auto_confirm_mode:
+                                    opt.value as SettingsData["auto_confirm_mode"],
+                                  // Keep the legacy boolean in sync for any
+                                  // external reader (all → true, otherwise false).
+                                  auto_confirm_bookings: opt.value === "all",
+                                }
+                              : prev,
+                          )
+                        }
+                        className="mt-0.5 w-4 h-4 border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <span className="font-medium text-sm">{opt.label}</span>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {opt.sub}
+                        </p>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="font-medium">
+                  {__("Email While Payment Is Pending", "yatra")}
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 mb-2">
+                  {__(
+                    "A booking and its reference are created before the card is charged, because the payment gateway needs a booking to charge against. This is what the customer is sent in that window. Pay-later, bank transfer and zero-balance bookings are unaffected \u2014 they have no payment to wait for.",
+                    "yatra",
+                  )}
+                </p>
+                <div role="radiogroup" className="flex flex-col gap-2">
+                  {[
+                    {
+                      value: "confirmation",
+                      label: __("Send the booking confirmation straight away", "yatra"),
+                      sub: __(
+                        "The customer is emailed as soon as the booking is created, before payment completes.",
+                        "yatra",
+                      ),
+                    },
+                    {
+                      value: "after_payment",
+                      label: __("Wait until the payment succeeds", "yatra"),
+                      sub: __(
+                        "Nothing is emailed while payment is outstanding, so an abandoned or failed card attempt never produces a confirmation.",
+                        "yatra",
+                      ),
+                    },
+                  ].map((opt) => (
+                    <label
+                      key={opt.value}
+                      htmlFor={`pending_payment_email_${opt.value}`}
+                      className="flex items-start gap-2 cursor-pointer"
+                    >
+                      <input
+                        type="radio"
+                        id={`pending_payment_email_${opt.value}`}
+                        name="pending_payment_email"
+                        value={opt.value}
+                        checked={
+                          (formData.pending_payment_email || "confirmation") ===
+                          opt.value
+                        }
+                        onChange={() =>
+                          setFormData((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  pending_payment_email:
+                                    opt.value as SettingsData["pending_payment_email"],
+                                }
+                              : prev,
+                          )
+                        }
+                        className="mt-0.5 w-4 h-4 border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <span className="font-medium text-sm">{opt.label}</span>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {opt.sub}
+                        </p>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="require_login"
+                  checked={formData.require_login}
+                  name="require_login"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="require_login"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Require Login for Booking", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Customers must create an account to make bookings",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="allow_guest_checkout"
+                  checked={formData.allow_guest_checkout}
+                  name="allow_guest_checkout"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="allow_guest_checkout"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Allow Guest Checkout", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Allow customers to book without creating an account",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {/*
+                Guest email verification — only meaningful when guest
+                checkout is allowed AND login isn't required, since
+                logged-in customers' emails are verified by WordPress
+                on registration. We still render the checkbox at all
+                times so operators can pre-configure before flipping
+                the parent toggles; the help text explains the
+                dependency rather than hiding the control.
+              */}
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="require_guest_email_verification"
+                  checked={formData.require_guest_email_verification}
+                  name="require_guest_email_verification"
+                  onChange={handleFieldChange}
+                  disabled={
+                    !formData.allow_guest_checkout || formData.require_login
+                  }
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="require_guest_email_verification"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Require Guest Email Verification", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Hold guest bookings until the customer clicks a magic link sent to their email. Stops typo'd addresses and form-spam bots. Only applies when guest checkout is allowed and login isn't required — logged-in customers are already verified.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="show_sold_out"
+                  checked={formData.show_sold_out !== false}
+                  name="show_sold_out"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="show_sold_out"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Show sold-out dates", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Keep sold-out dates on the calendar marked \"Sold out\" — needed for the waitlist below. Turn this off to hide them entirely, the way blocked dates are hidden.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <FormField
+                  id="availability_horizon_months"
+                  label={__("Booking horizon (months)", "yatra")}
+                  description={__(
+                    "How far ahead customers can see and book dates on the storefront calendar — 1 to 36 months (default 12). A trip whose Available To date is earlier stops there. Long horizons make flexible-booking trips (no dates or rules configured) load more dates per page.",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="availability_horizon_months"
+                    type="number"
+                    value={formData.availability_horizon_months ?? 12}
+                    name="availability_horizon_months"
+                    onChange={handleFieldChange}
+                    min="1"
+                    max="36"
+                  />
+                </FormField>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="allow_waitlist"
+                  checked={formData.allow_waitlist}
+                  name="allow_waitlist"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="allow_waitlist"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Allow waitlist when a date is full", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Customers can join a waitlist instead of being blocked when seats are gone (per-trip caps still apply).",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="waitlist_auto_confirm"
+                  checked={formData.waitlist_auto_confirm}
+                  name="waitlist_auto_confirm"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="waitlist_auto_confirm"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Auto-confirm promoted waitlist bookings", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "When a spot opens, move the next waitlisted booking to confirmed; otherwise it becomes pending for staff review.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {/* Pro feature: replace flatpickr calendar with a dropdown of
+                  available departure dates on the single-trip sidebar + the
+                  mobile sticky bar. The checkbox stays interactive for non-Pro
+                  installs so the value can be staged, but the frontend gate
+                  ignores it unless Pro is active. */}
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="date_picker_as_dropdown"
+                  checked={!!formData.date_picker_as_dropdown}
+                  name="date_picker_as_dropdown"
+                  onChange={handleFieldChange}
+                  disabled={!(window as any).yatraAdmin?.isPro}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="date_picker_as_dropdown"
+                    className="font-medium cursor-pointer inline-flex items-center"
+                  >
+                    {__("Show available dates as a dropdown", "yatra")}
+                    <ProBadge
+                      isProActive={!!(window as any).yatraAdmin?.isPro}
+                    />
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Replace the calendar date picker with a dropdown listing every available departure date on the single-trip sidebar and the mobile sticky bar. Best for trips with a small set of fixed departures.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/*
+              Cancellation & Refund Policy section removed.
+
+              Earlier versions exposed three settings here
+              (cancellation_policy dropdown, cancellation_days number,
+              refund_policy textarea). All three were display-only —
+              they appeared in the booking confirmation email but
+              did NOT enforce any cancellation cutoff or compute any
+              refund amount, because Yatra has no customer-facing
+              self-service cancellation flow. The names implied
+              enforcement that did not exist, which is worse than
+              having no setting at all.
+
+              Per-trip cancellation copy still lives on the Trip
+              editor (Trip Builder → cancellation_policy field) and
+              is what the booking confirmation page + email now
+              show. To restore site-wide cancellation enforcement,
+              build the cancellation REST endpoint and re-add gated
+              settings here.
+            */}
+
+            <SectionDivider title={__("Booking Expiry & Reminders", "yatra")} />
+
+            <div className="space-y-4">
+              <FormField
+                id="booking_expiry_hours"
+                label={__("Booking Expiry Hours", "yatra")}
+                description={__(
+                  "Hours before unpaid bookings expire and are cancelled",
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="booking_expiry_hours"
+                  type="number"
+                  value={formData.booking_expiry_hours}
+                  name="booking_expiry_hours"
+                  onChange={handleFieldChange}
+                  min="1"
+                />
+              </FormField>
+
+              <FormField
+                id="booking_reminder_days"
+                label={__("Booking Reminder Days", "yatra")}
+                description={__(
+                  "Send reminder emails this many days before departure",
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="booking_reminder_days"
+                  type="number"
+                  value={formData.booking_reminder_days}
+                  name="booking_reminder_days"
+                  onChange={handleFieldChange}
+                  min="0"
+                />
+              </FormField>
+            </div>
+          </div>
+        );
+
+      case "pricing": {
+        // Snapshot the two Pro-module flags. The free plugin's
+        // AdminAssetsProvider sets these directly from the canonical
+        // ModuleManager::isModuleEnabled(). Truthy check (not
+        // `=== true`) is mandatory because wp_localize_script
+        // serializes every scalar to a string before handing it to
+        // JS — true becomes "1", false becomes "". Comparing
+        // === true would always be false for an enabled module,
+        // which was why every operator saw the "not active" banner
+        // even on a correctly-configured site.
+        const adEnabled = !!(window as any)?.yatraAdmin
+          ?.advancedDiscountEnabled;
+        const dpEnabled = !!(window as any)?.yatraAdmin?.dynamicPricingEnabled;
+        const bothActive = adEnabled && dpEnabled;
+        return (
+          <div className="space-y-6">
+            <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
+              {__(
+                "Controls what happens when both a Discount (coupon or group discount) and a Dynamic Pricing rule could apply to the same booking. The control only takes effect when both the Advanced Discount and Dynamic Pricing modules are turned on.",
+                "yatra",
+              )}
+            </div>
+
+            {/* Module-status banner. Green when both modules are on,
+                amber when the setting is inert because one (or both)
+                is off. Either way the dropdown stays rendered so the
+                operator knows the feature exists and what it does. */}
+            {bothActive ? (
+              <div className="rounded-md border border-green-200 bg-green-50 p-3 text-xs text-green-800 dark:border-green-800 dark:bg-green-900/20 dark:text-green-200">
+                <div className="flex items-start gap-2">
+                  <Check className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                  <div>
+                    <div className="font-medium">{__("Active", "yatra")}</div>
+                    <div className="mt-0.5">
+                      {__(
+                        "Advanced Discount and Dynamic Pricing are both enabled. Your stacking choice below is being applied to every new booking calculation.",
+                        "yatra",
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                  <div>
+                    <div className="font-medium">
+                      {__("Not active yet", "yatra")}
+                    </div>
+                    <div className="mt-0.5">
+                      {__(
+                        "This setting only applies when BOTH modules below are enabled. Without both, bookings calculate exactly as they do today (no stacking control).",
+                        "yatra",
+                      )}
+                    </div>
+                    <ul className="mt-2 space-y-1">
+                      <li className="flex items-center gap-1.5">
+                        {adEnabled ? (
+                          <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+                        ) : (
+                          <XCircle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+                        )}
+                        <span>
+                          {__("Advanced Discount module", "yatra")}{" "}
+                          {adEnabled
+                            ? __("(enabled)", "yatra")
+                            : __("(not enabled)", "yatra")}
+                        </span>
+                      </li>
+                      <li className="flex items-center gap-1.5">
+                        {dpEnabled ? (
+                          <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+                        ) : (
+                          <XCircle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+                        )}
+                        <span>
+                          {__("Dynamic Pricing module", "yatra")}{" "}
+                          {dpEnabled
+                            ? __("(enabled)", "yatra")
+                            : __("(not enabled)", "yatra")}
+                        </span>
+                      </li>
+                    </ul>
+                    <button
+                      type="button"
+                      onClick={() => navigateMenu("modules")}
+                      className="mt-2 inline-flex items-center gap-1 text-amber-900 underline hover:text-amber-700 dark:text-amber-100 dark:hover:text-amber-300"
+                    >
+                      {__("Open Modules", "yatra")}
+                      <ExternalLink className="h-3 w-3" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <FormField
+              id="discount_stacking_mode"
+              label={__("Discount Stacking", "yatra")}
+              description={__(
+                "Pick how Discounts and Dynamic Pricing combine on the same booking.",
+                "yatra",
+              )}
+            >
+              <Select
+                id="discount_stacking_mode"
+                name="discount_stacking_mode"
+                value={formData.discount_stacking_mode ?? "both"}
+                onChange={handleFieldChange}
+                disabled={!bothActive}
+              >
+                <option value="both">
+                  {__(
+                    "Both apply (legacy) — Dynamic Pricing and Discount stack",
+                    "yatra",
+                  )}
+                </option>
+                <option value="best_for_customer">
+                  {__(
+                    "Best for the customer — pick whichever single mechanism gives the larger reduction",
+                    "yatra",
+                  )}
+                </option>
+                <option value="discount_only">
+                  {__(
+                    "Discount only — if a coupon or group discount applies, ignore Dynamic Pricing",
+                    "yatra",
+                  )}
+                </option>
+                <option value="dynamic_pricing_only">
+                  {__(
+                    "Dynamic Pricing only — if a Dynamic Pricing rule fires, ignore the discount",
+                    "yatra",
+                  )}
+                </option>
+              </Select>
+            </FormField>
+
+            <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800 dark:border-blue-800 dark:bg-blue-900/20 dark:text-blue-200">
+              {__("What each mode does:", "yatra")}
+              <ul className="mt-2 ml-4 list-disc space-y-1">
+                <li>
+                  <strong>{__("Both apply", "yatra")}</strong>
+                  {" — "}
+                  {__(
+                    "default and matches the original behavior. A coupon stacks on top of the Dynamic Pricing-adjusted price.",
+                    "yatra",
+                  )}
+                </li>
+                <li>
+                  <strong>{__("Best for the customer", "yatra")}</strong>
+                  {" — "}
+                  {__(
+                    "calculates both scenarios and picks the cheaper one for the customer. Never combines.",
+                    "yatra",
+                  )}
+                </li>
+                <li>
+                  <strong>{__("Discount only", "yatra")}</strong>
+                  {" — "}
+                  {__(
+                    "when a discount is valid, Dynamic Pricing is skipped for that booking.",
+                    "yatra",
+                  )}
+                </li>
+                <li>
+                  <strong>{__("Dynamic Pricing only", "yatra")}</strong>
+                  {" — "}
+                  {__(
+                    "when a Dynamic Pricing rule reduced the price, discount codes and group discounts are ignored for that booking.",
+                    "yatra",
+                  )}
+                </li>
+              </ul>
+            </div>
+          </div>
+        );
+      }
+
+      case "customer":
+        return (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="customer_registration"
+                  checked={formData.customer_registration}
+                  name="customer_registration"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="customer_registration"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable Customer Registration", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Allow customers to create accounts on your website",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <FormField
+                id="customer_account_page"
+                label={__("Customer Account Page", "yatra")}
+                description={__(
+                  "URL path segment for the account area (e.g. my-account → /my-account/dashboard). Must match your frontend routes.",
+                  "yatra",
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="customer_account_page"
+                    value={formData.customer_account_page}
+                    name="customer_account_page"
+                    onChange={handleFieldChange}
+                    placeholder="/my-account"
+                    className="flex-1"
+                  />
+                  {formData.customer_account_page &&
+                    (() => {
+                      const siteUrl = ((window as any).yatraAdmin?.siteUrl ||
+                        "") as string;
+                      const accountUrl = buildYatraAccountViewUrl(
+                        siteUrl,
+                        formData.customer_account_page,
+                      );
+                      return (
+                        <a
+                          href={accountUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 whitespace-nowrap border border-blue-300 dark:border-blue-600 rounded-md hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
+                        >
+                          {__("View Page", "yatra")} →
+                        </a>
+                      );
+                    })()}
+                </div>
+              </FormField>
+
+              {(window as any)?.yatraAdmin?.isPro ? (
+                <div className="flex items-start gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md border border-gray-200 dark:border-gray-700">
+                  <input
+                    type="checkbox"
+                    id="enable_wishlist"
+                    checked={!!formData.enable_wishlist}
+                    name="enable_wishlist"
+                    onChange={handleFieldChange}
+                    className="w-4 h-4 mt-1 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <div className="flex-1">
+                    <Label
+                      htmlFor="enable_wishlist"
+                      className="font-medium cursor-pointer"
+                    >
+                      {__("Enable wishlist (saved trips)", "yatra")}
+                    </Label>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {__(
+                        "Shows the heart control on trip cards and single trips, and the Saved Trips area in the customer account. Requires Yatra Pro.",
+                        "yatra",
+                      )}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 rounded-lg border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-sm text-amber-900 dark:text-amber-100">
+                  {__(
+                    "Wishlist / saved trips are a Yatra Pro feature. Install Yatra Pro to enable them and turn them on in Customer settings.",
+                    "yatra",
+                  )}
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="require_email_verification"
+                  checked={formData.require_email_verification}
+                  name="require_email_verification"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="require_email_verification"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Require Email Verification", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Customers must verify their email before account activation",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "review":
+        return (
+          <div className="space-y-6">
+            <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
+              {__(
+                "These options apply to trip review forms on the frontend (who may review, moderation, minimum stars, and reminder scheduling).",
+                "yatra",
+              )}
+            </div>
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="enable_reviews"
+                  checked={formData.enable_reviews}
+                  name="enable_reviews"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="enable_reviews"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable Reviews", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Allow customers to leave reviews and ratings",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {formData.enable_reviews && (
+                <>
+                  <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="require_booking"
+                      checked={formData.require_booking}
+                      name="require_booking"
+                      onChange={handleFieldChange}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div className="flex-1">
+                      <Label
+                        htmlFor="require_booking"
+                        className="font-medium cursor-pointer"
+                      >
+                        {__("Require Booking to Review", "yatra")}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__(
+                          "Only customers who have booked can leave reviews",
+                          "yatra",
+                        )}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="auto_approve_reviews"
+                      checked={formData.auto_approve_reviews}
+                      name="auto_approve_reviews"
+                      onChange={handleFieldChange}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div className="flex-1">
+                      <Label
+                        htmlFor="auto_approve_reviews"
+                        className="font-medium cursor-pointer"
+                      >
+                        {__("Auto-Approve Reviews", "yatra")}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__(
+                          "Automatically publish reviews without moderation",
+                          "yatra",
+                        )}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="review_moderation"
+                      checked={formData.review_moderation}
+                      name="review_moderation"
+                      onChange={handleFieldChange}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div className="flex-1">
+                      <Label
+                        htmlFor="review_moderation"
+                        className="font-medium cursor-pointer"
+                      >
+                        {__("Enable Review Moderation", "yatra")}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__(
+                          "Manually approve reviews before they are published",
+                          "yatra",
+                        )}
+                      </p>
+                    </div>
+                  </div>
+
+                  <FormField
+                    id="min_rating"
+                    label={__("Minimum Rating", "yatra")}
+                    description={__(
+                      "Lowest rating value allowed (1-5 stars)",
+                      "yatra",
+                    )}
+                  >
+                    <Select
+                      id="min_rating"
+                      value={formData.min_rating}
+                      name="min_rating"
+                      onChange={handleFieldChange}
+                    >
+                      <option value="1">1 {__("Star", "yatra")}</option>
+                      <option value="2">2 {__("Stars", "yatra")}</option>
+                      <option value="3">3 {__("Stars", "yatra")}</option>
+                      <option value="4">4 {__("Stars", "yatra")}</option>
+                      <option value="5">5 {__("Stars", "yatra")}</option>
+                    </Select>
+                  </FormField>
+
+                  <FormField
+                    id="review_reminder_days"
+                    label={__("Review Reminder Days", "yatra")}
+                    description={__(
+                      "Send the review request this many days after the trip ends. Set to 0 to never send one.",
+                      "yatra",
+                    )}
+                  >
+                    <Input
+                      id="review_reminder_days"
+                      type="number"
+                      value={formData.review_reminder_days}
+                      name="review_reminder_days"
+                      onChange={handleFieldChange}
+                      min="0"
+                    />
+                  </FormField>
+
+                  <FormField
+                    id="review_reminder_max_age_days"
+                    label={__("Don't Ask About Trips Older Than", "yatra")}
+                    description={__(
+                      "Days. A trip that ended longer ago than this is never asked about — so marking a backlog of old bookings complete does not email those customers.",
+                      "yatra",
+                    )}
+                  >
+                    <Input
+                      id="review_reminder_max_age_days"
+                      type="number"
+                      value={formData.review_reminder_max_age_days}
+                      name="review_reminder_max_age_days"
+                      onChange={handleFieldChange}
+                      min="0"
+                    />
+                  </FormField>
+                </>
+              )}
+            </div>
+          </div>
+        );
+
+      case "tax":
+        return (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="enable_tax"
+                  checked={formData.enable_tax}
+                  name="enable_tax"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="enable_tax"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable Tax", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__("Add tax to booking prices", "yatra")}
+                  </p>
+                </div>
+              </div>
+
+              {formData.enable_tax && (
+                <>
+                  <FormField
+                    id="multiple_taxes"
+                    label={__("Taxes", "yatra")}
+                    description={__(
+                      "Configure taxes to apply to bookings",
+                      "yatra",
+                    )}
+                  >
+                    <MultipleTaxesEditor
+                      taxes={formData.multiple_taxes || []}
+                      onChange={(taxes) => {
+                        setFormData((prev) =>
+                          prev ? { ...prev, multiple_taxes: taxes } : prev,
+                        );
+                      }}
+                    />
+
+                    {/* New Tax Input Fields - Template for adding new taxes */}
+                    <div className="p-4 border border-gray-200 rounded-lg bg-gray-50 dark:bg-gray-800 dark:border-gray-700 mt-4">
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1">
+                          <Input
+                            value={newTaxName}
+                            onChange={(e) => setNewTaxName(e.target.value)}
+                            placeholder={__(
+                              "Tax name (e.g., VAT, GST)",
+                              "yatra",
+                            )}
+                            className="w-full"
+                          />
+                        </div>
+                        <div className="flex-1">
+                          <div className="flex items-center gap-1">
+                            <Input
+                              type="number"
+                              value={newTaxRate}
+                              onChange={(e) => setNewTaxRate(e.target.value)}
+                              min="0"
+                              max="100"
+                              step="0.01"
+                              placeholder={__("Rate", "yatra")}
+                              className="w-full"
+                            />
+                            <span className="text-sm text-gray-500 dark:text-gray-400">
+                              %
+                            </span>
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            if (
+                              newTaxName &&
+                              newTaxRate &&
+                              parseFloat(newTaxRate) >= 0 &&
+                              parseFloat(newTaxRate) <= 100
+                            ) {
+                              setFormData((prev) => {
+                                const currentTaxes = prev?.multiple_taxes || [];
+                                const newTax = {
+                                  name: newTaxName,
+                                  rate: parseFloat(newTaxRate),
+                                };
+                                const updatedTaxes = [...currentTaxes, newTax];
+                                return prev
+                                  ? { ...prev, multiple_taxes: updatedTaxes }
+                                  : prev;
+                              });
+                              setNewTaxName("");
+                              setNewTaxRate("");
+                            }
+                          }}
+                          disabled={
+                            !newTaxName ||
+                            !newTaxRate ||
+                            parseFloat(newTaxRate) < 0 ||
+                            parseFloat(newTaxRate) > 100
+                          }
+                          className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white"
+                        >
+                          <Plus className="w-4 h-4 mr-2" />
+                          {__("Add new Tax", "yatra")}
+                        </Button>
+                      </div>
+                    </div>
+
+                    {/* Total Tax Rate */}
+                    {(formData.multiple_taxes || []).length > 0 && (
+                      <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800 mt-4">
+                        <div className="text-sm font-medium text-blue-800 dark:text-blue-200">
+                          {__("Total Tax Rate:", "yatra")}{" "}
+                          {(formData.multiple_taxes || [])
+                            .reduce((sum, tax) => sum + tax.rate, 0)
+                            .toFixed(2)}
+                          %
+                        </div>
+                      </div>
+                    )}
+                  </FormField>
+
+                  <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="tax_inclusive"
+                      checked={formData.tax_inclusive}
+                      name="tax_inclusive"
+                      onChange={handleFieldChange}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div className="flex-1">
+                      <Label
+                        htmlFor="tax_inclusive"
+                        className="font-medium cursor-pointer"
+                      >
+                        {__("Tax Inclusive Pricing", "yatra")}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__("Tax is included in displayed prices", "yatra")}
+                      </p>
+                    </div>
+                  </div>
+
+                  <FormField
+                    id="vat_number"
+                    label={__("VAT Number", "yatra")}
+                    description={__(
+                      "Your company VAT or tax identification number",
+                      "yatra",
+                    )}
+                  >
+                    <Input
+                      id="vat_number"
+                      value={formData.vat_number}
+                      name="vat_number"
+                      onChange={handleFieldChange}
+                      placeholder={__("Enter VAT number", "yatra")}
+                    />
+                  </FormField>
+                </>
+              )}
+            </div>
+          </div>
+        );
+
+      case "currency":
+        return (
+          <div className="space-y-6">
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+              {__("Currency Settings", "yatra")}
+            </h3>
+
+            {/* Two Column Layout for All Currency Settings */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Left Column */}
+              <div className="space-y-6">
+                <FormField
+                  id="currency"
+                  label={__("Default Currency", "yatra")}
+                  description={__(
+                    "Primary currency for all transactions",
+                    "yatra",
+                  )}
+                  required
+                >
+                  <SearchableSelect
+                    value={formData.currency}
+                    onChange={(val) =>
+                      setFormData((prev) =>
+                        prev ? { ...prev, currency: val } : prev,
+                      )
+                    }
+                    options={getCurrencyOptions()}
+                    placeholder={__("Select currency...", "yatra")}
+                    searchPlaceholder={__("Search currencies...", "yatra")}
+                    showValueId={false}
+                  />
+                </FormField>
+
+                <FormField
+                  id="currency_position"
+                  label={__("Currency Position", "yatra")}
+                  description={__(
+                    "Where to display currency symbol relative to amount",
+                    "yatra",
+                  )}
+                >
+                  <Select
+                    id="currency_position"
+                    value={formData.currency_position}
+                    name="currency_position"
+                    onChange={handleFieldChange}
+                  >
+                    <option value="left">$100 (Left)</option>
+                    <option value="right">100$ (Right)</option>
+                    <option value="left_space">$ 100 (Left with Space)</option>
+                    <option value="right_space">
+                      100 $ (Right with Space)
+                    </option>
+                  </Select>
+                </FormField>
+
+                <FormField
+                  id="thousand_separator"
+                  label={__("Thousand Separator", "yatra")}
+                  description={__(
+                    "Character used to separate thousands (e.g., comma for 1,000)",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="thousand_separator"
+                    value={formData.thousand_separator}
+                    name="thousand_separator"
+                    onChange={handleFieldChange}
+                    maxLength={1}
+                    placeholder={","}
+                  />
+                </FormField>
+              </div>
+
+              {/* Right Column */}
+              <div className="space-y-6">
+                <FormField
+                  id="currency_decimals"
+                  label={__("Decimal Places", "yatra")}
+                  description={__(
+                    "Number of decimal places to show in prices",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="currency_decimals"
+                    type="number"
+                    value={formData.currency_decimals}
+                    name="currency_decimals"
+                    onChange={handleFieldChange}
+                    min="0"
+                    max="4"
+                  />
+                </FormField>
+
+                <FormField
+                  id="decimal_separator"
+                  label={__("Decimal Separator", "yatra")}
+                  description={__(
+                    "Character used to separate decimal part (e.g., period for 99.99)",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="decimal_separator"
+                    value={formData.decimal_separator}
+                    name="decimal_separator"
+                    onChange={handleFieldChange}
+                    maxLength={1}
+                    placeholder={"."}
+                  />
+                </FormField>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "integration":
+        return (
+          <div className="space-y-6">
+            {/* Google Calendar Integration - Only show if Pro is active */}
+            {window.yatraAdmin &&
+              (window as any).yatraAdmin.showGoogleCalendarSettingsUI && (
+                <>
+                  <SectionDivider
+                    title={__("Google Calendar Integration", "yatra")}
+                  />
+                  <GoogleCalendarIntegrationSection
+                    formData={formData}
+                    setFormData={setFormData}
+                  />
+                </>
+              )}
+
+            {/* Mailchimp Integration - Pro Feature */}
+            <SectionDivider title={__("Mailchimp Integration", "yatra")} />
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between pb-2">
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <Mail className="w-5 h-5 text-yellow-500" />
+                  {__("Mailchimp", "yatra")}
+                  <ProBadge isProActive={(window as any).yatraAdmin?.isPro} />
+                </CardTitle>
+                {(window as any).yatraAdmin?.mailchimp?.connectionStatus
+                  ?.connected ? (
+                  <div className="flex items-center gap-1 text-sm text-green-600 dark:text-green-400">
+                    <CheckCircle className="w-4 h-4" />
+                    {__("Connected", "yatra")}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1 text-sm text-gray-500 dark:text-gray-400">
+                    <XCircle className="w-4 h-4" />
+                    {__("Not Connected", "yatra")}
+                  </div>
+                )}
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-gray-600 dark:text-gray-300">
+                  {__(
+                    "Automatically sync customers to Mailchimp lists when they book. Add tags based on trips booked and build targeted email campaigns.",
+                    "yatra",
+                  )}
+                </p>
+
+                <ProFeature
+                  title={__("Mailchimp", "yatra")}
+                  description={__("automatically sync your customers", "yatra")}
+                  moduleName="Mailchimp"
+                  pricingUrl="https://wpyatra.com/pricing?module=mailchimp"
+                  isProActive={(window as any).yatraAdmin?.isPro}
+                  isModuleEnabled={
+                    (window as any).yatraAdmin?.showMailchimpSettingsUI
+                  }
+                >
+                  <div className="space-y-4">
+                    <FormField
+                      id="mailchimp_api_key"
+                      label={__("API Key", "yatra")}
+                      description={
+                        <>
+                          {__("Get your API key from", "yatra")}{" "}
+                          <a
+                            href="https://admin.mailchimp.com/account/api/"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline"
+                          >
+                            {__("Mailchimp Account Settings", "yatra")}
+                          </a>
+                        </>
+                      }
+                    >
+                      <div className="flex gap-2">
+                        <div className="relative flex-1">
+                          <Input
+                            id="mailchimp_api_key"
+                            type={showApiKey ? "text" : "password"}
+                            value={formData.mailchimp_api_key || ""}
+                            name="mailchimp_api_key"
+                            onChange={handleFieldChange}
+                            placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-us1"
+                            className="pr-10"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowApiKey(!showApiKey)}
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            tabIndex={-1}
+                          >
+                            {showApiKey ? (
+                              <EyeOff className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            ) : (
+                              <Eye className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            )}
+                          </button>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={validateMailchimpApiKey}
+                          disabled={
+                            !formData.mailchimp_api_key || validatingApiKey
+                          }
+                          className="whitespace-nowrap"
+                        >
+                          {validatingApiKey ? (
+                            <>
+                              <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                              {__("Validating...", "yatra")}
+                            </>
+                          ) : (
+                            <>
+                              <Check className="h-4 w-4 mr-2" />
+                              {__("Validate", "yatra")}
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                      {formData.mailchimp_api_key && (
+                        <div
+                          className={`mt-2 text-sm ${(window as any).yatraAdmin?.mailchimp?.connectionStatus?.connected ? "text-green-600 dark:text-green-400" : "text-orange-600 dark:text-orange-400"}`}
+                        >
+                          {(window as any).yatraAdmin?.mailchimp
+                            ?.connectionStatus?.connected ? (
+                            <>
+                              <CheckCircle className="h-4 w-4 inline mr-1" />
+                              {__("Connected successfully!", "yatra")}
+                            </>
+                          ) : (window as any).yatraAdmin?.mailchimp
+                              ?.connectionStatus?.error ? (
+                            <>
+                              <XCircle className="h-4 w-4 inline mr-1" />
+                              {
+                                (window as any).yatraAdmin?.mailchimp
+                                  ?.connectionStatus?.error
+                              }
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="h-4 w-4 inline mr-1" />
+                              {__(
+                                "API key entered. Click 'Validate' to test connection.",
+                                "yatra",
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </FormField>
+
+                    <FormField
+                      id="mailchimp_list_id"
+                      label={__("Audience/List", "yatra")}
+                      description={__(
+                        "Select the Mailchimp audience to sync subscribers to.",
+                        "yatra",
+                      )}
+                    >
+                      <Select
+                        id="mailchimp_list_id"
+                        value={formData.mailchimp_list_id || ""}
+                        name="mailchimp_list_id"
+                        onChange={handleFieldChange}
+                        disabled={
+                          !(window as any).yatraAdmin?.mailchimp
+                            ?.connectionStatus?.connected
+                        }
+                      >
+                        <option value="">
+                          {!(window as any).yatraAdmin?.mailchimp
+                            ?.connectionStatus?.connected
+                            ? __("Please validate API key first", "yatra")
+                            : __("Select an audience", "yatra")}
+                        </option>
+                        {(
+                          window as any
+                        ).yatraAdmin?.mailchimp?.availableLists?.map(
+                          (list: any) => (
+                            <option key={list.id} value={list.id}>
+                              {list.name}
+                            </option>
+                          ),
+                        )}
+                      </Select>
+                    </FormField>
+
+                    <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <input
+                        type="checkbox"
+                        id="mailchimp_sync_on_booking"
+                        checked={formData.mailchimp_sync_on_booking ?? true}
+                        name="mailchimp_sync_on_booking"
+                        onChange={handleFieldChange}
+                        className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="mailchimp_sync_on_booking"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Sync on Booking", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__(
+                            "Automatically add customers to Mailchimp when they make a booking",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                      <input
+                        type="checkbox"
+                        id="mailchimp_double_optin"
+                        checked={formData.mailchimp_double_optin ?? false}
+                        name="mailchimp_double_optin"
+                        onChange={handleFieldChange}
+                        className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="mailchimp_double_optin"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Double Opt-in", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__(
+                            "Require email confirmation before adding to list (recommended for GDPR)",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Advanced Field Mapping Section */}
+                    {formData.mailchimp_api_key &&
+                      formData.mailchimp_list_id && (
+                        <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+                          <h4 className="text-sm font-semibold text-gray-900 dark:text-white mb-3 flex items-center gap-2">
+                            <ClipboardList className="w-4 h-4" />
+                            {__("Field Mapping", "yatra")}
+                          </h4>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                            {__(
+                              "Map Yatra customer fields to Mailchimp merge fields. This controls what data is synced when a customer is added to your list.",
+                              "yatra",
+                            )}
+                          </p>
+
+                          <div className="space-y-3">
+                            {(window as any).yatraAdmin?.mailchimp?.mergeFields
+                              ?.length > 0 ? (
+                              (
+                                window as any
+                              ).yatraAdmin?.mailchimp?.mergeFields.map(
+                                (field: any) => {
+                                  const currentMapping =
+                                    (formData as any).mailchimp_field_mapping ||
+                                    {};
+                                  const yatraFields =
+                                    (window as any).yatraAdmin?.mailchimp
+                                      ?.yatraFields || {};
+                                  const yatraFieldOptions =
+                                    yatraFields[field.type] ||
+                                    yatraFields["text"] ||
+                                    [];
+
+                                  return (
+                                    <div
+                                      key={field.tag}
+                                      className="grid grid-cols-2 gap-3 items-center"
+                                    >
+                                      <div className="text-sm text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-gray-800 px-3 py-2 rounded">
+                                        <div className="flex items-center gap-2">
+                                          <span>{field.name}</span>
+                                          {field.required && (
+                                            <span className="text-xs text-red-500">
+                                              *
+                                            </span>
+                                          )}
+                                          <span className="text-xs text-gray-400">
+                                            ({field.tag})
+                                          </span>
+                                        </div>
+                                      </div>
+                                      <Select
+                                        value={currentMapping[field.tag] || ""}
+                                        onChange={(e) => {
+                                          const newMapping = {
+                                            ...((formData as any)
+                                              .mailchimp_field_mapping || {}),
+                                          };
+                                          if (e.target.value) {
+                                            newMapping[field.tag] =
+                                              e.target.value;
+                                          } else {
+                                            delete newMapping[field.tag];
+                                          }
+                                          setFormData((prev: any) => ({
+                                            ...prev,
+                                            mailchimp_field_mapping: newMapping,
+                                          }));
+                                        }}
+                                      >
+                                        <option value="">
+                                          {__("Do not sync", "yatra")}
+                                        </option>
+                                        {Object.entries(yatraFieldOptions).map(
+                                          ([value, label]) => (
+                                            <option key={value} value={value}>
+                                              {String(label)}
+                                            </option>
+                                          ),
+                                        )}
+                                      </Select>
+                                    </div>
+                                  );
+                                },
+                              )
+                            ) : (
+                              <div className="text-center py-4 text-sm text-gray-500 dark:text-gray-400">
+                                {__(
+                                  "No merge fields available. Please select a list first.",
+                                  "yatra",
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Tags Configuration */}
+                          <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+                            <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                              <input
+                                type="checkbox"
+                                id="mailchimp_add_tags"
+                                checked={
+                                  (formData as any).mailchimp_add_tags ?? true
+                                }
+                                onChange={(e) =>
+                                  setFormData((prev: any) => ({
+                                    ...prev,
+                                    mailchimp_add_tags: e.target.checked,
+                                  }))
+                                }
+                                className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                              <div className="flex-1">
+                                <Label
+                                  htmlFor="mailchimp_add_tags"
+                                  className="font-medium cursor-pointer"
+                                >
+                                  {__("Add Trip Tags", "yatra")}
+                                </Label>
+                                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                  {__(
+                                    "Automatically tag subscribers with the trip name they booked",
+                                    "yatra",
+                                  )}
+                                </p>
+                              </div>
+                            </div>
+
+                            <FormField
+                              id="mailchimp_default_tags"
+                              label={__("Default Tags", "yatra")}
+                              description={__(
+                                'Comma-separated tags to add to all synced subscribers (e.g., "yatra, booking")',
+                                "yatra",
+                              )}
+                            >
+                              <Input
+                                id="mailchimp_default_tags"
+                                value={
+                                  (formData as any).mailchimp_default_tags || ""
+                                }
+                                onChange={(e) =>
+                                  setFormData((prev: any) => ({
+                                    ...prev,
+                                    mailchimp_default_tags: e.target.value,
+                                  }))
+                                }
+                                placeholder="yatra, booking"
+                              />
+                            </FormField>
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                </ProFeature>
+              </CardContent>
+            </Card>
+
+            {/* Facebook Pixel Integration - Pro Feature */}
+            <SectionDivider title={__("Facebook Pixel", "yatra")} />
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between pb-2">
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <svg
+                    className="w-5 h-5 text-blue-600"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                  >
+                    <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
+                  </svg>
+                  {__("Facebook Pixel", "yatra")}
+                  <ProBadge isProActive={(window as any).yatraAdmin?.isPro} />
+                </CardTitle>
+                {(window as any).yatraAdmin?.facebookPixel?.connectionStatus
+                  ?.pixelConnected ? (
+                  <div className="flex items-center gap-1 text-sm text-green-600 dark:text-green-400">
+                    <CheckCircle className="w-4 h-4" />
+                    {__("Connected", "yatra")}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1 text-sm text-gray-500 dark:text-gray-400">
+                    <XCircle className="w-4 h-4" />
+                    {__("Not Connected", "yatra")}
+                  </div>
+                )}
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-gray-600 dark:text-gray-300">
+                  {__(
+                    "Track booking conversions with Facebook Pixel. Retarget visitors who viewed trips and optimize ad campaigns with accurate conversion data.",
+                    "yatra",
+                  )}
+                </p>
+
+                <ProFeature
+                  title={__("Facebook Pixel", "yatra")}
+                  description={__(
+                    "access advanced conversion tracking features",
+                    "yatra",
+                  )}
+                  moduleName="Facebook Pixel"
+                  pricingUrl="https://wpyatra.com/pricing?module=facebook-pixel"
+                  isProActive={(window as any).yatraAdmin?.isPro}
+                  isModuleEnabled={
+                    (window as any).yatraAdmin?.showFacebookPixelSettingsUI
+                  }
+                >
+                  <div className="space-y-4">
+                    <FormField
+                      id="facebook_pixel_id"
+                      label={__("Pixel ID", "yatra")}
+                      description={
+                        <div className="space-y-2">
+                          <p>
+                            {__(
+                              "Your Facebook Pixel ID (e.g., 123456789012345).",
+                              "yatra",
+                            )}
+                          </p>
+                          <details className="text-sm">
+                            <summary className="cursor-pointer text-blue-600 hover:text-blue-500 dark:text-blue-400 font-medium">
+                              {__("How to get your Pixel ID:", "yatra")}
+                            </summary>
+                            <ol className="mt-2 ml-4 list-decimal space-y-1 text-gray-600 dark:text-gray-400">
+                              <li>
+                                {__(
+                                  "Go to Facebook Business Manager: business.facebook.com",
+                                  "yatra",
+                                )}
+                              </li>
+                              <li>
+                                {__("Select your Business Account", "yatra")}
+                              </li>
+                              <li>
+                                {__(
+                                  "Click 'All tools' and select 'Pixels'",
+                                  "yatra",
+                                )}
+                              </li>
+                              <li>
+                                {__(
+                                  "Click 'Add Pixel' if you don't have one",
+                                  "yatra",
+                                )}
+                              </li>
+                              <li>
+                                {__(
+                                  "Enter a Pixel name and enter your website URL",
+                                  "yatra",
+                                )}
+                              </li>
+                              <li>{__("Click 'Create Pixel'", "yatra")}</li>
+                              <li>
+                                {__(
+                                  "Your Pixel ID will be displayed (e.g., 123456789012345)",
+                                  "yatra",
+                                )}
+                              </li>
+                              <li>
+                                {__(
+                                  "Copy this Pixel ID and paste it in the field above",
+                                  "yatra",
+                                )}
+                              </li>
+                            </ol>
+                          </details>
+                          <div className="mt-2">
+                            <a
+                              href="https://business.facebook.com/events_manager"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline text-sm"
+                            >
+                              {__("Open Facebook Events Manager →", "yatra")}
+                            </a>
+                          </div>
+                        </div>
+                      }
+                    >
+                      <div className="flex gap-2">
+                        <div className="flex-1">
+                          <Input
+                            id="facebook_pixel_id"
+                            value={formData.facebook_pixel_id || ""}
+                            name="facebook_pixel_id"
+                            onChange={handleFieldChange}
+                            placeholder="123456789012345"
+                          />
+                        </div>
+                        <Button
+                          type="button"
+                          onClick={validateFacebookPixel}
+                          disabled={
+                            !formData.facebook_pixel_id || validatingPixel
+                          }
+                          variant="outline"
+                          size="sm"
+                          className="whitespace-nowrap"
+                        >
+                          {validatingPixel ? (
+                            <>
+                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              {__("Validating...", "yatra")}
+                            </>
+                          ) : (
+                            <>
+                              <Check className="h-4 w-4 mr-2" />
+                              {__("Validate", "yatra")}
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                      {formData.facebook_pixel_id && (
+                        <div
+                          className={`mt-2 text-sm ${(window as any).yatraAdmin?.facebookPixel?.connectionStatus?.pixelConnected ? "text-green-600 dark:text-green-400" : "text-orange-600 dark:text-orange-400"}`}
+                        >
+                          {(window as any).yatraAdmin?.facebookPixel
+                            ?.connectionStatus?.pixelConnected ? (
+                            <>
+                              <CheckCircle className="h-4 w-4 inline mr-1" />
+                              {__("Pixel ID is valid!", "yatra")}
+                            </>
+                          ) : (window as any).yatraAdmin?.facebookPixel
+                              ?.connectionStatus?.pixelError ? (
+                            <>
+                              <XCircle className="h-4 w-4 inline mr-1" />
+                              {
+                                (window as any).yatraAdmin?.facebookPixel
+                                  ?.connectionStatus?.pixelError
+                              }
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="h-4 w-4 inline mr-1" />
+                              {__(
+                                "Click 'Validate' to test Pixel ID.",
+                                "yatra",
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </FormField>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                        <input
+                          type="checkbox"
+                          id="fb_track_view_content"
+                          checked={formData.fb_track_view_content ?? true}
+                          name="fb_track_view_content"
+                          onChange={handleFieldChange}
+                          className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <Label
+                          htmlFor="fb_track_view_content"
+                          className="text-sm cursor-pointer"
+                        >
+                          {__("Track ViewContent", "yatra")}
+                        </Label>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                        <input
+                          type="checkbox"
+                          id="fb_track_initiate_checkout"
+                          checked={formData.fb_track_initiate_checkout ?? true}
+                          name="fb_track_initiate_checkout"
+                          onChange={handleFieldChange}
+                          className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <Label
+                          htmlFor="fb_track_initiate_checkout"
+                          className="text-sm cursor-pointer"
+                        >
+                          {__("Track InitiateCheckout", "yatra")}
+                        </Label>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                        <input
+                          type="checkbox"
+                          id="fb_track_purchase"
+                          checked={formData.fb_track_purchase ?? true}
+                          name="fb_track_purchase"
+                          onChange={handleFieldChange}
+                          className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <Label
+                          htmlFor="fb_track_purchase"
+                          className="text-sm cursor-pointer"
+                        >
+                          {__("Track Purchase", "yatra")}
+                        </Label>
+                      </div>
+
+                      <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                        <input
+                          type="checkbox"
+                          id="fb_use_conversions_api"
+                          checked={formData.fb_use_conversions_api ?? false}
+                          name="fb_use_conversions_api"
+                          onChange={handleFieldChange}
+                          className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <Label
+                          htmlFor="fb_use_conversions_api"
+                          className="text-sm cursor-pointer"
+                        >
+                          {__("Use Conversions API", "yatra")}
+                        </Label>
+                      </div>
+                    </div>
+
+                    {formData.fb_use_conversions_api && (
+                      <FormField
+                        id="facebook_access_token"
+                        label={__("Access Token", "yatra")}
+                        description={
+                          <div className="space-y-2">
+                            <p>
+                              {__(
+                                "Required for Conversions API. Enables server-side tracking for better accuracy.",
+                                "yatra",
+                              )}
+                            </p>
+                            <details className="text-sm">
+                              <summary className="cursor-pointer text-blue-600 hover:text-blue-500 dark:text-blue-400 font-medium">
+                                {__("How to get Access Token:", "yatra")}
+                              </summary>
+                              <ol className="mt-2 ml-4 list-decimal space-y-1 text-gray-600 dark:text-gray-400">
+                                <li>
+                                  {__(
+                                    "Go to Facebook Business Manager: business.facebook.com",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__("Select your Business Account", "yatra")}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Click 'All tools' and select 'Events Manager'",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Find your Pixel ID in the data sources list (it should match the Pixel ID you entered above)",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Click on your Pixel name to open its settings",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Click 'Settings' (gear icon ⚙️) in the top right",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Scroll down to 'Conversions API' section",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__("Click 'Generate access token'", "yatra")}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Choose permissions: 'ads_management' and 'business_management'",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>{__("Click 'Generate token'", "yatra")}</li>
+                                <li>
+                                  {__(
+                                    "Copy the generated access token",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__("Paste it in the field above", "yatra")}
+                                </li>
+                              </ol>
+                              <div className="mt-3 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded">
+                                <p className="text-xs text-blue-800 dark:text-blue-300">
+                                  <strong>{__("💡 Tip:", "yatra")}</strong>{" "}
+                                  {__(
+                                    "If you have multiple Pixels, look for the one that matches the Pixel ID you entered above. The Pixel ID is displayed next to each Pixel name in the list.",
+                                    "yatra",
+                                  )}
+                                </p>
+                              </div>
+                              <div className="mt-2 p-2 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded">
+                                <p className="text-xs text-yellow-800 dark:text-yellow-300">
+                                  {__(
+                                    "⚠️ Keep your access token secure and never share it publicly.",
+                                    "yatra",
+                                  )}
+                                </p>
+                              </div>
+                            </details>
+                            <div className="mt-2">
+                              <a
+                                href="https://business.facebook.com/settings/conversions-api"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline text-sm"
+                              >
+                                {__("Open Conversions API Settings →", "yatra")}
+                              </a>
+                            </div>
+                          </div>
+                        }
+                      >
+                        <div className="space-y-2">
+                          <div className="flex gap-2">
+                            <div className="flex-1 relative">
+                              <Input
+                                id="facebook_access_token"
+                                type={showFacebookToken ? "text" : "password"}
+                                value={formData.facebook_access_token || ""}
+                                name="facebook_access_token"
+                                onChange={handleFieldChange}
+                                placeholder="EAAC..."
+                                className="pr-10"
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setShowFacebookToken(!showFacebookToken)
+                                }
+                                className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                                tabIndex={-1}
+                              >
+                                {showFacebookToken ? (
+                                  <EyeOff className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                                ) : (
+                                  <Eye className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                                )}
+                              </button>
+                            </div>
+                            <Button
+                              type="button"
+                              onClick={validateFacebookToken}
+                              disabled={
+                                !formData.facebook_access_token ||
+                                validatingToken
+                              }
+                              variant="outline"
+                              size="sm"
+                              className="whitespace-nowrap"
+                            >
+                              {validatingToken ? (
+                                <>
+                                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                  {__("Validating...", "yatra")}
+                                </>
+                              ) : (
+                                <>
+                                  <Check className="h-4 w-4 mr-2" />
+                                  {__("Validate", "yatra")}
+                                </>
+                              )}
+                            </Button>
+                          </div>
+                          {formData.facebook_access_token && (
+                            <div
+                              className={`text-sm ${(window as any).yatraAdmin?.facebookPixel?.connectionStatus?.tokenConnected ? "text-green-600 dark:text-green-400" : "text-orange-600 dark:text-orange-400"}`}
+                            >
+                              {(window as any).yatraAdmin?.facebookPixel
+                                ?.connectionStatus?.tokenConnected ? (
+                                <>
+                                  <CheckCircle className="h-4 w-4 inline mr-1" />
+                                  {__("Access token is valid!", "yatra")}
+                                </>
+                              ) : (window as any).yatraAdmin?.facebookPixel
+                                  ?.connectionStatus?.tokenError ? (
+                                <>
+                                  <XCircle className="h-4 w-4 inline mr-1" />
+                                  {
+                                    (window as any).yatraAdmin?.facebookPixel
+                                      ?.connectionStatus?.tokenError
+                                  }
+                                </>
+                              ) : (
+                                <>
+                                  <AlertCircle className="h-4 w-4 inline mr-1" />
+                                  {__(
+                                    "Click 'Validate' to test access token.",
+                                    "yatra",
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </FormField>
+                    )}
+                  </div>
+                </ProFeature>
+                {/* Facebook Pixel Monitoring Notice */}
+                {(window as any).yatraAdmin?.facebookPixel?.pixelId && (
+                  <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+                    <div className="flex items-center gap-2">
+                      <svg
+                        className="w-4 h-4 text-blue-600 dark:text-blue-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                      </svg>
+                      <div className="text-sm">
+                        <span className="text-blue-800 dark:text-blue-300 font-medium">
+                          {__("Facebook Pixel Monitoring:", "yatra")}
+                        </span>
+                        <span className="text-blue-700 dark:text-blue-400 ml-1">
+                          {__(
+                            "View event statistics and activity in the ",
+                            "yatra",
+                          )}
+                          <a
+                            href={`${(window as any).yatraAdmin?.siteUrl || ""}/wp-admin/admin.php?page=yatra&subpage=reports`}
+                            className="underline hover:text-blue-600 dark:hover:text-blue-300 font-medium"
+                          >
+                            {__("Reports page", "yatra")}
+                          </a>
+                          {__(" → Facebook Pixel tab.", "yatra")}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Google Analytics 4 Enhanced - Pro Feature */}
+            <SectionDivider
+              title={__("Google Analytics 4 Enhanced", "yatra")}
+            />
+            <Card className="overflow-hidden border-gray-200 dark:border-gray-700 shadow-sm">
+              <CardHeader className="flex flex-row flex-wrap items-start gap-3 justify-between border-b border-gray-100 dark:border-gray-800 bg-gray-50/80 dark:bg-gray-900/40 pb-4">
+                <CardTitle className="text-lg flex items-center gap-2.5 text-gray-900 dark:text-white">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-orange-500/10 dark:bg-orange-500/15">
+                    <BarChart3
+                      className="w-5 h-5 text-orange-600 dark:text-orange-400"
+                      aria-hidden
+                    />
+                  </span>
+                  <span className="flex flex-wrap items-center gap-2 leading-tight">
+                    {__("Google Analytics 4 Enhanced", "yatra")}
+                    <ProBadge isProActive={(window as any).yatraAdmin?.isPro} />
+                  </span>
+                </CardTitle>
+                {(() => {
+                  const ga4HasId = Boolean(formData.ga4_measurement_id?.trim());
+                  const ga4Connected =
+                    ga4HasId ||
+                    Boolean(
+                      (window as any).yatraAdmin?.googleAnalytics?.connected,
+                    );
+                  return ga4Connected ? (
+                    <div className="inline-flex items-center gap-1.5 rounded-full border border-green-200 bg-green-50 px-2.5 py-1 text-xs font-medium text-green-800 dark:border-green-800 dark:bg-green-950/40 dark:text-green-300">
+                      <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                      {__("Measurement ID set", "yatra")}
+                    </div>
+                  ) : (
+                    <div className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-400">
+                      <XCircle className="w-3.5 h-3.5 shrink-0" />
+                      {__("Not configured", "yatra")}
+                    </div>
+                  );
+                })()}
+              </CardHeader>
+              <CardContent className="space-y-6 pt-6">
+                <p className="text-sm leading-relaxed text-gray-600 dark:text-gray-300">
+                  {__(
+                    "Connect GA4 for ecommerce events (view item, add to cart, checkout, purchase). Optional Measurement Protocol sends verified server-side events for more reliable attribution.",
+                    "yatra",
+                  )}
+                </p>
+
+                <ProFeature
+                  title={__("Google Analytics 4 Enhanced", "yatra")}
+                  description={__(
+                    "access enhanced e-commerce tracking features",
+                    "yatra",
+                  )}
+                  moduleName="Google Analytics"
+                  pricingUrl="https://wpyatra.com/pricing?module=google-analytics"
+                  isProActive={(window as any).yatraAdmin?.isPro}
+                  isModuleEnabled={
+                    (window as any).yatraAdmin?.showGoogleAnalyticsSettingsUI
+                  }
+                >
+                  <div className="space-y-8">
+                    {/* Connection */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-950/30 sm:p-5">
+                      <div className="mb-4">
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-white">
+                          {__("Connection", "yatra")}
+                        </h4>
+                        <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                          {__(
+                            "Use your GA4 web data stream Measurement ID (format G-XXXXXXXXXX). Find it under Admin → Data streams → your stream.",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                      <FormField
+                        id="ga4_measurement_id"
+                        label={__("Measurement ID", "yatra")}
+                        description={
+                          <div className="space-y-2">
+                            <p>
+                              {__(
+                                "Your GA4 web data stream Measurement ID (format G-XXXXXXXXXX). The Validate button checks the format only — confirm the stream is live in your GA4 Admin.",
+                                "yatra",
+                              )}
+                            </p>
+                            <details className="text-sm">
+                              <summary className="cursor-pointer font-medium text-blue-600 hover:text-blue-500 dark:text-blue-400">
+                                {__("How to get your Measurement ID:", "yatra")}
+                              </summary>
+                              <ol className="mt-2 ml-4 list-decimal space-y-1 text-gray-600 dark:text-gray-400">
+                                <li>
+                                  {__(
+                                    "Go to Google Analytics: analytics.google.com",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Sign in and select the property you want to track this site with (or create one: Admin → Create → Property → choose your business details).",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "In the bottom-left corner click the gear icon (Admin).",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "In the Property column click Data Streams.",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Click your existing Web stream — or click Add stream → Web, enter your site URL and a stream name, then Create stream.",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "On the stream details panel, copy the Measurement ID at the top right (format G-XXXXXXXXXX).",
+                                    "yatra",
+                                  )}
+                                </li>
+                                <li>
+                                  {__(
+                                    "Paste it in the field above and click Validate.",
+                                    "yatra",
+                                  )}
+                                </li>
+                              </ol>
+                            </details>
+                            <div className="mt-2">
+                              <a
+                                href="https://analytics.google.com/analytics/web/"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline text-sm"
+                              >
+                                {__("Open Google Analytics →", "yatra")}
+                              </a>
+                            </div>
+                          </div>
+                        }
+                        actionButton={
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => validateMeasurementId()}
+                            disabled={
+                              !formData.ga4_measurement_id?.trim() ||
+                              validatingMeasurementId
+                            }
+                            className="shrink-0"
+                          >
+                            {validatingMeasurementId ? (
+                              <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                {__("Validating...", "yatra")}
+                              </>
+                            ) : (
+                              <>
+                                <Check className="mr-2 h-4 w-4" />
+                                {__("Validate", "yatra")}
+                              </>
+                            )}
+                          </Button>
+                        }
+                      >
+                        <Input
+                          id="ga4_measurement_id"
+                          value={formData.ga4_measurement_id || ""}
+                          name="ga4_measurement_id"
+                          onChange={handleFieldChange}
+                          placeholder="G-XXXXXXXXXX"
+                          className="font-mono text-sm"
+                          spellCheck={false}
+                          autoComplete="off"
+                        />
+                      </FormField>
+                    </div>
+
+                    {/* Events */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-950/30 sm:p-5">
+                      <div className="mb-4">
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-white">
+                          {__("Events", "yatra")}
+                        </h4>
+                        <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                          {__(
+                            "Choose which standard ecommerce events Yatra should emit to GA4 on the storefront and booking flow.",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                        <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                          <input
+                            type="checkbox"
+                            id="ga4_track_view_item"
+                            checked={formData.ga4_track_view_item ?? true}
+                            name="ga4_track_view_item"
+                            onChange={handleFieldChange}
+                            className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <Label
+                              htmlFor="ga4_track_view_item"
+                              className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                            >
+                              {__("View item", "yatra")}
+                            </Label>
+                            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                              {__(
+                                "Trip detail pages (recommended for remarketing).",
+                                "yatra",
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                          <input
+                            type="checkbox"
+                            id="ga4_track_add_to_cart"
+                            checked={formData.ga4_track_add_to_cart ?? true}
+                            name="ga4_track_add_to_cart"
+                            onChange={handleFieldChange}
+                            className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <Label
+                              htmlFor="ga4_track_add_to_cart"
+                              className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                            >
+                              {__("Add to cart", "yatra")}
+                            </Label>
+                            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                              {__(
+                                "When a trip is added to the booking session / checkout.",
+                                "yatra",
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                          <input
+                            type="checkbox"
+                            id="ga4_track_begin_checkout"
+                            checked={formData.ga4_track_begin_checkout ?? true}
+                            name="ga4_track_begin_checkout"
+                            onChange={handleFieldChange}
+                            className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <Label
+                              htmlFor="ga4_track_begin_checkout"
+                              className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                            >
+                              {__("Begin checkout", "yatra")}
+                            </Label>
+                            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                              {__(
+                                "When a booking is created (checkout started).",
+                                "yatra",
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                          <input
+                            type="checkbox"
+                            id="ga4_track_purchase"
+                            checked={formData.ga4_track_purchase ?? true}
+                            name="ga4_track_purchase"
+                            onChange={handleFieldChange}
+                            className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <Label
+                              htmlFor="ga4_track_purchase"
+                              className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                            >
+                              {__("Purchase", "yatra")}
+                            </Label>
+                            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                              {__(
+                                "When payment completes (and on confirmation page).",
+                                "yatra",
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Measurement Protocol */}
+                    <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-950/30 sm:p-5">
+                      <div className="mb-4">
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-white">
+                          {__("Server-side (Measurement Protocol)", "yatra")}
+                        </h4>
+                        <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                          {__(
+                            "Send duplicate events from your server with an API secret—useful when ad blockers affect the browser tag or for reconciliation.",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+
+                      <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                        <input
+                          type="checkbox"
+                          id="ga4_use_measurement_protocol"
+                          checked={
+                            formData.ga4_use_measurement_protocol ?? false
+                          }
+                          name="ga4_use_measurement_protocol"
+                          onChange={handleFieldChange}
+                          className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <Label
+                            htmlFor="ga4_use_measurement_protocol"
+                            className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                          >
+                            {__("Enable Measurement Protocol", "yatra")}
+                          </Label>
+                          <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                            {__(
+                              "Requires an API secret from the same GA4 data stream.",
+                              "yatra",
+                            )}
+                          </p>
+                        </div>
+                      </div>
+
+                      {formData.ga4_use_measurement_protocol && (
+                        <div className="mt-4 space-y-4 border-t border-gray-100 pt-4 dark:border-gray-800">
+                          {/* Only a Yatra Pro that honours the option advertises it. */}
+                          {(window as any).yatraAdmin?.googleAnalytics
+                            ?.requireConsentSupported && (
+                          <div className="flex gap-3 rounded-lg border border-gray-100 bg-gray-50/80 p-3 dark:border-gray-700 dark:bg-gray-900/50">
+                            <input
+                              type="checkbox"
+                              id="ga4_require_consent"
+                              checked={formData.ga4_require_consent ?? false}
+                              name="ga4_require_consent"
+                              onChange={handleFieldChange}
+                              className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <Label
+                                htmlFor="ga4_require_consent"
+                                className="cursor-pointer text-sm font-medium text-gray-900 dark:text-white"
+                              >
+                                {__(
+                                  "Only send when consent can be verified",
+                                  "yatra",
+                                )}
+                              </Label>
+                              <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                                {__(
+                                  "Server-side events always follow visitor consent recorded through the WP Consent API (used by WPConsent, Complianz, CookieYes and others). Turn this on to send nothing server-side when that plugin is not active.",
+                                  "yatra",
+                                )}
+                              </p>
+                            </div>
+                          </div>
+                          )}
+                          <div className="flex gap-3 rounded-lg border border-amber-100 bg-amber-50/60 p-3 dark:border-amber-900/40 dark:bg-amber-950/20">
+                            <input
+                              type="checkbox"
+                              id="ga4_debug_mode"
+                              checked={formData.ga4_debug_mode ?? false}
+                              name="ga4_debug_mode"
+                              onChange={handleFieldChange}
+                              className="mt-0.5 h-4 w-4 shrink-0 rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <Label
+                                htmlFor="ga4_debug_mode"
+                                className="cursor-pointer text-sm font-medium text-amber-950 dark:text-amber-100"
+                              >
+                                {__(
+                                  "Validation mode (debug endpoint)",
+                                  "yatra",
+                                )}
+                              </Label>
+                              <p className="mt-0.5 text-xs text-amber-900/90 dark:text-amber-200/90">
+                                {__(
+                                  "Send Measurement Protocol hits to Google’s validation URL for troubleshooting. Events won’t appear in standard reports.",
+                                  "yatra",
+                                )}
+                              </p>
+                            </div>
+                          </div>
+
+                          <FormField
+                            id="ga4_api_secret"
+                            label={__(
+                              "Measurement Protocol API secret",
+                              "yatra",
+                            )}
+                            description={
+                              <div className="space-y-2">
+                                <p>
+                                  {__(
+                                    "Treat this like a password — anyone with it can send fake events to your GA4 property. Restrict who can view Yatra settings.",
+                                    "yatra",
+                                  )}
+                                </p>
+                                <details className="text-sm">
+                                  <summary className="cursor-pointer font-medium text-blue-600 hover:text-blue-500 dark:text-blue-400">
+                                    {__("How to get your API secret:", "yatra")}
+                                  </summary>
+                                  <ol className="mt-2 ml-4 list-decimal space-y-1 text-gray-600 dark:text-gray-400">
+                                    <li>
+                                      {__(
+                                        "Go to Google Analytics: analytics.google.com",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "Sign in and select the same property you used for the Measurement ID above.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "Click the gear icon (Admin) in the bottom-left corner.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "In the Property column click Data Streams, then click your Web stream.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "Scroll to Events → Measurement Protocol API secrets → Create.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "Give the secret a nickname (e.g. “Yatra server”) and click Create.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                    <li>
+                                      {__(
+                                        "Copy the Secret value (not the nickname) and paste it in the field above.",
+                                        "yatra",
+                                      )}
+                                    </li>
+                                  </ol>
+                                </details>
+                                <div className="mt-2">
+                                  <a
+                                    href="https://analytics.google.com/analytics/web/"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-blue-600 hover:text-blue-500 dark:text-blue-400 underline text-sm"
+                                  >
+                                    {__("Open Google Analytics →", "yatra")}
+                                  </a>
+                                </div>
+                              </div>
+                            }
+                            actionButton={
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => validateApiSecret()}
+                                disabled={
+                                  !formData.ga4_api_secret ||
+                                  !formData.ga4_measurement_id ||
+                                  validatingApiSecret
+                                }
+                                className="shrink-0"
+                              >
+                                {validatingApiSecret ? (
+                                  <>
+                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                    {__("Validating...", "yatra")}
+                                  </>
+                                ) : (
+                                  <>
+                                    <Check className="mr-2 h-4 w-4" />
+                                    {__("Validate", "yatra")}
+                                  </>
+                                )}
+                              </Button>
+                            }
+                          >
+                            <div className="relative">
+                              <Input
+                                id="ga4_api_secret"
+                                type={showGa4ApiSecret ? "text" : "password"}
+                                value={formData.ga4_api_secret || ""}
+                                name="ga4_api_secret"
+                                onChange={handleFieldChange}
+                                placeholder={__(
+                                  "Paste secret from GA4",
+                                  "yatra",
+                                )}
+                                className="pr-10 font-mono text-sm"
+                                spellCheck={false}
+                                autoComplete="new-password"
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setShowGa4ApiSecret(!showGa4ApiSecret)
+                                }
+                                className="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                                tabIndex={-1}
+                                aria-label={
+                                  showGa4ApiSecret
+                                    ? __("Hide secret", "yatra")
+                                    : __("Show secret", "yatra")
+                                }
+                              >
+                                {showGa4ApiSecret ? (
+                                  <EyeOff className="h-4 w-4" />
+                                ) : (
+                                  <Eye className="h-4 w-4" />
+                                )}
+                              </button>
+                            </div>
+                          </FormField>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </ProFeature>
+
+                {/* Reports shortcut */}
+                {(Boolean(formData.ga4_measurement_id?.trim()) ||
+                  Boolean(
+                    (window as any).yatraAdmin?.googleAnalytics?.measurementId,
+                  )) && (
+                  <div className="flex gap-3 rounded-lg border border-blue-200 bg-blue-50/90 p-4 dark:border-blue-800 dark:bg-blue-950/30">
+                    <BarChart3 className="mt-0.5 h-5 w-5 shrink-0 text-blue-600 dark:text-blue-400" />
+                    <div className="min-w-0 text-sm leading-relaxed">
+                      <p className="font-medium text-blue-900 dark:text-blue-100">
+                        {__("Reports & event log", "yatra")}
+                      </p>
+                      <p className="mt-1 text-blue-800/90 dark:text-blue-200/90">
+                        {__(
+                          "Review connection status and recent Measurement Protocol activity under",
+                          "yatra",
+                        )}{" "}
+                        <a
+                          href={`${(window as any).yatraAdmin?.siteUrl || ""}/wp-admin/admin.php?page=yatra&subpage=reports`}
+                          className="font-medium underline decoration-blue-600/40 underline-offset-2 hover:text-blue-950 dark:hover:text-white"
+                        >
+                          {__("Reports", "yatra")}
+                        </a>
+                        {" → "}
+                        {__("Google Analytics 4.", "yatra")}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* OpenStreetMap - Free Feature */}
+            <SectionDivider title={__("Maps", "yatra")} />
+            <div className="space-y-4">
+              <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
+                <div className="flex items-start gap-3">
+                  <div className="w-6 h-6 text-blue-600 dark:text-blue-400 mt-0.5">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"
+                      />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <h4 className="text-sm font-medium text-blue-900 dark:text-blue-100 mb-1">
+                      {__("OpenStreetMap Integration", "yatra")}
+                    </h4>
+                    <p className="text-sm text-blue-700 dark:text-blue-300">
+                      {__(
+                        "Maps are powered by OpenStreetMap - a free, open-source mapping service. No API key required! Maps will automatically display trip starting locations with custom markers.",
+                        "yatra",
+                      )}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <SectionDivider title={__("reCAPTCHA Settings", "yatra")} />
+
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="recaptcha_enabled"
+                  checked={formData.recaptcha_enabled}
+                  name="recaptcha_enabled"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="recaptcha_enabled"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable reCAPTCHA", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__("Protect forms from spam and bots", "yatra")}
+                  </p>
+                </div>
+              </div>
+
+              {formData.recaptcha_enabled && (
+                <>
+                  <FormField
+                    id="recaptcha_site_key"
+                    label={__("Site Key", "yatra")}
+                    description={__("Your reCAPTCHA site key", "yatra")}
+                  >
+                    <Input
+                      id="recaptcha_site_key"
+                      value={formData.recaptcha_site_key}
+                      name="recaptcha_site_key"
+                      onChange={handleFieldChange}
+                      placeholder={__("Enter site key", "yatra")}
+                    />
+                  </FormField>
+
+                  <FormField
+                    id="recaptcha_secret_key"
+                    label={__("Secret Key", "yatra")}
+                    description={__(
+                      "Your reCAPTCHA secret key (keep this secure)",
+                      "yatra",
+                    )}
+                  >
+                    <Input
+                      id="recaptcha_secret_key"
+                      type="password"
+                      value={formData.recaptcha_secret_key}
+                      name="recaptcha_secret_key"
+                      onChange={handleFieldChange}
+                      placeholder={__("Enter secret key", "yatra")}
+                    />
+                  </FormField>
+
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    {__(
+                      "Uses reCAPTCHA v3 (invisible, score-based). Create v3 keys at google.com/recaptcha and paste them above.",
+                      "yatra",
+                    )}
+                  </p>
+
+                  <FormField
+                    id="recaptcha_score_threshold"
+                    label={__("Score Threshold", "yatra")}
+                    description={__(
+                      "Minimum v3 score (0.0–1.0) to accept a submission. Lower is more lenient, higher is stricter. Default 0.5.",
+                      "yatra",
+                    )}
+                  >
+                    <Input
+                      id="recaptcha_score_threshold"
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.1"
+                      value={String(formData.recaptcha_score_threshold ?? 0.5)}
+                      name="recaptcha_score_threshold"
+                      onChange={(e) =>
+                        setFormData((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                recaptcha_score_threshold: parseFloat(
+                                  e.target.value,
+                                ),
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </FormField>
+
+                  <div className="pt-2">
+                    <Label className="font-medium">
+                      {__("Protect these forms", "yatra")}
+                    </Label>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 mb-2">
+                      {__(
+                        "Choose which forms reCAPTCHA should verify. Booking protection is off by default to avoid blocking a legitimate payment on a low score.",
+                        "yatra",
+                      )}
+                    </p>
+                    <div className="space-y-2">
+                      {[
+                        {
+                          key: "recaptcha_protect_enquiry",
+                          label: __("Enquiry form", "yatra"),
+                        },
+                        {
+                          key: "recaptcha_protect_booking",
+                          label: __("Booking / checkout form", "yatra"),
+                        },
+                        {
+                          key: "recaptcha_protect_registration",
+                          label: __("Customer registration", "yatra"),
+                        },
+                      ].map((f) => (
+                        <label
+                          key={f.key}
+                          className="flex items-center gap-2 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            id={f.key}
+                            name={f.key}
+                            checked={Boolean(
+                              (formData as unknown as Record<string, unknown>)[
+                                f.key
+                              ],
+                            )}
+                            onChange={handleFieldChange}
+                            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <span className="text-sm">{f.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        );
+
+      case "permalink": {
+        const listingSite = (
+          ((window as any)?.yatraAdmin?.siteUrl || "") as string
+        ).replace(/\/$/, "");
+        const listingHref = (segment: string) =>
+          buildYatraListingPublicUrl(segment, listingSite || undefined);
+
+        const bookingConfirmationPreviewUrl = (bookingBase: string) => {
+          const bb = (bookingBase || "book").replace(/^\/|\/$/g, "");
+          const site = listingSite || "";
+          if (isWordPressPlainPermalink()) {
+            return site
+              ? `${site}/?yatra_booking_confirmation=`
+              : "/?yatra_booking_confirmation=";
+          }
+          return site ? `${site}/${bb}/confirmation/` : `/${bb}/confirmation/`;
+        };
+
+        return (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                {__("Permalink Settings", "yatra")}
+              </h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-6">
+                {__(
+                  "Configure URL slugs for your Yatra content types. These settings control how your trips, destinations, and activities appear in URLs.",
+                  "yatra",
+                )}
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              <FormField
+                id="trip_base"
+                label={__("Trip Base", "yatra")}
+                description={__(
+                  'URL slug for trip single pages (e.g., "trip" will create URLs like /trip/everest-base-camp)',
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="trip_base"
+                  name="trip_base"
+                  value={formData.trip_base || "trip"}
+                  onChange={handleFieldChange}
+                  placeholder="trip"
+                  className="font-mono"
+                />
+                {formData.trip_base && (
+                  <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 flex items-center gap-2">
+                    <span className="min-w-0">
+                      {__("Listing URL:", "yatra")}{" "}
+                      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                        {listingHref(formData.trip_base || "trip")}
+                      </code>
+                    </span>
+                    <a
+                      href={listingHref(formData.trip_base || "trip")}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                    >
+                      <ExternalLink className="w-3 h-3" /> {__("View", "yatra")}
+                    </a>
+                  </div>
+                )}
+              </FormField>
+
+              <FormField
+                id="destination_base"
+                label={__("Destination Base", "yatra")}
+                description={__(
+                  'URL slug for destination archive pages (e.g., "destination" will create URLs like /destination/nepal)',
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="destination_base"
+                  name="destination_base"
+                  value={formData.destination_base || "destination"}
+                  onChange={handleFieldChange}
+                  placeholder="destination"
+                  className="font-mono"
+                />
+                {formData.destination_base && (
+                  <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 flex items-center gap-2">
+                    <span className="min-w-0">
+                      {__("Listing URL:", "yatra")}{" "}
+                      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                        {listingHref(
+                          formData.destination_base || "destination",
+                        )}
+                      </code>
+                    </span>
+                    <a
+                      href={listingHref(
+                        formData.destination_base || "destination",
+                      )}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                    >
+                      <ExternalLink className="w-3 h-3" /> {__("View", "yatra")}
+                    </a>
+                  </div>
+                )}
+              </FormField>
+
+              <FormField
+                id="activity_base"
+                label={__("Activity Base", "yatra")}
+                description={__(
+                  'URL slug for activity archive pages (e.g., "activity" will create URLs like /activity/trekking)',
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="activity_base"
+                  name="activity_base"
+                  value={formData.activity_base || "activity"}
+                  onChange={handleFieldChange}
+                  placeholder="activity"
+                  className="font-mono"
+                />
+                {formData.activity_base && (
+                  <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 flex items-center gap-2">
+                    <span className="min-w-0">
+                      {__("Listing URL:", "yatra")}{" "}
+                      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                        {listingHref(formData.activity_base || "activity")}
+                      </code>
+                    </span>
+                    <a
+                      href={listingHref(formData.activity_base || "activity")}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                    >
+                      <ExternalLink className="w-3 h-3" /> {__("View", "yatra")}
+                    </a>
+                  </div>
+                )}
+              </FormField>
+
+              <FormField
+                id="trip_category_base"
+                label={__("Trip Category Base", "yatra")}
+                description={__(
+                  'URL slug for trip category archive pages (e.g., "trip-category" will create URLs like /trip-category/adventure)',
+                  "yatra",
+                )}
+              >
+                <Input
+                  id="trip_category_base"
+                  name="trip_category_base"
+                  value={formData.trip_category_base || "trip-category"}
+                  onChange={handleFieldChange}
+                  placeholder="trip-category"
+                  className="font-mono"
+                />
+                {formData.trip_category_base && (
+                  <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 flex items-center gap-2">
+                    <span className="min-w-0">
+                      {__("Listing URL:", "yatra")}{" "}
+                      <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                        {listingHref(
+                          formData.trip_category_base || "trip-category",
+                        )}
+                      </code>
+                    </span>
+                    <a
+                      href={listingHref(
+                        formData.trip_category_base || "trip-category",
+                      )}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                    >
+                      <ExternalLink className="w-3 h-3" /> {__("View", "yatra")}
+                    </a>
+                  </div>
+                )}
+              </FormField>
+            </div>
+
+            {/* Booking Page Settings */}
+            <div className="mt-8 pt-6 border-t border-gray-200 dark:border-gray-700">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                {__("Booking Page Settings", "yatra")}
+              </h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mb-6">
+                {__(
+                  "Configure the booking page URL. By default, bookings use /book/{trip-slug}. You can customize the URL base or use a custom WordPress page.",
+                  "yatra",
+                )}
+              </p>
+
+              <div className="space-y-4">
+                <FormField
+                  id="booking_base"
+                  label={__("Default Booking URL Base", "yatra")}
+                  description={__(
+                    'URL slug for the booking page (e.g., "book" will create URLs like /book/trip-name)',
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="booking_base"
+                    name="booking_base"
+                    value={formData.booking_base || "book"}
+                    onChange={handleFieldChange}
+                    placeholder="book"
+                    className="font-mono"
+                  />
+                  {formData.booking_base && (
+                    <>
+                      <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 flex items-center gap-2">
+                        <span className="min-w-0">
+                          {__("Booking hub URL:", "yatra")}{" "}
+                          <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                            {listingHref(formData.booking_base || "book")}
+                          </code>
+                        </span>
+                        <a
+                          href={listingHref(formData.booking_base || "book")}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                        >
+                          <ExternalLink className="w-3 h-3" />{" "}
+                          {__("View", "yatra")}
+                        </a>
+                      </div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                        <span className="min-w-0">
+                          {__(
+                            "Booking confirmation base (pageless, same slug as above):",
+                            "yatra",
+                          )}{" "}
+                          <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded break-all">
+                            {bookingConfirmationPreviewUrl(
+                              formData.booking_base || "book",
+                            )}
+                          </code>
+                          <span className="text-gray-400 dark:text-gray-500 ml-1">
+                            {__(
+                              "append booking reference after checkout",
+                              "yatra",
+                            )}
+                          </span>
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </FormField>
+
+                {formData.use_booking_page && (
+                  <FormField
+                    id="booking_page_id"
+                    label={__("Select Booking Page", "yatra")}
+                    description={__(
+                      "Choose a page that contains the [yatra_booking] shortcode. If the page doesn't have the shortcode, you'll be prompted to add it.",
+                      "Choose a page that contains the [yatra_booking] shortcode. If the page doesn't have the shortcode, you'll be prompted to add it.",
+                    )}
+                  >
+                    <div className="relative">
+                      <select
+                        id="booking_page_id"
+                        name="booking_page_id"
+                        value={formData.booking_page_id || 0}
+                        onChange={(e) =>
+                          handleBookingPageChange(parseInt(e.target.value))
+                        }
+                        disabled={isCheckingShortcode}
+                        className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:opacity-50 disabled:cursor-wait"
+                      >
+                        <option value={0}>
+                          {__("-- Select a page --", "yatra")}
+                        </option>
+                        {pagesData?.map((page) => (
+                          <option key={page.id} value={page.id}>
+                            {page.title}
+                          </option>
+                        ))}
+                      </select>
+                      {isCheckingShortcode && (
+                        <div className="absolute right-8 top-1/2 -translate-y-1/2">
+                          <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                        </div>
+                      )}
+                    </div>
+                    {formData.booking_page_id > 0 && pagesData && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__("Booking URL:", "yatra")}{" "}
+                        <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">
+                          {pagesData.find(
+                            (p) => p.id === formData.booking_page_id,
+                          )?.url || ""}
+                        </code>
+                      </p>
+                    )}
+                  </FormField>
+                )}
+              </div>
+            </div>
+
+            {/* Shortcode Dialog */}
+            {showShortcodeDialog && selectedPageForShortcode && (
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full mx-4 p-6">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+                    {__("Shortcode Required", "yatra")}
+                  </h3>
+                  <div className="mb-6">
+                    <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">
+                      {__("The page", "yatra")}{" "}
+                      <strong>"{selectedPageForShortcode.title}"</strong>{" "}
+                      {__("doesn't have the", "doesn't have the")}{" "}
+                      <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">
+                        [yatra_booking]
+                      </code>{" "}
+                      {__("shortcode.", "yatra")}
+                    </p>
+                    <p className="text-sm text-gray-600 dark:text-gray-300">
+                      {__(
+                        "Would you like to add it automatically, or edit the page manually to place it where you want?",
+                        "yatra",
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Button
+                      onClick={handleConfirmInsertShortcode}
+                      disabled={insertShortcodeMutation.isPending}
+                      className="w-full justify-center"
+                    >
+                      {insertShortcodeMutation.isPending ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                          {__("Adding...", "yatra")}
+                        </>
+                      ) : (
+                        __("Add Shortcode Automatically", "yatra")
+                      )}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        const editUrl = pagesData?.find(
+                          (p) => p.id === selectedPageForShortcode.id,
+                        )?.url;
+                        if (editUrl) {
+                          window.open(
+                            `/wp-admin/post.php?post=${selectedPageForShortcode.id}&action=edit`,
+                            "_blank",
+                          );
+                        }
+                        setShowShortcodeDialog(false);
+                        setSelectedPageForShortcode(null);
+                      }}
+                      className="w-full justify-center"
+                    >
+                      {__("Edit Page Manually", "yatra")}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      onClick={() => {
+                        setShowShortcodeDialog(false);
+                        setSelectedPageForShortcode(null);
+                        handleFieldChange({
+                          target: { name: "booking_page_id", value: 0 },
+                        } as any);
+                      }}
+                      className="w-full justify-center"
+                    >
+                      {__("Skip for now", "yatra")}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+              <div className="flex items-start gap-2">
+                <Info className="w-4 h-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+                <div className="flex-1 text-sm text-blue-800 dark:text-blue-200">
+                  <p className="font-medium mb-1">
+                    {__("Important:", "yatra")}
+                  </p>
+                  <p className="mb-3">
+                    {__(
+                      "After changing permalink settings, you must flush rewrite rules for the changes to take effect.",
+                      "yatra",
+                    )}
+                  </p>
+                  <Button
+                    type="button"
+                    onClick={() => flushRewriteRulesMutation.mutate()}
+                    disabled={flushRewriteRulesMutation.isPending}
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    {flushRewriteRulesMutation.isPending ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        {__("Flushing...", "yatra")}
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="w-4 h-4" />
+                        {__("Flush Rewrite Rules", "yatra")}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      case "seo":
+        return (
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                {__("Trip Archive SEO Settings", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Configure SEO meta tags for the trip archive page (/trip/). These meta tags will be used for the main trip listing page.",
+                  "yatra",
+                )}
+              </p>
+              <div className="space-y-4">
+                <FormField
+                  id="seo_trip_meta_title"
+                  label={__("Trip Archive Meta Title", "yatra")}
+                  description={__(
+                    "Meta title for the trip archive page. This will appear in search engine results for /trip/ page.",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="seo_trip_meta_title"
+                    type="text"
+                    value={formData.seo_trip_meta_title}
+                    onChange={(e) =>
+                      setFormData((prev) =>
+                        prev
+                          ? { ...prev, seo_trip_meta_title: e.target.value }
+                          : null,
+                      )
+                    }
+                    placeholder={__(
+                      "e.g., Browse All Trips - Find Your Perfect Adventure | Your Travel Agency",
+                      "yatra",
+                    )}
+                    className="w-full"
+                  />
+                </FormField>
+
+                <FormField
+                  id="seo_trip_meta_description"
+                  label={__("Trip Archive Meta Description", "yatra")}
+                  description={__(
+                    "Meta description for the trip archive page. Should be 150-160 characters for best SEO results.",
+                    "yatra",
+                  )}
+                >
+                  <textarea
+                    id="seo_trip_meta_description"
+                    value={formData.seo_trip_meta_description}
+                    onChange={(e) =>
+                      setFormData((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              seo_trip_meta_description: e.target.value,
+                            }
+                          : null,
+                      )
+                    }
+                    placeholder={__(
+                      "e.g., Explore our complete collection of amazing trips and adventures. Find and book your perfect journey with us.",
+                      "yatra",
+                    )}
+                    rows={3}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white"
+                  />
+                </FormField>
+
+                <FormField
+                  id="seo_trip_meta_keywords"
+                  label={__("Trip Archive Meta Keywords", "yatra")}
+                  description={__(
+                    "Comma-separated keywords for the trip archive page. Include relevant travel and booking keywords.",
+                    "yatra",
+                  )}
+                >
+                  <Input
+                    id="seo_trip_meta_keywords"
+                    type="text"
+                    value={formData.seo_trip_meta_keywords}
+                    onChange={(e) =>
+                      setFormData((prev) =>
+                        prev
+                          ? { ...prev, seo_trip_meta_keywords: e.target.value }
+                          : null,
+                      )
+                    }
+                    placeholder={__(
+                      "e.g., travel, trips, adventure, booking, tours, destinations, holidays",
+                      "yatra",
+                    )}
+                    className="w-full"
+                  />
+                </FormField>
+
+                <FormField
+                  id="seo_trip_meta_image"
+                  label={__("Trip Archive SEO Image", "yatra")}
+                  description={__(
+                    "Image for social media sharing and SEO. Recommended size: 1200x630 pixels. This image will appear when the trip archive page is shared on Facebook, Twitter, and other platforms.",
+                    "yatra",
+                  )}
+                >
+                  <div className="space-y-4">
+                    {formData.seo_trip_meta_image &&
+                    formData.seo_trip_meta_image > 0 ? (
+                      <div className="relative group">
+                        <div className="flex items-start gap-4 p-4 border border-gray-200 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-800/50">
+                          {seoImageLoading ? (
+                            <div className="w-24 h-24 flex items-center justify-center border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                              <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+                            </div>
+                          ) : seoImageUrl ? (
+                            <div className="relative w-24 h-24 overflow-hidden rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700">
+                              <img
+                                src={seoImageUrl}
+                                alt="SEO Preview"
+                                className="w-full h-full object-cover"
+                              />
+                              <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors" />
+                            </div>
+                          ) : seoImageError ? (
+                            <div className="w-24 h-24 flex flex-col items-center justify-center border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                              <X className="w-6 h-6 text-red-400 mb-1" />
+                              <span className="text-xs text-red-500 dark:text-red-400 text-center px-1">
+                                {seoImageError}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="w-24 h-24 flex flex-col items-center justify-center border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                              <Image className="w-6 h-6 text-gray-400 mb-1" />
+                              <span className="text-xs text-gray-500 dark:text-gray-400">
+                                No image
+                              </span>
+                            </div>
+                          )}
+
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between mb-2">
+                              <h4 className="text-sm font-medium text-gray-900 dark:text-white">
+                                {__("SEO Image", "yatra")}
+                              </h4>
+                              {!seoImageLoading && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setFormData((prev) =>
+                                      prev
+                                        ? { ...prev, seo_trip_meta_image: 0 }
+                                        : null,
+                                    );
+                                  }}
+                                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded"
+                                  title={__("Remove image", "yatra")}
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                              {__(
+                                "Recommended size: 1200x630 pixels for optimal social media display.",
+                                "yatra",
+                              )}
+                            </p>
+                            <Button
+                              type="button"
+                              onClick={() => {
+                                // Use WordPress media library
+                                if (window.wp && window.wp.media) {
+                                  const mediaUploader = window.wp.media({
+                                    title: __("Select SEO Image", "yatra"),
+                                    button: {
+                                      text: __("Use this image", "yatra"),
+                                    },
+                                    multiple: false,
+                                    library: { type: "image" },
+                                  });
+
+                                  mediaUploader.on("select", () => {
+                                    const attachment = mediaUploader
+                                      .state()
+                                      .get("selection")
+                                      .first()
+                                      .toJSON();
+                                    setFormData((prev) =>
+                                      prev
+                                        ? {
+                                            ...prev,
+                                            seo_trip_meta_image: attachment.id,
+                                          }
+                                        : null,
+                                    );
+                                  });
+
+                                  prepareWordPressMediaFrameOpen();
+                                  mediaUploader.open();
+                                }
+                              }}
+                              variant="outline"
+                              size="sm"
+                            >
+                              {__("Change Image", "yatra")}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-lg p-8 text-center hover:border-gray-400 dark:hover:border-gray-500 transition-colors">
+                        <div className="w-16 h-16 mx-auto mb-4 flex items-center justify-center bg-gray-100 dark:bg-gray-700 rounded-full">
+                          <Image className="w-8 h-8 text-gray-400" />
+                        </div>
+                        <h4 className="text-sm font-medium text-gray-900 dark:text-white mb-2">
+                          {__("Add SEO Image", "yatra")}
+                        </h4>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-4 max-w-sm mx-auto">
+                          {__(
+                            "Upload an image that will appear when your trip archive page is shared on social media. Recommended size: 1200x630 pixels.",
+                            "yatra",
+                          )}
+                        </p>
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            // Use WordPress media library
+                            if (window.wp && window.wp.media) {
+                              const mediaUploader = window.wp.media({
+                                title: __("Select SEO Image", "yatra"),
+                                button: { text: __("Use this image", "yatra") },
+                                multiple: false,
+                                library: { type: "image" },
+                              });
+
+                              mediaUploader.on("select", () => {
+                                const attachment = mediaUploader
+                                  .state()
+                                  .get("selection")
+                                  .first()
+                                  .toJSON();
+                                setFormData((prev) =>
+                                  prev
+                                    ? {
+                                        ...prev,
+                                        seo_trip_meta_image: attachment.id,
+                                      }
+                                    : null,
+                                );
+                              });
+
+                              prepareWordPressMediaFrameOpen();
+                              mediaUploader.open();
+                            }
+                          }}
+                        >
+                          <Plus className="w-4 h-4 mr-2" />
+                          {__("Select Image", "yatra")}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                </FormField>
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
+                {__("Sitemap", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Yatra publishes one sitemap of all trips, destinations, activities and categories so search engines can find them. It is advertised in robots.txt and linked into Yoast, Rank Math, AIOSEO and WordPress core sitemaps automatically.",
+                  "yatra",
+                )}
+              </p>
+              <div className="space-y-4">
+                <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <input
+                    type="checkbox"
+                    id="enable_sitemap"
+                    checked={formData.enable_sitemap}
+                    name="enable_sitemap"
+                    onChange={handleFieldChange}
+                    className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <div className="flex-1">
+                    <Label
+                      htmlFor="enable_sitemap"
+                      className="font-medium cursor-pointer"
+                    >
+                      {__("Enable Sitemap", "yatra")}
+                    </Label>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {__(
+                        "Generate /yatra-sitemap.xml and advertise it to search engines.",
+                        "yatra",
+                      )}
+                    </p>
+                  </div>
+                </div>
+                {formData.enable_sitemap && (
+                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <Label className="font-medium">
+                      {__("Sitemap URL", "yatra")}
+                    </Label>
+                    <div className="mt-2 flex items-center gap-2">
+                      <a
+                        href={
+                          (window as { yatraAdmin?: { sitemapUrl?: string } })
+                            .yatraAdmin?.sitemapUrl || "#"
+                        }
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex-1 break-all text-sm text-blue-600 dark:text-blue-400 underline"
+                      >
+                        {(window as { yatraAdmin?: { sitemapUrl?: string } })
+                          .yatraAdmin?.sitemapUrl || ""}
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          navigator.clipboard?.writeText(
+                            (window as { yatraAdmin?: { sitemapUrl?: string } })
+                              .yatraAdmin?.sitemapUrl || "",
+                          )
+                        }
+                        className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+                      >
+                        {__("Copy", "yatra")}
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                      {__(
+                        "Optional: submit this URL in Google Search Console or Bing Webmaster Tools. It is already listed in robots.txt, so search engines find it automatically.",
+                        "yatra",
+                      )}
+
+                {formData.enable_sitemap && (
+                  <div className="p-3 border border-gray-200 dark:border-gray-700 rounded-md space-y-3">
+                    <div>
+                      <Label className="font-medium">
+                        {__("Content in the sitemap", "yatra")}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__(
+                          "Uncheck a type to keep it out of /yatra-sitemap.xml.",
+                          "yatra",
+                        )}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {[
+                        { key: "trip", label: __("Trips", "yatra") },
+                        { key: "destination", label: __("Destinations", "yatra") },
+                        { key: "activity", label: __("Activities", "yatra") },
+                        { key: "category", label: __("Trip categories", "yatra") },
+                        { key: "archive", label: __("Listing pages", "yatra") },
+                      ].map((t) => {
+                        const selected = formData.sitemap_types ?? [];
+                        const checked = selected.includes(t.key);
+                        return (
+                          <label
+                            key={t.key}
+                            className="flex items-center gap-2 text-sm cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() =>
+                                setFormData((prev) => {
+                                  if (!prev) return prev;
+                                  return {
+                                    ...prev,
+                                    sitemap_types: checked
+                                      ? (prev.sitemap_types ?? []).filter(
+                                          (x: string) => x !== t.key,
+                                        )
+                                      : [...(prev.sitemap_types ?? []), t.key],
+                                  };
+                                })
+                              }
+                              className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                            />
+                            <span>{t.label}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex items-start gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+                      <input
+                        type="checkbox"
+                        id="sitemap_noindex_excluded"
+                        name="sitemap_noindex_excluded"
+                        checked={formData.sitemap_noindex_excluded}
+                        onChange={(e) =>
+                          setFormData((prev) => {
+                            if (!prev) return prev;
+                            return {
+                              ...prev,
+                              sitemap_noindex_excluded: e.target.checked,
+                            };
+                          })
+                        }
+                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="flex-1">
+                        <Label
+                          htmlFor="sitemap_noindex_excluded"
+                          className="font-medium cursor-pointer"
+                        >
+                          {__("Also add noindex to excluded types", "yatra")}
+                        </Label>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                          {__(
+                            "Leaving a type out of the sitemap does not stop Google indexing it. Turn this on to send noindex on those pages as well — they will drop out of search results, so only do this for content you do not want found.",
+                            "yatra",
+                          )}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+
+      case "uninstall":
+        return (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <div className="rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+                {__(
+                  "This only applies when Yatra is deleted from the Plugins screen. Deactivating the plugin never removes anything.",
+                  "yatra",
+                )}
+              </div>
+
+              <div className="flex items-start gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="delete_data_on_uninstall"
+                  checked={formData.delete_data_on_uninstall}
+                  name="delete_data_on_uninstall"
+                  onChange={handleFieldChange}
+                  className="mt-1 w-4 h-4 rounded border-gray-300 text-red-600 focus:ring-red-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="delete_data_on_uninstall"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Delete all data on uninstall", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Permanently remove every Yatra database table, setting and scheduled task when the plugin is deleted. Yatra Pro follows the same switch and removes its own data too.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {formData.delete_data_on_uninstall ? (
+                <div className="rounded-md border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-950/40">
+                  <p className="text-sm font-semibold text-red-800 dark:text-red-200">
+                    {__("This cannot be undone", "yatra")}
+                  </p>
+                  <p className="text-xs text-red-700 dark:text-red-300 mt-1">
+                    {__(
+                      "Trips, bookings, customers, payments, reviews and enquiries are destroyed along with the plugin. Take a backup, or use Tools to export first, if you may want this data again.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              ) : (
+                <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
+                  {__(
+                    "Your data is kept when Yatra is deleted, so reinstalling restores everything as it was.",
+                    "yatra",
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+      case "advanced":
+        return (
+          <div className="space-y-6">
+            <div className="space-y-4">
+              <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
+                {__(
+                  "For PHP-level debug output, use WordPress wp-config.php (WP_DEBUG). The options below are implemented by the plugin.",
+                  "yatra",
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="enable_logging"
+                  checked={formData.enable_logging}
+                  name="enable_logging"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="enable_logging"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable Logging", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Log system events and errors for troubleshooting",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="debug_mode"
+                  checked={formData.debug_mode}
+                  name="debug_mode"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="debug_mode"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Debug mode", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Extra plugin-side diagnostics. When on, Yatra object cache is bypassed (same as when WP_DEBUG is true in wp-config).",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <input
+                  type="checkbox"
+                  id="cache_enabled"
+                  checked={formData.cache_enabled}
+                  name="cache_enabled"
+                  onChange={handleFieldChange}
+                  className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div className="flex-1">
+                  <Label
+                    htmlFor="cache_enabled"
+                    className="font-medium cursor-pointer"
+                  >
+                    {__("Enable Cache", "yatra")}
+                  </Label>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    {__(
+                      "Stores frequently used data for faster loads. Stays off while WP_DEBUG or Debug mode (above) is on.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-2">
+                {__("Legal pages (Booking UI)", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Select the pages that will be linked from the booking Terms and Privacy consent checkboxes.",
+                  "yatra",
+                )}
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="terms_page_id">
+                    {__("Terms & Conditions page", "yatra")}
+                  </Label>
+                  <select
+                    id="terms_page_id"
+                    name="terms_page_id"
+                    value={formData.terms_page_id || 0}
+                    onChange={handleFieldChange}
+                    className="mt-1 w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-900"
+                  >
+                    <option value={0}>{__("— Select —", "yatra")}</option>
+                    {pagesData?.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <Label htmlFor="privacy_policy_page_id">
+                    {__("Privacy Policy page", "yatra")}
+                  </Label>
+                  <select
+                    id="privacy_policy_page_id"
+                    name="privacy_policy_page_id"
+                    value={formData.privacy_policy_page_id || 0}
+                    onChange={handleFieldChange}
+                    className="mt-1 w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-900"
+                  >
+                    <option value={0}>{__("— Select —", "yatra")}</option>
+                    {pagesData?.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.title}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                    {__(
+                      "If not set here, WordPress Settings → Privacy will be used when available.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+                <BarChart3 className="w-4 h-4" />
+                {__("Help us improve Yatra", "yatra")}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                {__(
+                  "Share non-sensitive technical details so we can make Yatra better. You can turn this off anytime. See what we collect on our site:",
+                  "yatra",
+                )}{" "}
+                <a
+                  className="text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                  href="https://wpyatra.com/what-we-collect/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {__("What we collect", "yatra")}
+                  <ExternalLink className="w-3 h-3" aria-hidden />
+                </a>
+                {" · "}
+                <a
+                  className="text-blue-600 hover:underline"
+                  href="https://mantrabrain.com/privacy-policy/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {__("Privacy policy", "yatra")}
+                </a>
+              </p>
+
+              {usageLoading && (
+                <p className="text-sm text-gray-500 flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {__("Loading…", "yatra")}
+                </p>
+              )}
+
+              {!usageLoading && !usageStatus && (
+                <div className="space-y-1">
+                  <p className="text-sm text-amber-600">
+                    {__(
+                      "Could not load this section. You may need permission to manage Yatra.",
+                      "yatra",
+                    )}
+                  </p>
+                  {usageError && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {usageError}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {!usageLoading && usageStatus && (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center gap-3 p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <input
+                      type="checkbox"
+                      id="yatra_usage_tracking_enabled"
+                      checked={usageStatus.enabled}
+                      disabled={usageBusy}
+                      onChange={async (e) => {
+                        setUsageBusy(true);
+                        try {
+                          const r = await postUsageTrackingSettings(
+                            e.target.checked,
+                          );
+                          setUsageStatus((prev) =>
+                            prev ? { ...prev, enabled: r.enabled } : prev,
+                          );
+                          showToast(
+                            __("Preference saved.", "yatra"),
+                            "success",
+                          );
+                        } catch (err: any) {
+                          showToast(
+                            err?.message ||
+                              __("Could not save your preference.", "yatra"),
+                            "error",
+                          );
+                        } finally {
+                          setUsageBusy(false);
+                        }
+                      }}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 shrink-0"
+                    />
+                    <div className="flex-1 min-w-[200px]">
+                      <Label
+                        htmlFor="yatra_usage_tracking_enabled"
+                        className="font-medium cursor-pointer"
+                      >
+                        {__(
+                          "Help us improve the product by sharing non-sensitive data",
+                          "yatra",
+                        )}
+                      </Label>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                        {__(
+                          "Sent periodically while enabled. Learn more: ",
+                          "yatra",
+                        )}
+                        <a
+                          className="text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                          href="https://wpyatra.com/what-we-collect/"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {__("What we collect", "yatra")}
+                          <ExternalLink className="w-3 h-3" aria-hidden />
+                        </a>
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="default"
+                      size="sm"
+                      disabled={usageBusy}
+                      onClick={async () => {
+                        setUsageBusy(true);
+                        try {
+                          await postUsageTrackingSend({
+                            force: !usageStatus.enabled,
+                          });
+                          const s = await fetchUsageTrackingStatus();
+                          setUsageStatus(s);
+                          showToast(
+                            __("Sent successfully.", "yatra"),
+                            "success",
+                          );
+                        } catch (err: any) {
+                          showToast(
+                            err?.message || __("Send failed.", "yatra"),
+                            "error",
+                          );
+                        } finally {
+                          setUsageBusy(false);
+                        }
+                      }}
+                    >
+                      <RefreshCw className="w-4 h-4 mr-1" />
+                      {__("Send now", "yatra")}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+      default:
+        return (
+          <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+            {__("Settings section coming soon", "yatra")}
+          </div>
+        );
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="space-y-3">
+        {/* Page Header Skeleton */}
+        <div className="flex items-center justify-between">
+          <div className="space-y-2">
+            <div className="h-8 w-48 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+            <div className="h-4 w-96 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+          </div>
+          <div className="h-10 w-32 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-3">
+          {/* Left Sidebar Skeleton */}
+          <div className="lg:col-span-1">
+            <Card>
+              <CardContent className="p-0">
+                <nav className="space-y-1 p-2">
+                  {[...Array(12)].map((_, index) => (
+                    <div
+                      key={`skeleton-nav-${index}`}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md"
+                    >
+                      <div className="w-4 h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                      <div className="h-4 w-24 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                    </div>
+                  ))}
+                </nav>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Right Content Skeleton */}
+          <div className="lg:col-span-3">
+            <Card>
+              <CardHeader className="pb-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                  <div className="h-5 w-32 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                </div>
+              </CardHeader>
+              <CardContent className="pb-4 space-y-4">
+                {/* Form Fields Skeleton */}
+                {[...Array(6)].map((_, index) => (
+                  <div key={`skeleton-field-${index}`} className="space-y-2">
+                    <div className="h-4 w-24 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                    <div className="h-10 w-full bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                  </div>
+                ))}
+                {/* Grid fields skeleton */}
+                <div className="grid grid-cols-2 gap-4">
+                  {[...Array(4)].map((_, index) => (
+                    <div key={`skeleton-grid-${index}`} className="space-y-2">
+                      <div className="h-4 w-20 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                      <div className="h-10 w-full bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <PageHeader
+        title={__("Settings", "yatra")}
+        description={__(
+          "Configure your travel booking plugin settings",
+          "yatra",
+        )}
+        actions={
+          <Button
+            onClick={handleSave}
+            disabled={isSaving || !formData}
+            className="flex items-center gap-2"
+          >
+            {isSaving ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {__("Saving...", "yatra")}
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4" />
+                {__("Save Settings", "yatra")}
+              </>
+            )}
+          </Button>
+        }
+      />
+
+      <ConditionalRender capability="yatra_manage_settings">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-3">
+          {/* Left Sidebar */}
+          <div className="lg:col-span-1">
+            <Card>
+              <CardContent className="p-0">
+                <nav className="space-y-1 p-2">
+                  {settingsSections.map((section) => {
+                    const Icon = section.icon;
+                    const isViewing = viewingSection === section.id;
+                    return (
+                      <button
+                        key={section.id}
+                        onClick={() => setViewingSection(section.id)}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium transition-colors ${
+                          isViewing
+                            ? "bg-blue-50 text-blue-700 dark:bg-blue-900/20 dark:text-blue-400"
+                            : "text-gray-700 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
+                        }`}
+                      >
+                        <Icon className="w-4 h-4" />
+                        {section.label}
+                      </button>
+                    );
+                  })}
+                </nav>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Right Content */}
+          <div className="lg:col-span-3">
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  {(() => {
+                    const section = settingsSections.find(
+                      (s) => s.id === viewingSection,
+                    );
+                    const Icon = section?.icon || SettingsIcon;
+                    return (
+                      <>
+                        <Icon className="w-4 h-4" />
+                        {section?.label || __("Settings", "yatra")}
+                      </>
+                    );
+                  })()}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pb-4">
+                {renderSettingsContent()}
+              </CardContent>
+              <CardFooter className="flex justify-end pt-4 border-t border-gray-100 dark:border-gray-700/50">
+                <Button
+                  onClick={handleSave}
+                  disabled={isSaving || !formData}
+                  className="flex items-center gap-2"
+                >
+                  {isSaving ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {__("Saving...", "yatra")}
+                    </>
+                  ) : (
+                    <>
+                      <Save className="w-4 h-4" />
+                      {__("Save Settings", "yatra")}
+                    </>
+                  )}
+                </Button>
+              </CardFooter>
+            </Card>
+          </div>
+        </div>
+      </ConditionalRender>
+
+      {/* Premium Upgrade Dialog for Payment Gateways */}
+      <PremiumUpgradeDialog
+        open={showPremiumDialog}
+        onClose={() => setShowPremiumDialog(false)}
+        moduleName={selectedPremiumGateway}
+        moduleDescription={`Unlock ${selectedPremiumGateway} payment gateway to accept payments from your customers. This premium gateway provides secure payment processing with advanced features.`}
+        purchaseUrl={
+          (window as any).yatraAdmin?.pricingUrl ||
+          "https://wpyatra.com/pricing"
+        }
+      />
+    </div>
+  );
+};
+
+export default Settings;

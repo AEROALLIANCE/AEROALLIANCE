@@ -1,0 +1,1655 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Services;
+
+use Yatra\Repositories\BookingRepository;
+use Yatra\Repositories\PaymentRepository;
+use Yatra\Repositories\TravellerRepository;
+use Yatra\Repositories\CustomerRepository;
+use Yatra\Repositories\TripRepository;
+use Yatra\Repositories\DepartureRepository;
+use Yatra\Repositories\BookingDepartureRepository;
+use Yatra\Validators\BookingValidator;
+use Yatra\Utils\Logger;
+use Yatra\Services\BookingTaxService;
+
+/**
+ * Booking Service
+ * 
+ * Contains business logic for bookings.
+ * Uses repositories for data access.
+ * 
+ * Note: Does not extend BaseService as it uses multiple repositories
+ * and has specialized booking-related methods.
+ * 
+ * @package Yatra\Services
+ */
+class BookingService
+{
+    /**
+     * Accepted payment statuses — mirrors the `payment_status` ENUM on the
+     * bookings table. Anything outside this list is rejected before it reaches
+     * the database, where an unknown value would be silently coerced.
+     */
+    public const PAYMENT_STATUSES = ['pending', 'partial', 'paid', 'refunded', 'failed'];
+
+    private BookingRepository $bookingRepository;
+    private PaymentRepository $paymentRepository;
+    private TravellerRepository $travellerRepository;
+    private CustomerRepository $customerRepository;
+    private TripRepository $tripRepository;
+    private DepartureService $departureService;
+
+    public function __construct()
+    {
+        $this->bookingRepository = new BookingRepository();
+        $this->paymentRepository = new PaymentRepository();
+        $this->travellerRepository = new TravellerRepository();
+        $this->customerRepository = new CustomerRepository();
+        $this->tripRepository = new TripRepository();
+        $this->departureService = new DepartureService(
+            new DepartureRepository(),
+            new BookingDepartureRepository(),
+            $this->bookingRepository,
+            $this->tripRepository
+        );
+    }
+
+    /**
+     * Get paginated bookings
+     * 
+     * @param array $filters Filters (page, per_page, status, search, etc.)
+     * @return array
+     */
+    public function getBookings(array $filters = []): array
+    {
+        $result = $this->bookingRepository->paginate($filters);
+
+        // Format each booking
+        $result['data'] = array_map([$this, 'formatBooking'], $result['data']);
+
+        return $result;
+    }
+
+    /**
+     * Get single booking with all related data
+     * 
+     * @param int $id Booking ID
+     * @return array|null
+     */
+    public function getBooking(int $id): ?array
+    {
+        $booking = $this->bookingRepository->findWithTrip($id);
+
+        if (!$booking) {
+            return null;
+        }
+
+        $formatted = $this->formatBookingWithDetails($booking);
+
+        return $formatted;
+    }
+
+    /**
+     * Get booking by reference code
+     * 
+     * @param string $reference Booking reference
+     * @return array|null
+     */
+    public function getBookingByReference(string $reference): ?array
+    {
+        $booking = $this->bookingRepository->findByReference($reference);
+
+        if (!$booking) {
+            return null;
+        }
+
+        return $this->formatBookingWithDetails($booking);
+    }
+
+    /**
+     * Validate booking business rules
+     */
+    private function validateBookingBusinessRules(array $data): array
+    {
+        // Check minimum travelers count
+        $travelersCount = (int) ($data['travelers_count'] ?? 0);
+        if ($travelersCount <= 0) {
+            return [
+                'success' => false,
+                'message' => __('At least one traveler is required for booking.', 'yatra')
+            ];
+        }
+
+        // Check trip capacity if specified
+        if (!empty($data['trip_id'])) {
+            $trip = $this->tripRepository->find((int) $data['trip_id']);
+            if ($trip && !empty($trip->max_travelers)) {
+                $maxCapacity = (int) $trip->max_travelers;
+                if ($travelersCount > $maxCapacity) {
+                    return [
+                        'success' => false,
+                        'message' => sprintf(
+                            /* translators: %d: maximum number of travelers allowed. */
+                            __('Maximum %d travelers allowed for this trip.', 'yatra'),
+                            $maxCapacity
+                        )
+                    ];
+                }
+            }
+        }
+
+        // Check booking date is in the future
+        if (!empty($data['start_date'])) {
+            $startDate = strtotime($data['start_date']);
+            $today = strtotime('today');
+            
+            if ($startDate < $today) {
+                return [
+                    'success' => false,
+                    'message' => __('Booking date must be in the future.', 'yatra')
+                ];
+            }
+        }
+
+        // Check total amount is positive
+        $totalAmount = (float) ($data['total_amount'] ?? 0);
+        if ($totalAmount <= 0) {
+            return [
+                'success' => false,
+                'message' => __('Total amount must be greater than zero.', 'yatra')
+            ];
+        }
+
+        // Check payment amount doesn't exceed total
+        $amountPaid = (float) ($data['amount_paid'] ?? 0);
+        if ($amountPaid > $totalAmount) {
+            return [
+                'success' => false,
+                'message' => __('Payment amount cannot exceed total booking amount.', 'yatra')
+            ];
+        }
+
+        // Validate tax configuration
+        $taxValidation = BookingTaxService::validateBookingTax($data);
+        if (!$taxValidation['valid']) {
+            return [
+                'success' => false,
+                'message' => __('Tax configuration error.', 'yatra'),
+                'errors' => $taxValidation['errors']
+            ];
+        }
+
+        return ['success' => true];
+    }
+
+    /**
+     * Create a new booking with comprehensive validation and business rules
+     * 
+     * @param array $data Booking data
+     * @return array {success: bool, booking_id?: int, reference?: string, message?: string}
+     */
+    public function createBooking(array $data): array
+    {
+        $startTime = microtime(true);
+
+        // Checkout defers the rich confirmation to BookingSessionController (avoids duplicate customer emails).
+        // Not persisted; stripped by BookingValidator::sanitize().
+        $skipInitialCustomerConfirmation = !empty($data['skip_initial_customer_confirmation']);
+        
+        try {
+            Logger::info("Booking creation started", [
+                'data_keys' => array_keys($data),
+                'trip_id' => $data['trip_id'] ?? null,
+                'has_itinerary_costs' => isset($data['itinerary_costs']),
+                'has_itinerary_costs_total' => isset($data['itinerary_costs_total'])
+            ]);
+            
+            // Comprehensive validation using BookingValidator
+            try {
+                BookingValidator::validateCreate($data);
+            } catch (\Yatra\Exceptions\ValidationException $e) {
+                Logger::warning('Booking validation failed', [
+                    'trip_id' => $data['trip_id'] ?? null,
+                    'errors' => $e->getErrors(),
+                ]);
+                return [
+                    'success' => false,
+                    'message' => $e->getMessage() ?: __('Booking validation failed.', 'yatra'),
+                    'errors' => $e->getErrors(),
+                ];
+            }
+            
+            $data = BookingValidator::sanitize($data);
+
+            // ========================================
+            // SERVER-SIDE AVAILABILITY RESOLUTION (single source of truth)
+            // ========================================
+            // For rule-generated dates we may not have a numeric availability_id. Always re-resolve
+            // by (trip_id, travel_date, departure_time) so capacity/status/cutoff checks match what
+            // the single-trip UI showed.
+            $isWaitlist = isset($data['status']) && $data['status'] === 'waitlist';
+            $tripId = (int) ($data['trip_id'] ?? 0);
+            $travelDate = (string) ($data['travel_date'] ?? ($data['start_date'] ?? ''));
+            $departureTime = null;
+            if (!empty($data['departure_time']) && is_string($data['departure_time'])) {
+                $departureTime = trim($data['departure_time']);
+                if ($departureTime === '') {
+                    $departureTime = null;
+                }
+            }
+
+            if (!$isWaitlist && $tripId > 0 && $travelDate !== '') {
+                try {
+                    $resolver = new AvailabilityResolutionService();
+                    $resolved = $resolver->resolveAvailabilityForDate($tripId, $travelDate, $departureTime);
+
+                    $status = (string) ($resolved->status ?? 'available');
+                    if (in_array($status, ['blocked', 'closed', 'cancelled'], true)) {
+                        return [
+                            'success' => false,
+                            'message' => __('This departure is not open for booking.', 'yatra'),
+                        ];
+                    }
+
+                    $travelersCount = (int) ($data['travelers_count'] ?? 0);
+                    $seatsAvailable = isset($resolved->seats_available) ? (int) $resolved->seats_available : null;
+                    if ($status === 'sold_out' || ($seatsAvailable !== null && $seatsAvailable <= 0)) {
+                        return [
+                            'success' => false,
+                            'message' => __('This departure is sold out.', 'yatra'),
+                        ];
+                    }
+                    if ($seatsAvailable !== null && $travelersCount > 0 && $travelersCount > $seatsAvailable) {
+                        return [
+                            'success' => false,
+                            'message' => __('This departure is full.', 'yatra'),
+                        ];
+                    }
+
+                    // Cutoff enforcement (best-effort; recurring generation already filters by cutoff).
+                    $cutoffHours = isset($resolved->cutoff_hours) ? (int) $resolved->cutoff_hours : 0;
+                    if ($cutoffHours > 0 && !empty($resolved->departure_date)) {
+                        $dt = (string) $resolved->departure_date;
+                        if (!empty($resolved->departure_time)) {
+                            $dt .= ' ' . (string) $resolved->departure_time;
+                        } else {
+                            $dt .= ' 00:00';
+                        }
+                        $depTs = strtotime($dt);
+                        if ($depTs !== false) {
+                            $latest = $depTs - ($cutoffHours * 3600);
+                            if (time() > $latest) {
+                                return [
+                                    'success' => false,
+                                    'message' => __('Booking cutoff has passed for this departure.', 'yatra'),
+                                ];
+                            }
+                        }
+                    }
+
+                    // Persist a snapshot of the resolved source for auditing and downstream modules.
+                    $meta = [];
+                    if (!empty($data['meta']) && is_string($data['meta'])) {
+                        $decoded = json_decode($data['meta'], true);
+                        $meta = is_array($decoded) ? $decoded : [];
+                    } elseif (is_array($data['meta'] ?? null)) {
+                        $meta = $data['meta'];
+                    }
+                    $meta['resolved_availability'] = [
+                        'source' => $resolved->source ?? null,
+                        'rule_id' => $resolved->rule_id ?? null,
+                        'availability_id' => $resolved->id ?? null,
+                        'departure_date' => $resolved->departure_date ?? null,
+                        'departure_time' => $resolved->departure_time ?? null,
+                        'pricing_type' => $resolved->pricing_type ?? null,
+                        'price_types' => $resolved->price_types ?? [],
+                    ];
+                    $data['meta'] = wp_json_encode($meta);
+                } catch (\Throwable $e) {
+                    // If resolution fails, allow booking to proceed using legacy validations.
+                }
+            }
+            
+            Logger::info("After BookingValidator::sanitize", [
+                'data_keys' => array_keys($data),
+                'has_itinerary_costs' => isset($data['itinerary_costs']),
+                'has_itinerary_costs_total' => isset($data['itinerary_costs_total'])
+            ]);
+            
+            // Business rule validations
+            $validationResult = $this->validateBookingBusinessRules($data);
+            if (!$validationResult['success']) {
+                Logger::warning("Booking business rule validation failed", [
+                    'trip_id' => $data['trip_id'],
+                    'reason' => $validationResult['message']
+                ]);
+                return $validationResult;
+            }
+            
+            // Validate trip exists and is available
+            $trip = $this->tripRepository->find((int) $data['trip_id']);
+            if (!$trip) {
+                Logger::error("Trip not found for booking", ['trip_id' => $data['trip_id']]);
+                return ['success' => false, 'message' => __('Trip not found.', 'yatra')];
+            }
+
+            if ($trip->status !== 'publish') {
+                Logger::warning("Trip not available for booking", [
+                    'trip_id' => $data['trip_id'],
+                    'status' => $trip->status
+                ]);
+                return ['success' => false, 'message' => __('Trip is not available for booking.', 'yatra')];
+            }
+
+            // Calculate start_date and end_date if travel_date is provided
+            if (!empty($data['travel_date']) && empty($data['start_date'])) {
+                $data['start_date'] = $data['travel_date'];
+            }
+            
+            if (!empty($data['start_date']) && empty($data['end_date'])) {
+                $data['end_date'] = $this->calculateEndDate($data['start_date'], (int) $data['trip_id']);
+            }
+
+            // Generate unique reference
+            $data['reference'] = $this->bookingRepository->generateReference();
+
+            // Find or create customer
+            if (!empty($data['contact_email'])) {
+                $customerId = $this->customerRepository->findOrCreate([
+                    'email' => $data['contact_email'],
+                    'first_name' => $data['contact_first_name'] ?? '',
+                    'last_name' => $data['contact_last_name'] ?? '',
+                    'phone' => $data['contact_phone'] ?? '',
+                    'country' => $data['contact_country'] ?? '',
+                    'user_id' => $data['user_id'] ?? null,
+                ]);
+                $data['customer_id'] = $customerId;
+            }
+
+            // Apply tax calculation to booking data
+            $data = BookingTaxService::applyTaxToBooking($data);
+
+            // Calculate amount due (recalculated after tax). Honor the selected
+            // payment method via Pro FlexiblePayments so a deposit/partial
+            // booking stores the reduced amount due now — not the full total.
+            // For 'full' (and when Pro is inactive) the filter returns
+            // total − paid unchanged, so full-payment bookings are unaffected.
+            // After the deposit is paid, payment completion resets amount_due to
+            // the remaining balance (total − amount_paid).
+            $bs_total          = (float) ($data['total_amount'] ?? 0);
+            $bs_paid           = (float) ($data['amount_paid'] ?? 0);
+            $bs_payment_method = strtolower(trim((string) ($data['payment_method'] ?? 'full')));
+            $bs_due_now        = (float) apply_filters(
+                'yatra_calculate_amount_due',
+                $bs_total - $bs_paid,
+                $bs_total,
+                $bs_payment_method,
+                [
+                    'trip_id'     => (int) ($data['trip_id'] ?? 0),
+                    // Tour start lets Pro enforce "pay in full when the tour is
+                    // within the balance-due window" (tour-anchored payments).
+                    'travel_date' => (string) ($data['travel_date'] ?? ($data['start_date'] ?? '')),
+                ]
+            );
+            $data['amount_due'] = max(0.0, round($bs_due_now, 2));
+
+            // Create booking
+            $bookingId = $this->bookingRepository->create($data);
+
+            if (!$bookingId) {
+                Logger::error("Failed to create booking in database", ['data' => $data]);
+                return ['success' => false, 'message' => __('Failed to create booking.', 'yatra')];
+            }
+
+            // Waitlist bookings do not consume departure capacity until promoted.
+            $isWaitlist = isset($data['status']) && $data['status'] === 'waitlist';
+
+            // Link booking to departure if start_date is provided
+            if (!$isWaitlist && !empty($data['start_date']) && !empty($data['end_date'])) {
+                try {
+                    $trip = $this->tripRepository->find((int) $data['trip_id']);
+                    // Get max capacity from trip's max_travelers, or use default
+                    $maxCapacity = null;
+                    if ($trip && !empty($trip->max_travelers)) {
+                        $maxCapacity = (int) $trip->max_travelers;
+                    }
+                    $travelersCount = (int) ($data['travelers_count'] ?? 0);
+
+                    $departureTime = null;
+                    if (!empty($data['departure_time']) && is_string($data['departure_time'])) {
+                        $departureTime = trim($data['departure_time']);
+                        if ($departureTime === '') {
+                            $departureTime = null;
+                        }
+                    }
+
+                    // Find or create departure
+                    $departure = $this->departureService->findOrCreateForBooking(
+                        (int) $data['trip_id'],
+                        $data['start_date'],
+                        $data['end_date'],
+                        $travelersCount,
+                        $maxCapacity,
+                        $departureTime
+                    );
+
+                    // Link booking to departure
+                    $this->departureService->linkBookingToDeparture($bookingId, $departure->id);
+
+                    // Increment booked count
+                    $this->departureService->incrementBookedCount($departure->id, $travelersCount);
+
+                    Logger::info("Booking linked to departure", [
+                        'booking_id' => $bookingId,
+                        'departure_id' => $departure->id
+                    ]);
+                } catch (\Exception $e) {
+                    // Log error but don't fail the booking
+                    Logger::warning("Failed to link booking to departure", [
+                        'booking_id' => $bookingId,
+                        'error' => $e->getMessage()
+                    ]);
+                }
+            }
+
+            // Save travelers
+            if (!empty($data['travelers']) && is_array($data['travelers'])) {
+                $this->saveTravelers($bookingId, $data['travelers']);
+            }
+
+            // Customer confirmation: skip when checkout will send the session email (offline / zero due).
+            if (!$skipInitialCustomerConfirmation) {
+                $this->sendBookingConfirmationEmail($bookingId);
+            }
+            
+            $executionTime = microtime(true) - $startTime;
+            Logger::info("Booking created successfully", [
+                'booking_id' => $bookingId,
+                'reference' => $data['reference'],
+                'execution_time' => $executionTime
+            ]);
+
+            $booking = $this->bookingRepository->find((int) $bookingId);
+            if (!is_object($booking)) {
+                $booking = (object) [];
+            }
+
+            // Defer the public booking-created action when the row is
+            // still in `pending_verification`. Sending the booking
+            // confirmation email and firing analytics integrations
+            // before the customer has proven the email is theirs would
+            // (a) leak the booking details to whoever owns that
+            // address, and (b) inflate conversion metrics with bookings
+            // that may never be verified. BookingSessionController::
+            // verify_email() re-fires this action after the status flip
+            // so every listener (NotificationHooks, EmailAutomation,
+            // analytics modules) still runs — just *after* verification.
+            //
+            // Inventory + cache invalidation aren't routed through this
+            // action (they're called directly above), so seat-holding
+            // continues to work while the customer is in the holding
+            // state.
+            /**
+             * A booking has been stored — fired for every booking, including
+             * one still in `pending_verification`, which defers
+             * yatra_booking_created until the e-mail is verified. For
+             * listeners that must act at checkout time (e.g. recording the
+             * visitor's consent choice), not for notifications.
+             *
+             * @param int    $bookingId
+             * @param object $booking
+             */
+            do_action('yatra_booking_inserted', (int) $bookingId, $booking);
+
+            $bookingStatus = (string) ($data['status'] ?? ($booking->status ?? ''));
+            if ($bookingStatus !== 'pending_verification') {
+                do_action(\Yatra\Hooks\TelemetryHookNames::BOOKING_CREATED, (int) $bookingId, $booking);
+            }
+
+            return [
+                'success' => true,
+                'booking_id' => $bookingId,
+                'reference' => $data['reference'],
+                'message' => __('Booking created successfully.', 'yatra'),
+            ];
+            
+        } catch (\Exception $e) {
+            $executionTime = microtime(true) - $startTime;
+            Logger::error("Booking creation failed", [
+                'trip_id' => $data['trip_id'] ?? null,
+                'execution_time' => $executionTime,
+                'error' => $e->getMessage()
+            ]);
+            
+            return [
+                'success' => false,
+                'message' => $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Update a booking
+     * 
+     * @param int   $id   Booking ID
+     * @param array $data Booking data
+     * @return array {success: bool, message: string}
+     */
+    public function updateBooking(int $id, array $data): array
+    {
+        $booking = $this->bookingRepository->find($id);
+
+        if (!$booking) {
+            return ['success' => false, 'message' => __('Booking not found.', 'yatra')];
+        }
+
+        // Reject an unknown payment status instead of handing it to MySQL. The
+        // column is an ENUM, so an unrecognised value was silently coerced —
+        // resetting a fully-paid booking to "pending" while amount_paid kept the
+        // money that had actually been received, and still returning success.
+        if (array_key_exists('payment_status', $data)) {
+            $paymentStatus = (string) $data['payment_status'];
+
+            if (!in_array($paymentStatus, self::PAYMENT_STATUSES, true)) {
+                return [
+                    'success' => false,
+                    'message' => sprintf(
+                        /* translators: %s: the list of accepted payment statuses. */
+                        __('Invalid payment status. Accepted values are: %s.', 'yatra'),
+                        implode(', ', self::PAYMENT_STATUSES)
+                    ),
+                ];
+            }
+        }
+
+        // Check if date is being changed
+        $oldStartDate = $booking->start_date ?? $booking->travel_date ?? null;
+        $newStartDate = $data['start_date'] ?? $data['travel_date'] ?? null;
+        $dateChanged = false;
+
+        if ($newStartDate && $oldStartDate && $newStartDate !== $oldStartDate) {
+            $dateChanged = true;
+        }
+
+        // Calculate end_date if start_date is provided
+        if (!empty($data['start_date']) && empty($data['end_date'])) {
+            $data['end_date'] = $this->calculateEndDate($data['start_date'], (int) $booking->trip_id);
+        } elseif (!empty($data['travel_date']) && empty($data['start_date']) && empty($data['end_date'])) {
+            $data['start_date'] = $data['travel_date'];
+            $data['end_date'] = $this->calculateEndDate($data['travel_date'], (int) $booking->trip_id);
+        }
+
+        $oldStatus = (string) ($booking->status ?? '');
+        $oldPaymentStatus = (string) ($booking->payment_status ?? '');
+        $oldTripId = (int) ($booking->trip_id ?? 0);
+
+        // Update booking
+        $updated = $this->bookingRepository->update($id, $data);
+
+        if (!$updated) {
+            return ['success' => false, 'message' => __('Failed to update booking.', 'yatra')];
+        }
+
+        $newStatus = isset($data['status']) ? (string) $data['status'] : null;
+        if ($newStatus !== null && $oldStatus === 'waitlist' && $newStatus !== 'waitlist') {
+            WaitlistService::releaseWaitlistHolding($booking);
+        }
+
+        // Re-link the departure when the date changed OR the operator picked a
+        // different departure time. A trip running several departures a day needs the
+        // time as well — moving a booking from the 09:00 to the 14:00 slot is not a
+        // date change, and without this it silently stayed on the original slot.
+        $departureTimeForUpdate = null;
+        if (!empty($data['departure_time']) && is_string($data['departure_time'])) {
+            $departureTimeForUpdate = trim($data['departure_time']) !== '' ? trim($data['departure_time']) : null;
+        }
+
+        // Changing the tour (trip_id) also has to move the departure: the booking
+        // now belongs to a different trip, so its seat has to be released from the
+        // old trip's departure and taken on the new trip's departure. Previously
+        // only a date/time change triggered the re-link, so switching Tour A -> Tour B
+        // left the booking counted against Tour A's departure (and absent from
+        // Tour B's) — over-selling A and under-selling B.
+        $tripChanged = isset($data['trip_id'])
+            && (int) $data['trip_id'] > 0
+            && (int) $data['trip_id'] !== $oldTripId;
+
+        // handleBookingDateChange() re-reads the booking (already saved with the new
+        // trip_id above) and needs the effective travel dates. When only the tour
+        // changed, the date fields aren't in $data, so fall back to the booking's
+        // current dates rather than skipping the re-link.
+        $effectiveStart = !empty($data['start_date'])
+            ? $data['start_date']
+            : ($booking->start_date ?? $booking->travel_date ?? null);
+        $effectiveEnd = !empty($data['end_date'])
+            ? $data['end_date']
+            : ($booking->end_date ?? $effectiveStart);
+
+        if (($dateChanged || $tripChanged || $departureTimeForUpdate !== null)
+            && !empty($effectiveStart) && !empty($effectiveEnd)) {
+            try {
+                $this->departureService->handleBookingDateChange(
+                    $id,
+                    $effectiveStart,
+                    $effectiveEnd,
+                    $departureTimeForUpdate
+                );
+                } catch (\Exception $e) {
+                // Log error but don't fail the update
+                }
+        }
+
+        // Update travelers if provided
+        if (isset($data['travelers']) && is_array($data['travelers'])) {
+            // Delete existing travelers
+            $this->travellerRepository->deleteByBookingId($id);
+            // Save new travelers
+            $this->saveTravelers($id, $data['travelers']);
+        }
+
+        // A manual payment-status change (e.g. an admin marking an offline
+        // bank-transfer booking as Paid) fired no notification and no hook before,
+        // so the customer was never told their payment was received. Detect the
+        // change and notify — without firing `yatra_payment_completed` (that means
+        // a real gateway charge and carries capture side effects).
+        $newPaymentStatus = isset($data['payment_status']) ? (string) $data['payment_status'] : null;
+        if ($newPaymentStatus !== null && $newPaymentStatus !== $oldPaymentStatus) {
+            $this->handlePaymentStatusChange($id, $oldPaymentStatus, $newPaymentStatus);
+        }
+
+        // Changing the status here fired no event at all, so confirming a booking
+        // from the edit form saved the status and then went silent: no confirmation
+        // email, no Email Automation sequence (booking.confirmed / .cancelled /
+        // .completed), no seat release on cancel. Only the status action
+        // (updateStatus) ever emitted it, which is why the same change appeared to
+        // work from one screen and not the other.
+        //
+        // Fired last, once the travellers and related rows are saved, so listeners
+        // read the booking's final state — and only on a real transition, so
+        // re-saving the form without touching the status stays silent.
+        if ($newStatus !== null && $newStatus !== $oldStatus) {
+            // Same order as updateStatus(): the notification is sent inline (it is
+            // not a listener on the action below), then the event fans out.
+            $this->sendStatusChangeNotification($id, $oldStatus, $newStatus);
+
+            /**
+             * Fires when a booking's status changes.
+             *
+             * @param int    $id        The booking ID
+             * @param string $oldStatus Previous status
+             * @param string $newStatus New status
+             */
+            do_action('yatra_booking_status_changed', $id, $oldStatus, $newStatus);
+
+            if ($newStatus === 'confirmed' && $oldStatus !== 'confirmed'
+                && function_exists('yatra_trigger_booking_confirmed')) {
+                yatra_trigger_booking_confirmed($id, $oldStatus);
+            }
+
+            if ($newStatus === 'cancelled' && $oldStatus !== 'cancelled'
+                && function_exists('yatra_trigger_booking_cancelled')) {
+                yatra_trigger_booking_cancelled($id, $oldStatus);
+            }
+        }
+
+        // Return the fresh booking so the REST controller's `$result['data']`
+        // is defined (previously absent → "Undefined array key data" warning).
+        return [
+            'success' => true,
+            'message' => __('Booking updated successfully.', 'yatra'),
+            'data' => $this->bookingRepository->find($id),
+        ];
+    }
+
+    /**
+     * Record an operator-confirmed payment against a booking.
+     *
+     * Used when a booking is marked paid by hand — typically an offline payment
+     * such as a bank transfer or cash, where no gateway callback ever arrives.
+     * Without this the booking claimed the money while the ledger showed
+     * nothing, and the Payments screen stayed empty.
+     *
+     * Written as `completed` because the operator is asserting the funds were
+     * received; `payment_type` reflects whether this settles a balance or is the
+     * only payment on the booking.
+     */
+    private function recordManualPayment(
+        object $booking,
+        int $bookingId,
+        float $amount,
+        float $existingLedger,
+        string $notes = ''
+    ): int {
+        $gateway = (string) ($booking->payment_gateway ?? $booking->payment_method ?? '');
+
+        if (trim($gateway) === '') {
+            // `gateway` is NOT NULL on the payments table.
+            $gateway = 'manual';
+        }
+
+        $paymentId = (int) $this->paymentRepository->create([
+            'booking_id'   => $bookingId,
+            'customer_id'  => !empty($booking->customer_id) ? (int) $booking->customer_id : null,
+            'gateway'      => $gateway,
+            'amount'       => $amount,
+            'currency'     => (string) ($booking->currency ?? SettingsService::getCurrency()),
+            'status'       => 'completed',
+            'payment_type' => $existingLedger > 0 ? 'final' : 'initial',
+            'notes'        => $notes !== ''
+                ? $notes
+                : __('Recorded manually when the booking was marked as paid.', 'yatra'),
+            'processed_at' => current_time('mysql'),
+            'created_at'   => current_time('mysql'),
+        ]);
+
+        do_action('yatra_manual_payment_recorded', $bookingId, $amount, $gateway);
+
+        return $paymentId;
+    }
+
+    /**
+     * React to a manual payment-status change (admin edits, e.g. bank transfer
+     * marked Paid). Sends the customer + admin payment emails when money is
+     * (fully or partially) received, and fires `yatra_payment_status_changed`
+     * so integrations can react. Intentionally separate from
+     * `yatra_payment_completed`, which represents a real gateway capture.
+     */
+    private function handlePaymentStatusChange(int $bookingId, string $oldStatus, string $newStatus): void
+    {
+        $booking = $this->bookingRepository->findWithTrip($bookingId);
+        if (!$booking) {
+            return;
+        }
+
+        do_action('yatra_payment_status_changed', $bookingId, $oldStatus, $newStatus, $booking);
+
+        // Marking a booking paid has to settle its money fields too. An operator
+        // confirming an offline payment (bank transfer, cash) has no payment row
+        // to mark as completed — this status change is the only signal we get.
+        // Without reconciling here the booking read "paid" while amount_paid
+        // stayed 0 and amount_due kept the outstanding figure, so the invoice
+        // still reported "Payment Pending" with nothing paid and the full amount
+        // due.
+        //
+        // Only ever settles UP: a recorded amount_paid at or above the total is
+        // left alone, so this can never erase or reduce a real payment. The other
+        // statuses are deliberately untouched — "partial" carries no amount to
+        // apply, and zeroing on "pending"/"refunded" would destroy payment data.
+
+        // How much money this status change actually brought in, which is what
+        // decides whether a receipt goes out below. Stays zero for "partial",
+        // which carries no amount to record.
+        $recordedNow = 0.0;
+        $recordedPaymentId = 0;
+
+        if ($newStatus === 'paid') {
+            $total = (float) ($booking->total_amount ?? 0);
+            $recorded = (float) ($booking->amount_paid ?? 0);
+
+            if ($total > 0) {
+                // The payments ledger is the source of truth: PaymentService
+                // recalculates amount_paid from it whenever a payment is added,
+                // so a booking marked paid without a matching ledger row would
+                // silently revert to "partial" the next time any payment was
+                // recorded. Write the outstanding balance as a real payment so
+                // the two agree and the Payments screen shows what was received.
+                $ledger = (float) $this->paymentRepository->getTotalPaidForBooking($bookingId);
+
+                // Measure the gap against whichever figure is higher so an
+                // existing (pre-ledger) amount_paid is never double-counted.
+                $alreadyCovered = max($ledger, $recorded);
+                $outstanding = round($total - $alreadyCovered, 2);
+
+                // A booking can carry an amount_paid the ledger knows nothing
+                // about — set by an import, or by a path that predates the
+                // ledger. That money was really received, so give it a row of
+                // its own before recording the balance. Without this the ledger
+                // ends up short by exactly that amount, and because
+                // PaymentService recalculates amount_paid FROM the ledger, the
+                // next payment of any kind would quietly undo the settlement.
+                // It is recorded separately from the balance so the receipt
+                // below still announces only what this change brought in.
+                $unledgered = round($recorded - $ledger, 2);
+
+                if ($unledgered > 0) {
+                    $this->recordManualPayment(
+                        $booking,
+                        $bookingId,
+                        $unledgered,
+                        $ledger,
+                        __('Earlier payment reconciled when the booking was marked as paid.', 'yatra')
+                    );
+                    $ledger = (float) $this->paymentRepository->getTotalPaidForBooking($bookingId);
+                }
+
+                if ($outstanding > 0) {
+                    $recordedPaymentId = $this->recordManualPayment($booking, $bookingId, $outstanding, $ledger);
+                    $recordedNow = $outstanding;
+                    $ledger = (float) $this->paymentRepository->getTotalPaidForBooking($bookingId);
+                }
+
+                // Never reduce a recorded overpayment: settle up, never down.
+                // `$alreadyCovered + $outstanding` is the total actually
+                // received; $ledger alone understated it whenever a pre-ledger
+                // amount_paid had not been backfilled, leaving a fully paid
+                // booking reading as part paid with a balance still due.
+                $newAmountPaid = max($ledger, $alreadyCovered + max(0.0, $outstanding));
+
+                if ($newAmountPaid > $recorded || $recorded < $total) {
+                    // Canonical writer — also derives amount_due and keeps
+                    // payment_status consistent with the amounts.
+                    $this->bookingRepository->updateAmountPaid($bookingId, $newAmountPaid);
+
+                    $booking->amount_paid = $newAmountPaid;
+                    $booking->amount_due = max(0.0, $total - $newAmountPaid);
+                }
+            }
+        }
+
+        // A receipt is only honest if money actually arrived. This used to fire
+        // for any change to "paid" or "partial" and announce the booking's
+        // cumulative amount_paid as though it were the payment just made —
+        // falling back to the FULL BOOKING TOTAL whenever amount_paid was zero.
+        // So flipping a status could tell a customer they had paid the whole
+        // trip when they had paid a deposit, or nothing at all. It now reports
+        // the amount this change recorded, and says nothing when it recorded
+        // nothing: re-flagging an already-settled booking, or moving it to
+        // "partial" (which records no amount), is a bookkeeping act, not a
+        // payment. The admin "resend email" action still exists for sending a
+        // receipt deliberately.
+        if ($recordedNow > 0) {
+            \Yatra\Services\NotificationService::sendPaymentCompletedNotification([
+                'booking_id' => $bookingId,
+                // Names the exact row just written, so {{payment_reference}}
+                // cites this payment rather than the booking's latest.
+                'payment_id' => $recordedPaymentId,
+                'amount' => $recordedNow,
+                'payment_method' => (string) ($booking->payment_method ?? ''),
+                'transaction_id' => '',
+            ]);
+        }
+    }
+
+    /**
+     * Calculate end date from start date and trip duration
+     * 
+     * @param string $startDate Start date (YYYY-MM-DD)
+     * @param int $tripId Trip ID
+     * @return string End date (YYYY-MM-DD)
+     */
+    private function calculateEndDate(string $startDate, int $tripId): string
+    {
+        return $this->bookingRepository->calculateEndDate($startDate, $tripId);
+    }
+
+    /**
+     * Update booking status
+     * 
+     * @param int    $id     Booking ID
+     * @param string $status New status
+     * @return array {success: bool, message: string}
+     */
+    public function updateStatus(int $id, string $status, string $reason = ''): array
+    {
+        $validStatuses = ['pending', 'confirmed', 'processing', 'completed', 'cancelled', 'refunded', 'failed', 'on_hold'];
+
+        if (!in_array($status, $validStatuses, true)) {
+            return ['success' => false, 'message' => __('Invalid status.', 'yatra')];
+        }
+
+        $booking = $this->bookingRepository->find($id);
+
+        if (!$booking) {
+            return ['success' => false, 'message' => __('Booking not found.', 'yatra')];
+        }
+
+        $oldStatus = $booking->status;
+
+        // A reason only means anything on a cancellation, and it must be saved
+        // BEFORE the notification below reads the row — the cancellation email
+        // carries {{cancellation_reason}}.
+        $reason = $status === 'cancelled' ? trim($reason) : '';
+        $updated = $this->bookingRepository->updateStatus($id, $status, $reason);
+
+        if ($reason !== '') {
+            // Keep the in-memory row in step so the email sees the reason even
+            // if it is rendered from $booking rather than re-read.
+            $booking->cancellation_reason = $reason;
+        }
+
+        if (!$updated) {
+            return ['success' => false, 'message' => __('Failed to update status.', 'yatra')];
+        }
+
+        if ($oldStatus === 'waitlist' && $status !== 'waitlist') {
+            WaitlistService::releaseWaitlistHolding($booking);
+        }
+
+        // ========================================
+        // HANDLE DEPARTURE BOOKED_COUNT UPDATE
+        // ========================================
+        // If booking is cancelled or refunded, unlink from departure and decrement booked_count
+        // If booking status changes from cancelled/refunded to active, link and increment booked_count
+        try {
+            $departure = $this->departureService->getDepartureForBooking($id);
+            $travelersCount = (int) ($booking->travelers_count ?? 0);
+
+            if ($departure) {
+                // If booking is being cancelled or refunded
+                if (in_array($status, ['cancelled', 'refunded'], true) && 
+                    !in_array($oldStatus, ['cancelled', 'refunded'], true)) {
+                    // Unlink booking from departure (this will handle cancellation if no bookings remain)
+                    $this->departureService->unlinkBookingFromDeparture($id, $departure->id);
+                    }
+                // If booking status changes from cancelled/refunded back to active
+                elseif (in_array($oldStatus, ['cancelled', 'refunded'], true) && 
+                        !in_array($status, ['cancelled', 'refunded'], true)) {
+                    // Ensure booking is linked and increment booked count
+                    $this->departureService->linkBookingToDeparture($id, $departure->id);
+                    $this->departureService->incrementBookedCount($departure->id, $travelersCount);
+                    }
+            } elseif (!empty($booking->start_date) || !empty($booking->travel_date)) {
+                // Booking doesn't have a departure yet, but has a date - create and link
+                $startDate = $booking->start_date ?? $booking->travel_date;
+                $endDate = $booking->end_date ?? $this->calculateEndDate($startDate, (int) $booking->trip_id);
+                
+                $trip = $this->tripRepository->find((int) $booking->trip_id);
+                // Resolve capacity from the trip's real column (`max_travelers`).
+                // The old `$trip->max_capacity` does not exist on the trips table,
+                // so this always fell back to 9999 — seeding a junk "unlimited"
+                // sentinel that then showed as a huge number on the Departures page
+                // but as 0 on the dashboard. Pass null when unset so
+                // findOrCreateForBooking resolves via Availability, then its own
+                // trip-default fallback, exactly like the primary creation path.
+                $maxCapacity = ($trip && !empty($trip->max_travelers)) ? (int) $trip->max_travelers : null;
+
+                $departure = $this->departureService->findOrCreateForBooking(
+                    (int) $booking->trip_id,
+                    $startDate,
+                    $endDate,
+                    $travelersCount,
+                    $maxCapacity
+                );
+                
+                $this->departureService->linkBookingToDeparture($id, $departure->id);
+                $this->departureService->incrementBookedCount($departure->id, $travelersCount);
+                }
+        } catch (\Exception $e) {
+            // Log error but don't fail the status update
+            }
+
+        // Send status change notification
+        $this->sendStatusChangeNotification($id, $oldStatus, $status);
+        
+        /**
+         * Action: Booking status changed
+         * Fires when booking status changes
+         * 
+         * @param int $id The booking ID
+         * @param string $oldStatus Previous status
+         * @param string $status New status
+         * @since 3.0.0
+         */
+        do_action('yatra_booking_status_changed', $id, $oldStatus, $status);
+
+        if ($status === 'confirmed' && $oldStatus !== 'confirmed') {
+            \yatra_trigger_booking_confirmed($id, $oldStatus);
+        }
+
+        if ($status === 'cancelled' && $oldStatus !== 'cancelled') {
+            \yatra_trigger_booking_cancelled($id, $oldStatus);
+        }
+
+        return [
+            'success' => true,
+            'message' => sprintf(
+                /* translators: %s: new booking status. */
+                __('Booking status updated to %s.', 'yatra'),
+                $status
+            ),
+        ];
+    }
+
+    /**
+     * Delete a booking
+     * 
+     * @param int $id Booking ID
+     * @return array {success: bool, message: string}
+     */
+    public function deleteBooking(int $id): array
+    {
+        $booking = $this->bookingRepository->find($id);
+
+        if (!$booking) {
+            return ['success' => false, 'message' => __('Booking not found.', 'yatra')];
+        }
+
+        if (($booking->status ?? '') === 'waitlist') {
+            WaitlistService::releaseWaitlistHolding($booking);
+        }
+
+        try {
+            $departure = $this->departureService->getDepartureForBooking($id);
+            if ($departure) {
+                $this->departureService->unlinkBookingFromDeparture($id, $departure->id);
+            }
+        } catch (\Throwable $e) {
+            // Continue with delete
+        }
+
+        // Delete related travelers
+        $this->travellerRepository->deleteByBookingId($id);
+
+        // Delete booking
+        $deleted = $this->bookingRepository->delete($id);
+
+        if (!$deleted) {
+            return ['success' => false, 'message' => __('Failed to delete booking.', 'yatra')];
+        }
+
+        if (!is_object($booking)) {
+            $booking = (object) [];
+        }
+
+        do_action('yatra_booking_deleted', (int) $id, $booking);
+
+        return [
+            'success' => true,
+            'message' => __('Booking deleted successfully.', 'yatra'),
+        ];
+    }
+
+    /**
+     * Get booking statistics
+     * 
+     * @return array
+     */
+    public function getStats(): array
+    {
+        return $this->bookingRepository->getStats();
+    }
+
+    /**
+     * Get booking payments
+     * 
+     * @param int $bookingId Booking ID
+     * @return array
+     */
+    public function getBookingPayments(int $bookingId): array
+    {
+        return $this->paymentRepository->findByBookingId($bookingId);
+    }
+
+    /**
+     * Get booking travelers
+     * 
+     * @param int $bookingId Booking ID
+     * @return array
+     */
+    public function getBookingTravelers(int $bookingId): array
+    {
+        return $this->travellerRepository->getByBookingId($bookingId);
+    }
+
+    /**
+     * Format booking for API response
+     * 
+     * @param object $booking Raw booking data
+     * @return array
+     */
+    private function formatBooking(object $booking): array
+    {
+        // Build customer name from contact fields
+        $customerName = trim(
+            ($booking->customer_first_name ?? $booking->contact_first_name ?? '') . ' ' . ($booking->customer_last_name ?? $booking->contact_last_name ?? '')
+        ) ?: ($booking->customer_name ?? $booking->customer_email ?? $booking->contact_email ?? null);
+
+        $customerEmail = $booking->customer_email ?? $booking->contact_email ?? null;
+        $customerPhone = $booking->contact_phone ?? null;
+
+        // Fallback: fetch customer record if customer_id is set and info missing
+        if (($booking->customer_id ?? 0) && (empty($customerName) || empty($customerEmail) || empty($customerPhone))) {
+            $customerRepo = new \Yatra\Repositories\CustomerRepository();
+            $customerRecord = $customerRepo->find((int)$booking->customer_id);
+            if ($customerRecord) {
+                if (empty($customerName)) {
+                    $customerName = trim(($customerRecord->first_name ?? '') . ' ' . ($customerRecord->last_name ?? '')) ?: ($customerRecord->email ?? $customerName);
+                }
+                if (empty($customerEmail)) {
+                    $customerEmail = $customerRecord->email ?? $customerEmail;
+                }
+                if (empty($customerPhone)) {
+                    $customerPhone = $customerRecord->phone ?? $customerPhone;
+                }
+                if (empty($booking->contact_first_name) && !empty($customerRecord->first_name)) {
+                    $booking->contact_first_name = $customerRecord->first_name;
+                }
+                if (empty($booking->contact_last_name) && !empty($customerRecord->last_name)) {
+                    $booking->contact_last_name = $customerRecord->last_name;
+                }
+                if (empty($booking->contact_country) && !empty($customerRecord->country)) {
+                    $booking->contact_country = $customerRecord->country;
+                }
+            }
+        }
+
+        return [
+            'id' => (int) $booking->id,
+            'reference' => $booking->reference,
+            // UI expects booking_number and booking_status fields
+            'booking_number' => $booking->reference,
+            'booking_status' => $booking->status,
+            'trip_id' => (int) $booking->trip_id,
+            'trip_title' => $booking->trip_title ?? '',
+            'trip_slug' => $booking->trip_slug ?? '',
+            'customer_id' => $booking->customer_id ? (int) $booking->customer_id : null,
+            'user_id' => $booking->user_id ? (int) $booking->user_id : null,
+            'customer_name' => $customerName,
+            'customer_email' => $customerEmail,
+            'customer_phone' => $customerPhone,
+            'contact' => [
+                'first_name' => $booking->contact_first_name ?? $booking->customer_first_name ?? null,
+                'last_name' => $booking->contact_last_name ?? $booking->customer_last_name ?? null,
+                'email' => $customerEmail,
+                'phone' => $customerPhone,
+                'country' => $booking->contact_country,
+            ],
+            'contact_first_name' => $booking->contact_first_name ?? $booking->customer_first_name ?? null,
+            'contact_last_name' => $booking->contact_last_name ?? $booking->customer_last_name ?? null,
+            'contact_email' => $customerEmail,
+            'contact_phone' => $customerPhone,
+            'contact_country' => $booking->contact_country ?? null,
+            'travel_date' => $booking->travel_date,
+            'start_date' => $booking->start_date ?? $booking->travel_date ?? null,
+            'end_date' => $booking->end_date ?? null,
+            // travelers_count stored; also fallback to total_travelers/travelers if present
+            'travelers_count' => (int) ($booking->travelers_count ?? $booking->total_travelers ?? $booking->travelers ?? 0),
+            'travelers' => (int) ($booking->travelers_count ?? $booking->total_travelers ?? $booking->travelers ?? 0),
+            'total_amount' => (float) $booking->total_amount,
+            'amount_paid' => (float) $booking->amount_paid,
+            'amount_due' => (float) $booking->amount_due,
+            'discount_amount' => (float) ($booking->discount_amount ?? 0),
+            'discount_code' => $booking->discount_code ?? null,
+            'currency' => $booking->currency,
+            'tax_amount' => (float) ($booking->tax_amount ?? 0),
+            'tax_rate' => (float) ($booking->tax_rate ?? 0),
+            'tax_inclusive' => (int) ($booking->tax_inclusive ?? 0),
+            'tax_details' => $booking->tax_details ?? null,
+            'tax_breakdown' => $booking->tax_details ? json_decode($booking->tax_details, true) : [],
+            'subtotal' => (float) ($booking->subtotal ?? $booking->total_amount ?? 0),
+            'taxable_amount' => (float) (($booking->subtotal ?? $booking->total_amount ?? 0) + ($booking->itinerary_costs_total ?? 0)),
+            'itinerary_costs' => $booking->itinerary_costs ? json_decode($booking->itinerary_costs, true) : [],
+            'itinerary_costs_total' => (float) ($booking->itinerary_costs_total ?? 0),
+            'status' => $booking->status,
+            'payment_status' => $booking->payment_status,
+            // Some UIs expect payment_method; map from payment_gateway
+            'payment_gateway' => $booking->payment_gateway,
+            'payment_method' => $booking->payment_gateway,
+            // booking_date is used in admin table; map to created_at
+            'booking_date' => $booking->created_at,
+            'created_at' => $booking->created_at,
+            'updated_at' => $booking->updated_at,
+        ];
+    }
+
+    /**
+     * Format booking with all details for single view
+     * 
+     * @param object $booking Raw booking data
+     * @return array
+     */
+    private function formatBookingWithDetails(object $booking): array
+    {
+        $formatted = $this->formatBooking($booking);
+
+        // Add customer name for easier access
+        $formatted['customer_name'] = trim(
+            ($booking->contact_first_name ?? '') . ' ' . ($booking->contact_last_name ?? '')
+        ) ?: null;
+        $formatted['customer_email'] = $booking->contact_email ?? null;
+        $formatted['customer_phone'] = $booking->contact_phone ?? null;
+        
+        // Also add contact fields at root level for backward compatibility
+        $formatted['contact_first_name'] = $booking->contact_first_name ?? null;
+        $formatted['contact_last_name'] = $booking->contact_last_name ?? null;
+        $formatted['contact_email'] = $booking->contact_email ?? null;
+        $formatted['contact_phone'] = $booking->contact_phone ?? null;
+        $formatted['contact_country'] = $booking->contact_country ?? null;
+
+        // Add full contact data
+        $formatted['contact_data'] = $booking->contact_data ? json_decode($booking->contact_data, true) : null;
+
+        // Add emergency contact: handle JSON, serialized, or array
+        $emergency = $booking->emergency_contact ?? null;
+        if (is_string($emergency)) {
+            $decoded = json_decode($emergency, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $emergency = $decoded;
+            } else {
+                $maybe = maybe_unserialize($emergency);
+                $emergency = is_array($maybe) ? $maybe : null;
+            }
+        } elseif (!is_array($emergency)) {
+            $emergency = null;
+        }
+        $formatted['emergency_contact'] = $emergency;
+
+        // Add travelers
+        $formatted['travelers'] = $this->getBookingTravelers((int) $booking->id);
+
+        // Add payments
+        $formatted['payments'] = $this->getBookingPayments((int) $booking->id);
+
+        // The ledger in three figures, so the booking screen can state what was
+        // received, what went back and what that leaves — rather than leaving an
+        // operator to work it out from a list in which refunds appear as
+        // negative rows. Derived from the payments, never from a stored column.
+        $paymentTotals = $this->paymentRepository->getBookingPaymentTotals((int) $booking->id);
+        $formatted['total_received'] = $paymentTotals['successful'];
+        $formatted['total_refunded'] = $paymentTotals['refunded'];
+        $formatted['net_received'] = max(0.0, $paymentTotals['net']);
+
+        // Add tax breakdown
+        $formatted['tax_breakdown'] = BookingTaxService::getBookingTaxBreakdown((array) $formatted);
+        $formatted['tax_display'] = BookingTaxService::formatBookingTaxDisplay((array) $formatted);
+        
+        // Add itinerary costs
+        $formatted['itinerary_costs'] = $booking->itinerary_costs ? json_decode($booking->itinerary_costs, true) : [];
+        $formatted['itinerary_costs_total'] = (float) ($booking->itinerary_costs_total ?? 0);
+
+        // Add additional fields
+        $formatted['special_requests'] = $booking->special_requests;
+        $formatted['internal_notes'] = $booking->internal_notes;
+        $formatted['payment_transaction_id'] = $booking->payment_transaction_id;
+        $formatted['cancelled_at'] = $booking->cancelled_at;
+        $formatted['cancellation_reason'] = $booking->cancellation_reason;
+        $formatted['confirmed_at'] = $booking->confirmed_at;
+        $formatted['completed_at'] = $booking->completed_at;
+
+        /**
+         * Filter: Add additional services to booking details
+         * Allows premium modules to include services data in booking response
+         * 
+         * @param array $services Empty array by default
+         * @param int $booking_id The booking ID
+         * @since 3.0.0
+         */
+        $formatted['additional_services'] = apply_filters('yatra_booking_get_services', [], (int) $booking->id);
+
+        $formatted = apply_filters('yatra_booking_details', $formatted, (int) $booking->id);
+
+        return $formatted;
+    }
+
+    /**
+     * Save travelers for a booking
+     * 
+     * @param int   $bookingId Booking ID
+     * @param array $travelers Travelers data
+     */
+    private function saveTravelers(int $bookingId, array $travelers): void
+    {
+        // Re-index defensively so traveller_index / is_lead are positional and
+        // contiguous regardless of the incoming keys.
+        $index = 0;
+        foreach ($travelers as $travelerData) {
+            if (!is_array($travelerData)) {
+                continue;
+            }
+            $isLead = $index === 0;
+            // Accept both shapes: a nested { fields: {...} } (repository format)
+            // or a flat field map (admin BookingForm). Drop non-field meta keys.
+            $fields = isset($travelerData['fields']) && is_array($travelerData['fields'])
+                ? $travelerData['fields']
+                : $travelerData;
+            unset($fields['is_lead'], $fields['traveller_index'], $fields['id'], $fields['booking_id']);
+            // create() is the real repository method (createTraveller() never existed);
+            // it inserts the traveller row and writes every field to the meta table —
+            // the same method the checkout flow uses.
+            $this->travellerRepository->create($bookingId, $index, $isLead, $fields);
+            $index++;
+        }
+    }
+
+    /**
+     * Transactional "new booking" email (settings / Pro templates). Used by checkout when the session
+     * defers email until after payment redirect or sends the rich HTML confirmation at the end.
+     */
+    public function sendNewBookingTransactionalConfirmation(int $bookingId): void
+    {
+        $this->sendBookingConfirmationEmail($bookingId);
+    }
+
+    /**
+     * Send booking confirmation email
+     * 
+     * @param int $bookingId Booking ID
+     */
+    private function sendBookingConfirmationEmail(int $bookingId): void
+    {
+        $booking = $this->bookingRepository->findWithTrip($bookingId);
+
+        if (!$booking || empty($booking->contact_email)) {
+            return;
+        }
+
+        $vars = TransactionalEmailTemplateService::variablesFromBooking($booking);
+        $vars['intro_paragraph'] = __('Thank you for your booking! Here are your details:', 'yatra');
+        $vars['transactional_context'] = 'booking_created';
+
+        TransactionalEmailTemplateService::sendIfEnabled(
+            TransactionalEmailTemplateService::TYPE_BOOKING_CONFIRMATION,
+            $booking->contact_email,
+            $vars
+        );
+    }
+
+    /**
+     * Send the "your booking has been confirmed" transactional email.
+     *
+     * Shared by the manual / programmatic status-change path ({@see updateStatus()}
+     * → sendStatusChangeNotification()) and the asynchronous payment-completion
+     * paths (via {@see yatra_trigger_booking_confirmed()}), which set a booking to
+     * `confirmed` with a direct DB write and never pass through updateStatus().
+     * Gated by the template's enabled flag (`sendIfEnabled`).
+     *
+     * @param int $bookingId Booking ID.
+     */
+    public function sendBookingConfirmedEmail(int $bookingId): void
+    {
+        $booking = $this->bookingRepository->findWithTrip($bookingId);
+
+        if (!$booking || empty($booking->contact_email)) {
+            return;
+        }
+
+        $vars = TransactionalEmailTemplateService::variablesFromBooking($booking);
+        $vars['intro_paragraph'] = __('Your booking has been confirmed! Here are your details:', 'yatra');
+        $vars['transactional_context'] = 'status_confirmed';
+        TransactionalEmailTemplateService::sendIfEnabled(
+            TransactionalEmailTemplateService::TYPE_BOOKING_CONFIRMATION,
+            $booking->contact_email,
+            $vars
+        );
+    }
+
+    /**
+     * Send the customer their cancellation email, choosing the wording by who
+     * ended the booking.
+     *
+     * `cancelled_by` carries the operator's user id (BookingRepository::updateStatus
+     * writes get_current_user_id() whenever a booking moves to cancelled); the
+     * unpaid-booking expiry job runs with no logged-in user and leaves it at 0,
+     * which is the "not us" case. So a non-zero value means an operator did it.
+     *
+     * The operator-specific email is opt-in and falls back to the ordinary
+     * cancellation email whenever it is switched off or has nothing to send —
+     * so a site that has not asked for the distinction keeps behaving exactly as
+     * it did, and one that has can never end up sending nothing at all.
+     */
+    private function sendCustomerCancellationEmail(object $booking, string $customerEmail): void
+    {
+        $customerEmail = sanitize_email($customerEmail);
+        if ($customerEmail === '' || !is_email($customerEmail)) {
+            return;
+        }
+
+        $vars = TransactionalEmailTemplateService::variablesFromBooking($booking);
+        $vars['cancellation_reason'] = (string) ($booking->cancellation_reason ?? '');
+
+        if ((int) ($booking->cancelled_by ?? 0) > 0) {
+            $sent = TransactionalEmailTemplateService::sendIfEnabled(
+                TransactionalEmailTemplateService::TYPE_BOOKING_CANCELLATION_BY_OPERATOR,
+                $customerEmail,
+                $vars
+            );
+
+            if ($sent) {
+                return;
+            }
+        }
+
+        TransactionalEmailTemplateService::sendIfEnabled(
+            TransactionalEmailTemplateService::TYPE_BOOKING_CANCELLATION,
+            $customerEmail,
+            $vars
+        );
+    }
+
+    /**
+     * Send status change notification
+     *
+     * @param int    $bookingId Booking ID
+     * @param string $oldStatus Previous status
+     * @param string $newStatus New status
+     */
+    private function sendStatusChangeNotification(int $bookingId, string $oldStatus, string $newStatus): void
+    {
+        // Only send for certain status changes
+        $notifyStatuses = ['confirmed', 'cancelled', 'completed'];
+
+        if (!in_array($newStatus, $notifyStatuses, true)) {
+            return;
+        }
+
+        $booking = $this->bookingRepository->findWithTrip($bookingId);
+
+        if (!$booking || empty($booking->contact_email)) {
+            return;
+        }
+
+        if ($newStatus === 'cancelled') {
+            $this->sendCustomerCancellationEmail($booking, (string) $booking->contact_email);
+
+            return;
+        }
+
+        if ($newStatus === 'confirmed') {
+            $this->sendBookingConfirmedEmail($bookingId);
+
+            return;
+        }
+
+        if ($newStatus === 'completed') {
+            $handled = apply_filters('yatra_send_booking_status_email_html', null, $bookingId, $oldStatus, $newStatus, $booking);
+            if ($handled !== null) {
+                ReviewReminderService::scheduleReminder($bookingId);
+
+                return;
+            }
+
+            $vars = TransactionalEmailTemplateService::variablesFromBooking($booking);
+            $vars['completion_date'] = date_i18n(get_option('date_format'));
+            TransactionalEmailTemplateService::sendIfEnabled(
+                TransactionalEmailTemplateService::TYPE_BOOKING_COMPLETED,
+                $booking->contact_email,
+                $vars
+            );
+
+            ReviewReminderService::scheduleReminder($bookingId);
+
+            return;
+        }
+    }
+
+    /**
+     * Get all travelers with pagination
+     * 
+     * @param array $filters Filters
+     * @return array
+     */
+    public function getTravelers(array $filters = []): array
+    {
+        return $this->travellerRepository->paginate($filters);
+    }
+
+    /**
+     * Perform bulk actions on travelers
+     *
+     * Currently supports only delete.
+     *
+     * @param int[]  $ids    Traveler IDs
+     * @param string $action Action key (e.g. 'delete')
+     * @return array {success: bool, message: string}
+     */
+    public function bulkTravelers(array $ids, string $action): array
+    {
+        $action = trim($action);
+
+        if ($action !== 'delete') {
+            return [
+                'success' => false,
+                'message' => __('Invalid traveler bulk action.', 'yatra'),
+            ];
+        }
+
+        return $this->travellerRepository->bulkDelete($ids);
+    }
+
+    /**
+     * Send booking email
+     * 
+     * @param int    $bookingId Booking ID
+     * @param string $emailType Email type (confirmation, reminder, etc.)
+     * @return array {success: bool, message: string}
+     */
+    public function sendEmail(int $bookingId, string $emailType = 'confirmation'): array
+    {
+        $booking = $this->bookingRepository->findWithTrip($bookingId);
+
+        if (!$booking) {
+            return ['success' => false, 'message' => __('Booking not found.', 'yatra')];
+        }
+
+        // Customer-facing emails need a recipient; admin notifications go to the
+        // store admin address, so they don't require the booking's contact email.
+        $customerEmail = (string) ($booking->contact_email ?? '');
+        $customerTypes = ['confirmation', 'reminder', 'cancellation', 'completed', 'payment_confirmation'];
+        if (in_array($emailType, $customerTypes, true) && $customerEmail === '') {
+            return ['success' => false, 'message' => __('No customer email address on this booking.', 'yatra')];
+        }
+
+        switch ($emailType) {
+            case 'confirmation':
+                // Resend the email that matches the booking's CURRENT state so it
+                // is identical to the automated one. A confirmed booking (or a
+                // completed one — it was confirmed before it travelled) gets the
+                // "booking confirmed" email (status_confirmed context → the
+                // `booking_confirmed` / booking.confirmed template); anything
+                // still pending gets the initial "booking received" email
+                // (booking_created context → the `booking_confirmation` template).
+                if (in_array((string) ($booking->status ?? ''), ['confirmed', 'completed'], true)) {
+                    $this->sendBookingConfirmedEmail($bookingId);
+                } else {
+                    $this->sendBookingConfirmationEmail($bookingId);
+                }
+                break;
+
+            case 'reminder':
+                if (!$this->sendBookingReminderEmail($booking)) {
+                    return [
+                        'success' => false,
+                        'message' => __('The trip reminder was not sent. Check that the Trip reminder email is switched on in the email settings.', 'yatra'),
+                    ];
+                }
+                break;
+
+            case 'cancellation':
+                // Mirrors sendStatusChangeNotification() so the resent email is
+                // identical to the automated cancellation email — including the
+                // choice between the ordinary wording and the "cancelled by us"
+                // wording, which depends on who cancelled the booking.
+                $this->sendCustomerCancellationEmail($booking, (string) $customerEmail);
+                break;
+
+            case 'completed':
+                $vars = TransactionalEmailTemplateService::variablesFromBooking($booking);
+                $vars['completion_date'] = date_i18n(get_option('date_format'));
+                TransactionalEmailTemplateService::sendIfEnabled(
+                    TransactionalEmailTemplateService::TYPE_BOOKING_COMPLETED,
+                    $customerEmail,
+                    $vars
+                );
+                break;
+
+            case 'payment_confirmation':
+                $paymentData = $this->buildPaymentDataForResend($booking);
+                if ($paymentData === null) {
+                    return ['success' => false, 'message' => __('No recorded payment to resend for this booking.', 'yatra')];
+                }
+                \Yatra\Services\NotificationService::resendCustomerPaymentEmail($paymentData);
+                break;
+
+            case 'admin_new_booking':
+                \Yatra\Services\NotificationService::sendBookingCreatedNotification($bookingId, (array) $booking);
+                break;
+
+            case 'admin_payment_received':
+                $paymentData = $this->buildPaymentDataForResend($booking);
+                if ($paymentData === null) {
+                    return ['success' => false, 'message' => __('No recorded payment to resend for this booking.', 'yatra')];
+                }
+                \Yatra\Services\NotificationService::resendAdminPaymentEmail($paymentData);
+                break;
+
+            default:
+                return ['success' => false, 'message' => __('Unknown email type.', 'yatra')];
+        }
+
+        return [
+            'success' => true,
+            'message' => __('Email sent successfully.', 'yatra'),
+        ];
+    }
+
+    /**
+     * Reconstruct the payment-notification payload for a resend from the latest
+     * payment on the booking (falling back to the booking's own amount_paid /
+     * gateway when no ledger row exists). Returns null when nothing has been
+     * paid, so there is no payment to acknowledge.
+     */
+    private function buildPaymentDataForResend(object $booking): ?array
+    {
+        $bookingId = (int) ($booking->id ?? 0);
+        $payment = $this->paymentRepository->findLatestByBookingId($bookingId);
+
+        $amount = (float) ($payment->amount ?? $booking->amount_paid ?? 0);
+        if ($amount <= 0) {
+            return null;
+        }
+
+        return [
+            'booking_id' => $bookingId,
+            'amount' => $amount,
+            'payment_method' => (string) ($payment->gateway ?? $booking->payment_gateway ?? ''),
+            'transaction_id' => (string) ($payment->transaction_id ?? ''),
+        ];
+    }
+
+    /**
+     * Send booking reminder email
+     *
+     * Same email as the daily reminder sweep (including the outstanding-balance
+     * block), so a manual resend matches the automatic one.
+     *
+     * @param object $booking Booking data
+     * @return bool Whether the email was sent
+     */
+    private function sendBookingReminderEmail(object $booking): bool
+    {
+        $sent = BookingCronService::sendReminderEmail($booking);
+
+        if ($sent) {
+            $this->bookingRepository->update((int) $booking->id, [
+                'reminder_sent' => 1,
+                'reminder_sent_at' => current_time('mysql'),
+            ]);
+        }
+
+        return $sent;
+    }
+}
+

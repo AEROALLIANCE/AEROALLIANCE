@@ -1,0 +1,1321 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Services;
+
+/**
+ * Central transactional emails (booking, payment, cancellation, reminder).
+ * Content is editable under Email → Templates (settings-backed) or overridden by Pro Email Automation DB templates via filter.
+ */
+class TransactionalEmailTemplateService
+{
+    public const TYPE_BOOKING_CONFIRMATION = 'booking_confirmation';
+
+    public const TYPE_PAYMENT_CONFIRMATION = 'payment_confirmation';
+
+    /**
+     * Partial payment received (deposit / instalment), where a balance remains.
+     *
+     * Opt-in: until an operator enables it, every payment keeps using
+     * TYPE_PAYMENT_CONFIRMATION exactly as before, so existing sites see no
+     * change. Only relevant when partial payments or deposits are switched on.
+     */
+    public const TYPE_PARTIAL_PAYMENT_RECEIVED = 'partial_payment_received';
+
+    public const TYPE_BOOKING_CANCELLATION = 'booking_cancellation';
+
+    /**
+     * Customer-facing cancellation wording for a booking the OPERATOR cancelled,
+     * as opposed to one cancelled by the customer or by the unpaid-booking
+     * expiry job.
+     *
+     * Yatra has only ever had one customer cancellation email, so the same
+     * wording went out whoever ended the booking — an operator cancelling a trip
+     * still told the customer their own cancellation had been received.
+     * `bookings.cancelled_by` has always recorded who did it; this is what finally
+     * uses it.
+     *
+     * Opt-in, exactly like TYPE_PARTIAL_PAYMENT_RECEIVED: until an operator
+     * switches it on, every cancellation keeps using TYPE_BOOKING_CANCELLATION
+     * as before, so no existing site starts sending wording nobody has reviewed.
+     * When it is switched on but has nothing to send, the send falls back to the
+     * ordinary cancellation email rather than going silent.
+     */
+    public const TYPE_BOOKING_CANCELLATION_BY_OPERATOR = 'booking_cancellation_by_operator';
+
+    public const TYPE_BOOKING_REMINDER = 'booking_reminder';
+
+    public const TYPE_ADMIN_NEW_BOOKING = 'admin_new_booking';
+
+    public const TYPE_ADMIN_PAYMENT_RECEIVED = 'admin_payment_received';
+
+    public const TYPE_ADMIN_BOOKING_CANCELLED = 'admin_booking_cancelled_notice';
+
+    /** Trip consent request (Yatra Pro Trip Consent module). */
+    public const TYPE_TRIP_CONSENT_REQUEST = 'trip_consent_request';
+
+    /** Customer account email verification (e.g. checkout registration). */
+    public const TYPE_CUSTOMER_EMAIL_VERIFICATION = 'customer_email_verification';
+
+    /**
+     * Guest-checkout email verification — sent BEFORE payment when
+     * `require_guest_email_verification` is on. The booking is held
+     * in `pending_verification` status until the customer clicks the
+     * magic link. Distinct from `customer_email_verification` because
+     * (a) the recipient is not a registered user, and (b) the link
+     * resumes the in-flight booking flow rather than completing
+     * account registration.
+     */
+    public const TYPE_GUEST_EMAIL_VERIFICATION = 'guest_email_verification';
+
+    /** Confirmation link sent to the NEW address when a customer changes their account email. */
+    public const TYPE_ACCOUNT_EMAIL_CHANGE_REQUEST = 'account_email_change_request';
+
+    /** Security notice sent to the OLD address once an account email change is confirmed. */
+    public const TYPE_ACCOUNT_EMAIL_CHANGED = 'account_email_changed';
+
+    public const TYPE_BOOKING_COMPLETED = 'booking_completed';
+
+    public const TYPE_BOOKING_EXPIRED_CUSTOMER = 'booking_expired_customer';
+
+    public const TYPE_ADMIN_BOOKING_EXPIRED = 'admin_booking_expired';
+
+    public const TYPE_SCHEDULED_PAYMENT_REMINDER = 'scheduled_payment_reminder';
+
+    public const TYPE_SCHEDULED_PAYMENT_SUCCEEDED = 'scheduled_payment_succeeded';
+
+    public const TYPE_SCHEDULED_PAYMENT_FAILED = 'scheduled_payment_failed';
+
+    public const TYPE_ADMIN_SCHEDULED_PAYMENT_FAILED = 'admin_scheduled_payment_failed';
+
+    public const TYPE_ENQUIRY_ADMIN = 'enquiry_admin';
+
+    public const TYPE_ENQUIRY_CUSTOMER_RECEIVED = 'enquiry_received';
+
+    public const TYPE_ENQUIRY_CUSTOMER_RESPONSE = 'enquiry_response';
+
+    public const TYPE_REVIEW_REQUEST = 'review_request';
+
+    /** Abandoned checkout recovery (Yatra Pro); 3-stage sequence. */
+    public const TYPE_ABANDONED_BOOKING_RECOVERY_FIRST = 'abandoned_booking_recovery_first';
+    public const TYPE_ABANDONED_BOOKING_RECOVERY_SECOND = 'abandoned_booking_recovery_second';
+    public const TYPE_ABANDONED_BOOKING_RECOVERY_FINAL = 'abandoned_booking_recovery_final';
+
+    /**
+     * Map catalog / settings UI keys to internal render types.
+     */
+    public static function coreTemplateKeyToType(string $templateKey): ?string
+    {
+        $map = [
+            'booking_confirmation' => self::TYPE_BOOKING_CONFIRMATION,
+            'payment_received' => self::TYPE_PAYMENT_CONFIRMATION,
+            'partial_payment_received' => self::TYPE_PARTIAL_PAYMENT_RECEIVED,
+            'booking_cancelled' => self::TYPE_BOOKING_CANCELLATION,
+            'booking_cancelled_by_operator' => self::TYPE_BOOKING_CANCELLATION_BY_OPERATOR,
+            'trip_reminder' => self::TYPE_BOOKING_REMINDER,
+            'admin_new_booking' => self::TYPE_ADMIN_NEW_BOOKING,
+            'admin_payment_received' => self::TYPE_ADMIN_PAYMENT_RECEIVED,
+            'admin_booking_cancelled' => self::TYPE_ADMIN_BOOKING_CANCELLED,
+            'trip_consent_request' => self::TYPE_TRIP_CONSENT_REQUEST,
+            'customer_email_verification' => self::TYPE_CUSTOMER_EMAIL_VERIFICATION,
+            'guest_email_verification' => self::TYPE_GUEST_EMAIL_VERIFICATION,
+            'account_email_change_request' => self::TYPE_ACCOUNT_EMAIL_CHANGE_REQUEST,
+            'account_email_changed' => self::TYPE_ACCOUNT_EMAIL_CHANGED,
+            'booking_completed' => self::TYPE_BOOKING_COMPLETED,
+            'booking_expired_customer' => self::TYPE_BOOKING_EXPIRED_CUSTOMER,
+            'admin_booking_expired' => self::TYPE_ADMIN_BOOKING_EXPIRED,
+            'scheduled_payment_reminder' => self::TYPE_SCHEDULED_PAYMENT_REMINDER,
+            'scheduled_payment_succeeded' => self::TYPE_SCHEDULED_PAYMENT_SUCCEEDED,
+            'scheduled_payment_failed' => self::TYPE_SCHEDULED_PAYMENT_FAILED,
+            'admin_scheduled_payment_failed' => self::TYPE_ADMIN_SCHEDULED_PAYMENT_FAILED,
+            'enquiry_admin' => self::TYPE_ENQUIRY_ADMIN,
+            'enquiry_received' => self::TYPE_ENQUIRY_CUSTOMER_RECEIVED,
+            'enquiry_response' => self::TYPE_ENQUIRY_CUSTOMER_RESPONSE,
+            'review_request' => self::TYPE_REVIEW_REQUEST,
+            'abandoned_booking_recovery_first' => self::TYPE_ABANDONED_BOOKING_RECOVERY_FIRST,
+            'abandoned_booking_recovery_second' => self::TYPE_ABANDONED_BOOKING_RECOVERY_SECOND,
+            'abandoned_booking_recovery_final' => self::TYPE_ABANDONED_BOOKING_RECOVERY_FINAL,
+        ];
+
+        return $map[$templateKey] ?? null;
+    }
+
+    /**
+     * Sample merge-tag values for admin preview (core templates).
+     *
+     * @return array<string, string>
+     */
+    public static function sampleVariablesForCoreTemplateKey(string $templateKey): array
+    {
+        return EmailTemplateSampleData::forTemplateKey($templateKey);
+    }
+
+    /**
+     * @param array<string, string|int|float> $variables
+     * @return array<string, string>
+     */
+    public static function mergeTemplateVariables(array $variables): array
+    {
+        return self::mergeDefaultVariables($variables);
+    }
+
+    /**
+     * Replace {{word}} placeholders (used by previews and extensions).
+     *
+     * @param array<string, string|int|float> $variables
+     */
+    public static function parseMergeTags(string $template, array $variables): string
+    {
+        $variables = self::mergeDefaultVariables($variables);
+
+        return self::parseTemplate($template, $variables);
+    }
+
+    /**
+     * Render using explicit subject/body templates (e.g. unsaved editor content). Empty strings use built-in defaults.
+     *
+     * @param array<string, string|int|float> $variables
+     * @return array{subject: string, body: string}
+     */
+    public static function renderWithStringTemplates(string $type, string $subjectTpl, string $bodyTpl, array $variables): array
+    {
+        $variables = self::mergeDefaultVariables($variables);
+        $variables = self::normalizeVariablesForType($type, $variables);
+        $map = self::typeToSettingsKeys();
+        if (!isset($map[$type])) {
+            return ['subject' => '', 'body' => ''];
+        }
+
+        if ($subjectTpl === '') {
+            // No operator-configured subject → use the built-in default, unless
+            // a caller supplied a context-specific override (e.g. guest checkout
+            // substitutes its booking-oriented subject for the account default).
+            // This is a FALLBACK only: when the operator HAS configured a subject
+            // (the `else` branch) it always wins — otherwise `_subject_override`
+            // would clobber a configured subject with the generic default.
+            $subject = self::defaultSubject($type, $variables);
+            if (isset($variables['_subject_override'])
+                && is_string($variables['_subject_override'])
+                && $variables['_subject_override'] !== ''
+            ) {
+                $subject = $variables['_subject_override'];
+            }
+        } else {
+            $subject = self::parseTemplate($subjectTpl, $variables);
+        }
+
+        if ($bodyTpl === '') {
+            $body = self::defaultBody($type, $variables);
+        } else {
+            $body = self::parseTemplate($bodyTpl, $variables);
+        }
+
+        return [
+            'subject' => $subject,
+            // Drop any detail row whose merge tag resolved to nothing — most
+            // visibly a Transaction ID on a manually recorded payment, which
+            // otherwise arrives as a labelled blank.
+            'body' => EmailTemplateLayout::dropUnfilledRows($body),
+        ];
+    }
+
+    /**
+     * Does the installed Yatra Pro keep its per-template Active switch and this
+     * plugin's per-type setting in step?
+     *
+     * Pro answers true from the build that added TemplateActiveSync. Anything
+     * older — or no Pro at all — answers false, and false only matters when the
+     * setting is off and Pro still holds an active template for the type.
+     */
+    private static function proSyncsTemplateFlags(): bool
+    {
+        return (bool) apply_filters('yatra_pro_email_syncs_template_flags', false);
+    }
+
+    /**
+     * The settings key that switches a transactional type on or off.
+     *
+     * Public so Yatra Pro can keep its own per-template Active switch and this
+     * one in step — they gate the same email, and when they disagreed the one
+     * the operator could see was not the one the send path obeyed.
+     *
+     * @return string Empty when the type is unknown.
+     */
+    public static function settingsFlagFor(string $type): string
+    {
+        $map = self::typeToSettingsKeys();
+
+        return (string) ($map[$type]['flag'] ?? '');
+    }
+
+    /**
+     * Every transactional type this build knows, as type => settings flag.
+     *
+     * @return array<string, string>
+     */
+    public static function settingsFlagMap(): array
+    {
+        $flags = [];
+        foreach (self::typeToSettingsKeys() as $type => $keys) {
+            if (!empty($keys['flag']) && is_string($keys['flag'])) {
+                $flags[$type] = $keys['flag'];
+            }
+        }
+
+        return $flags;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private static function typeToSettingsKeys(): array
+    {
+        $defaults = [
+            self::TYPE_BOOKING_CONFIRMATION => [
+                'flag' => 'email_template_booking',
+                'subject' => 'email_tpl_booking_subject',
+                'body' => 'email_tpl_booking_body',
+            ],
+            self::TYPE_PAYMENT_CONFIRMATION => [
+                'flag' => 'email_template_confirmation',
+                'subject' => 'email_tpl_payment_subject',
+                'body' => 'email_tpl_payment_body',
+            ],
+            self::TYPE_PARTIAL_PAYMENT_RECEIVED => [
+                'flag' => 'email_template_partial_payment',
+                'subject' => 'email_tpl_partial_payment_subject',
+                'body' => 'email_tpl_partial_payment_body',
+            ],
+            self::TYPE_BOOKING_CANCELLATION => [
+                'flag' => 'email_template_cancellation',
+                'subject' => 'email_tpl_cancellation_subject',
+                'body' => 'email_tpl_cancellation_body',
+            ],
+            self::TYPE_BOOKING_CANCELLATION_BY_OPERATOR => [
+                'flag' => 'email_template_cancellation_by_operator',
+                'subject' => 'email_tpl_cancellation_by_operator_subject',
+                'body' => 'email_tpl_cancellation_by_operator_body',
+            ],
+            self::TYPE_BOOKING_REMINDER => [
+                'flag' => 'email_template_reminder',
+                'subject' => 'email_tpl_reminder_subject',
+                'body' => 'email_tpl_reminder_body',
+            ],
+            self::TYPE_ADMIN_NEW_BOOKING => [
+                'flag' => 'email_template_admin_new_booking',
+                'subject' => 'email_tpl_admin_booking_subject',
+                'body' => 'email_tpl_admin_booking_body',
+            ],
+            self::TYPE_ADMIN_PAYMENT_RECEIVED => [
+                'flag' => 'email_template_admin_payment',
+                'subject' => 'email_tpl_admin_payment_subject',
+                'body' => 'email_tpl_admin_payment_body',
+            ],
+            self::TYPE_ADMIN_BOOKING_CANCELLED => [
+                'flag' => 'email_template_admin_cancellation',
+                'subject' => 'email_tpl_admin_cancellation_subject',
+                'body' => 'email_tpl_admin_cancellation_body',
+            ],
+            self::TYPE_TRIP_CONSENT_REQUEST => [
+                'flag' => 'email_template_trip_consent',
+                'subject' => 'email_tpl_trip_consent_subject',
+                'body' => 'email_tpl_trip_consent_body',
+            ],
+            self::TYPE_CUSTOMER_EMAIL_VERIFICATION => [
+                'flag' => 'email_template_customer_verification',
+                'subject' => 'email_tpl_customer_verification_subject',
+                'body' => 'email_tpl_customer_verification_body',
+            ],
+            self::TYPE_GUEST_EMAIL_VERIFICATION => [
+                'flag' => 'email_template_guest_verification',
+                'subject' => 'email_tpl_guest_verification_subject',
+                'body' => 'email_tpl_guest_verification_body',
+            ],
+            self::TYPE_ACCOUNT_EMAIL_CHANGE_REQUEST => [
+                'flag' => 'email_template_account_email_change',
+                'subject' => 'email_tpl_account_email_change_subject',
+                'body' => 'email_tpl_account_email_change_body',
+            ],
+            self::TYPE_ACCOUNT_EMAIL_CHANGED => [
+                'flag' => 'email_template_account_email_changed',
+                'subject' => 'email_tpl_account_email_changed_subject',
+                'body' => 'email_tpl_account_email_changed_body',
+            ],
+            self::TYPE_BOOKING_COMPLETED => [
+                'flag' => 'email_template_booking_completed',
+                'subject' => 'email_tpl_booking_completed_subject',
+                'body' => 'email_tpl_booking_completed_body',
+            ],
+            self::TYPE_BOOKING_EXPIRED_CUSTOMER => [
+                'flag' => 'email_template_booking_expired_customer',
+                'subject' => 'email_tpl_booking_expired_customer_subject',
+                'body' => 'email_tpl_booking_expired_customer_body',
+            ],
+            self::TYPE_ADMIN_BOOKING_EXPIRED => [
+                'flag' => 'email_template_admin_booking_expired',
+                'subject' => 'email_tpl_admin_booking_expired_subject',
+                'body' => 'email_tpl_admin_booking_expired_body',
+            ],
+            self::TYPE_SCHEDULED_PAYMENT_REMINDER => [
+                'flag' => 'email_template_scheduled_payment_reminder',
+                'subject' => 'email_tpl_scheduled_payment_reminder_subject',
+                'body' => 'email_tpl_scheduled_payment_reminder_body',
+            ],
+            self::TYPE_SCHEDULED_PAYMENT_SUCCEEDED => [
+                'flag' => 'email_template_scheduled_payment_succeeded',
+                'subject' => 'email_tpl_scheduled_payment_succeeded_subject',
+                'body' => 'email_tpl_scheduled_payment_succeeded_body',
+            ],
+            self::TYPE_SCHEDULED_PAYMENT_FAILED => [
+                'flag' => 'email_template_scheduled_payment_failed',
+                'subject' => 'email_tpl_scheduled_payment_failed_subject',
+                'body' => 'email_tpl_scheduled_payment_failed_body',
+            ],
+            self::TYPE_ADMIN_SCHEDULED_PAYMENT_FAILED => [
+                'flag' => 'email_template_admin_scheduled_payment_failed',
+                'subject' => 'email_tpl_admin_scheduled_payment_failed_subject',
+                'body' => 'email_tpl_admin_scheduled_payment_failed_body',
+            ],
+            self::TYPE_ENQUIRY_ADMIN => [
+                'flag' => 'email_template_enquiry_admin',
+                'subject' => 'email_tpl_enquiry_admin_subject',
+                'body' => 'email_tpl_enquiry_admin_body',
+            ],
+            self::TYPE_ENQUIRY_CUSTOMER_RECEIVED => [
+                'flag' => 'email_template_enquiry_received',
+                'subject' => 'email_tpl_enquiry_received_subject',
+                'body' => 'email_tpl_enquiry_received_body',
+            ],
+            self::TYPE_ENQUIRY_CUSTOMER_RESPONSE => [
+                'flag' => 'email_template_enquiry_response',
+                'subject' => 'email_tpl_enquiry_response_subject',
+                'body' => 'email_tpl_enquiry_response_body',
+            ],
+            self::TYPE_REVIEW_REQUEST => [
+                'flag' => 'email_template_review_request',
+                'subject' => 'email_tpl_review_request_subject',
+                'body' => 'email_tpl_review_request_body',
+            ],
+            self::TYPE_ABANDONED_BOOKING_RECOVERY_FIRST => [
+                'flag' => 'email_template_abandoned_booking_recovery_first',
+                'subject' => 'email_tpl_abandoned_booking_recovery_first_subject',
+                'body' => 'email_tpl_abandoned_booking_recovery_first_body',
+            ],
+            self::TYPE_ABANDONED_BOOKING_RECOVERY_SECOND => [
+                'flag' => 'email_template_abandoned_booking_recovery_second',
+                'subject' => 'email_tpl_abandoned_booking_recovery_second_subject',
+                'body' => 'email_tpl_abandoned_booking_recovery_second_body',
+            ],
+            self::TYPE_ABANDONED_BOOKING_RECOVERY_FINAL => [
+                'flag' => 'email_template_abandoned_booking_recovery_final',
+                'subject' => 'email_tpl_abandoned_booking_recovery_final_subject',
+                'body' => 'email_tpl_abandoned_booking_recovery_final_body',
+            ],
+        ];
+
+        /**
+         * Allow Pro modules (Team & Access, etc.) to register additional
+         * transactional template types — each entry must be an array with
+         * `flag`, `subject`, `body` keys matching the option-name pattern
+         * used above. Once registered, the type participates in:
+         *   - sendIfEnabled() (flag gate + send)
+         *   - render() / renderWithStringTemplates() (templated subject/body)
+         *   - the Email → Templates UI (auto-discovered via the same map)
+         *
+         * Modules also need to hook `yatra_transactional_email_default_subject`
+         * and `..._default_body` to supply baseline copy for their type.
+         *
+         * @param array<string, array{flag:string,subject:string,body:string}> $defaults
+         */
+        // Per-template BCC / CC keys are DERIVED from each type's subject key
+        // (email_tpl_booking_subject -> email_tpl_booking_bcc / _cc) rather than
+        // written out 26 times. A hand-maintained parallel list is exactly how
+        // `admin_payment_received` ended up missing from the Pro override map, so
+        // a new template type now gets its BCC/CC keys automatically — including
+        // types added by modules through the filter below.
+        foreach ($defaults as $type => $keys) {
+            if (empty($keys['subject']) || !is_string($keys['subject'])) {
+                continue;
+            }
+
+            $base = preg_replace('/_subject$/', '', $keys['subject']);
+
+            if (!isset($defaults[$type]['bcc'])) {
+                $defaults[$type]['bcc'] = $base . '_bcc';
+            }
+            if (!isset($defaults[$type]['cc'])) {
+                $defaults[$type]['cc'] = $base . '_cc';
+            }
+        }
+
+        return (array) apply_filters('yatra_transactional_email_type_to_keys', $defaults);
+    }
+
+    /**
+     * Build Cc/Bcc headers for a transactional type from its own settings.
+     *
+     * Both are opt-in: an empty setting adds no header, so nothing changes for
+     * an operator who never fills them in. Multiple comma-separated addresses are
+     * supported, and anything that is not a valid address is dropped rather than
+     * handed to the mailer.
+     *
+     * @return string[]
+     */
+    /**
+     * The transactional type currently being dispatched, if any.
+     *
+     * Pro can take over a send through `yatra_send_transactional_email` and mails
+     * it through its own service, which means header building here would be
+     * skipped entirely. Both paths funnel through EmailService::send, so the type
+     * is recorded for the duration of the dispatch and the Cc/Bcc for that
+     * template is applied there — one injection point that works whether core or
+     * Pro actually sends.
+     *
+     * @var string
+     */
+    private static $dispatchingType = '';
+
+    /**
+     * Cc/Bcc headers for the send currently in flight, for EmailService.
+     *
+     * @return string[]
+     */
+    public static function headersForCurrentDispatch(): array
+    {
+        if (self::$dispatchingType === '') {
+            return [];
+        }
+
+        return self::recipientHeadersForType(self::$dispatchingType);
+    }
+
+    private static function recipientHeadersForType(string $type): array
+    {
+        $map = self::typeToSettingsKeys();
+
+        if (!isset($map[$type])) {
+            return [];
+        }
+
+        $headers = [];
+
+        foreach (['Cc' => $map[$type]['cc'] ?? '', 'Bcc' => $map[$type]['bcc'] ?? ''] as $label => $settingKey) {
+            if ($settingKey === '') {
+                continue;
+            }
+
+            $addresses = self::sanitizeAddressList((string) SettingsService::get($settingKey, ''));
+
+            if ($addresses !== []) {
+                $headers[] = $label . ': ' . implode(', ', $addresses);
+            }
+        }
+
+        return $headers;
+    }
+
+    /**
+     * Split a comma/semicolon separated address list into valid addresses.
+     *
+     * @return string[]
+     */
+    public static function sanitizeAddressList(string $raw): array
+    {
+        $raw = trim($raw);
+
+        if ($raw === '') {
+            return [];
+        }
+
+        $addresses = [];
+
+        foreach (preg_split('/[,;]+/', $raw) as $candidate) {
+            $candidate = sanitize_email(trim((string) $candidate));
+
+            if ($candidate !== '' && is_email($candidate)) {
+                $addresses[strtolower($candidate)] = $candidate;
+            }
+        }
+
+        return array_values($addresses);
+    }
+
+    /**
+     * Send if the type is enabled in settings. Pro may handle via {@see 'yatra_send_transactional_email'}.
+     *
+     * Optional string `transactional_context` (e.g. `booking_created`, `status_confirmed`) is passed through
+     * to the filter so Pro can choose a different template row for the same TYPE_BOOKING_CONFIRMATION.
+     *
+     * @param array<string, string|int|float> $variables Merge tags: {{key}}
+     */
+    public static function sendIfEnabled(string $type, string $to, array $variables = []): bool
+    {
+        $to = sanitize_email($to);
+        if ($to === '' || !is_email($to)) {
+            return false;
+        }
+
+        $map = self::typeToSettingsKeys();
+        if (!isset($map[$type])) {
+            return false;
+        }
+
+        $flag = $map[$type]['flag'];
+
+        // The switch is honoured. It used to be skipped whenever Yatra Pro held
+        // an active template for the type, which meant an operator could turn an
+        // email off in Emails -> Templates and have it keep going out — the
+        // setting described one thing and the send path did another, for 26 of
+        // the 27 types Pro covers. Pro still decides WHICH wording is used, and
+        // suppresses the send when its own template is switched off; what it no
+        // longer does is override "off".
+        if (!SettingsService::isEnabled($flag)) {
+            // ...with one exception, for the window where this plugin has been
+            // updated and Yatra Pro has not. Free updates itself from
+            // WordPress.org; Pro is installed by hand, so the two are regularly
+            // out of step for days. A Pro build without the matching change
+            // cannot keep this setting in step with its own per-template switch,
+            // and on those sites the setting was never the one the operator was
+            // shown — it is very often still at its default. Enforcing it
+            // against an older Pro would therefore switch off emails nobody
+            // asked to switch off; review requests and partial payment receipts
+            // default to off and would stop without warning. So while Pro says
+            // it cannot sync, the old behaviour stands and Pro's own template
+            // decides. Updating Pro closes the gap.
+            if (!self::proSyncsTemplateFlags()) {
+                $legacyProOwns = (bool) apply_filters(
+                    'yatra_pro_email_automation_owns_transactional_type',
+                    false,
+                    $type
+                );
+
+                if (!$legacyProOwns) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        $variables = self::mergeDefaultVariables($variables);
+        $variables = self::normalizeVariablesForType($type, $variables);
+
+        /**
+         * Allow Yatra Pro (or extensions) to send instead of core templates.
+         * Return null to use core; true/false if handled.
+         */
+        // Mark the type for the whole dispatch — including a Pro takeover — so
+        // EmailService can apply this template's own Cc/Bcc whichever service
+        // ends up doing the sending.
+        $previousType = self::$dispatchingType;
+        self::$dispatchingType = $type;
+
+        try {
+            $handled = apply_filters('yatra_send_transactional_email', null, $type, $to, $variables);
+            if ($handled !== null) {
+                return (bool) $handled;
+            }
+
+            // No second look at the setting here. It is decided once, above,
+            // where the older-Pro exception is also applied — repeating the
+            // bare check at this point silently overrode that exception and
+            // stopped the very emails it exists to keep sending.
+            $rendered = self::render($type, $variables);
+
+            $sent = EmailService::send(
+                $to,
+                $rendered['subject'],
+                $rendered['body'],
+                ['Content-Type: text/html; charset=UTF-8']
+            );
+
+            /**
+             * A transactional email core just sent.
+             *
+             * Yatra Pro writes the Email Logs, but only from its own modules —
+             * nothing records what core sends, so a booking confirmation or a
+             * review request left no trace and an operator looking for "which
+             * email went to this customer" found a log that quietly covered
+             * only part of the picture. Pro listens for this and logs it.
+             *
+             * @param string               $type      Template type, e.g. review_request.
+             * @param string               $to        Recipient address.
+             * @param string               $subject   Rendered subject.
+             * @param string               $body      Rendered body.
+             * @param bool                 $sent      Whether wp_mail() accepted it.
+             * @param array<string, mixed> $variables Merge variables used to render.
+             */
+            do_action('yatra_transactional_email_sent', $type, $to, $rendered['subject'], $rendered['body'], $sent, $variables);
+
+            return $sent;
+        } finally {
+            self::$dispatchingType = $previousType;
+        }
+    }
+
+    /**
+     * @param array<string, string|int|float> $variables
+     * @return array{subject: string, body: string}
+     */
+    public static function render(string $type, array $variables): array
+    {
+        $map = self::typeToSettingsKeys();
+        if (!isset($map[$type])) {
+            return ['subject' => '', 'body' => ''];
+        }
+
+        $subjectKey = $map[$type]['subject'];
+        $bodyKey = $map[$type]['body'];
+
+        $subjectTpl = SettingsService::getString($subjectKey, '');
+        $bodyTpl = SettingsService::getString($bodyKey, '');
+
+        return self::renderWithStringTemplates($type, $subjectTpl, $bodyTpl, $variables);
+    }
+
+    /**
+     * Would the template that actually gets sent for $type render the
+     * verification link ({{verification_link}})? Guest checkout can't complete
+     * without it, so the checkout controller uses this to decide whether an
+     * operator's customised verification template is safe to use, or whether to
+     * fall back to the built-in default. Respects Pro ownership: a Pro DB
+     * template reports its raw body via `yatra_transactional_email_effective_body`;
+     * otherwise the core option body is checked, and an empty option means the
+     * built-in default (which always includes the link) is used.
+     */
+    public static function templateRendersVerificationLink(string $type): bool
+    {
+        $effective = apply_filters('yatra_transactional_email_effective_body', null, $type);
+        if (is_string($effective) && $effective !== '') {
+            return strpos($effective, 'verification_link') !== false;
+        }
+
+        $map = self::typeToSettingsKeys();
+        if (!isset($map[$type])) {
+            return false;
+        }
+
+        $body = SettingsService::getString($map[$type]['body'], '');
+        if (trim($body) === '') {
+            return true; // no custom body → built-in default is used, which always carries the link
+        }
+
+        return strpos($body, 'verification_link') !== false;
+    }
+
+    /**
+     * @param array<string, string|int|float> $variables
+     * @return array<string, string>
+     */
+    private static function mergeDefaultVariables(array $variables): array
+    {
+        $defaults = [
+            'site_name' => get_bloginfo('name'),
+            'site_url' => home_url('/'),
+            'admin_email' => SettingsService::getString('admin_email', get_option('admin_email')),
+        ];
+
+        $out = [];
+        foreach (array_merge($defaults, $variables) as $k => $v) {
+            $out[(string) $k] = is_scalar($v) ? (string) $v : '';
+        }
+
+        return $out;
+    }
+
+    /**
+     * Ensure templates always have safe, meaningful defaults for commonly-used tags.
+     *
+     * This prevents "blank sections" when a caller supplies only the core booking variables
+     * (e.g. status-change emails) while the template contains richer optional sections.
+     *
+     * @param array<string, string> $variables
+     * @return array<string, string>
+     */
+    private static function normalizeVariablesForType(string $type, array $variables): array
+    {
+        // Booking confirmation is sent from multiple contexts (checkout + admin status changes).
+        // If the caller didn't include the rich "intro/details/footer" blocks, provide a minimal,
+        // data-driven fallback so the email still looks correct.
+        if ($type === self::TYPE_BOOKING_CONFIRMATION) {
+            if (!isset($variables['intro_paragraph']) || trim($variables['intro_paragraph']) === '') {
+                $variables['intro_paragraph'] = __('Thank you for your booking.', 'yatra');
+            }
+            if (!isset($variables['details_html']) || trim($variables['details_html']) === '') {
+                $variables['details_html'] = self::fallbackBookingDetailsHtml($variables);
+            }
+            if (!isset($variables['footer_note']) || trim($variables['footer_note']) === '') {
+                /* translators: %s: site name. */
+                $variables['footer_note'] = sprintf(__('— %s', 'yatra'), get_bloginfo('name'));
+            }
+        }
+
+        // Shared defaults that are safe for most templates if included.
+        if (!isset($variables['intro_paragraph'])) {
+            $variables['intro_paragraph'] = '';
+        }
+        if (!isset($variables['footer_note'])) {
+            $variables['footer_note'] = '';
+        }
+        if (!isset($variables['details_html'])) {
+            $variables['details_html'] = '';
+        }
+
+        return $variables;
+    }
+
+    /**
+     * Minimal booking details block for confirmation emails when caller doesn't provide `details_html`.
+     *
+     * @param array<string, string> $v
+     */
+    private static function fallbackBookingDetailsHtml(array $v): string
+    {
+        $trip = $v['trip_name'] ?? '';
+        $date = $v['travel_date'] ?? '';
+        $pax = $v['travelers_count'] ?? '';
+        $total = $v['total_amount_formatted'] ?? '';
+        $due = $v['amount_due_formatted'] ?? '';
+
+        $rows = [];
+        if ($trip !== '') {
+            $rows[] = ['label' => __('Trip', 'yatra'), 'value' => esc_html($trip)];
+        }
+        if ($date !== '') {
+            $rows[] = ['label' => __('Departure', 'yatra'), 'value' => esc_html($date)];
+        }
+        if ($pax !== '') {
+            $rows[] = ['label' => __('Travelers', 'yatra'), 'value' => esc_html($pax)];
+        }
+        if ($total !== '') {
+            $rows[] = ['label' => __('Total', 'yatra'), 'value' => esc_html($total)];
+        }
+        if ($due !== '') {
+            $rows[] = ['label' => __('Amount due', 'yatra'), 'value' => esc_html($due)];
+        }
+
+        if (empty($rows)) {
+            return '';
+        }
+
+        return EmailTemplateLayout::detailCard($rows);
+    }
+
+    /**
+     * @param array<string, string> $variables
+     */
+    private static function parseTemplate(string $template, array $variables): string
+    {
+        $rendered = (string) preg_replace_callback(
+            // Allow optional whitespace: {{trip_name}} and {{ trip_name }} both work.
+            '/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/',
+            static function (array $m) use ($variables): string {
+                $key = $m[1];
+
+                // Never leak raw merge-tags into real emails. If a variable is
+                // missing, replace it with an empty string rather than
+                // returning the original {{tag}} token.
+                return $variables[$key] ?? '';
+            },
+            $template
+        );
+
+        // Hard-strip any remaining merge-tags (defense-in-depth).
+        $rendered = (string) preg_replace('/\{\{\s*[a-zA-Z0-9_]+\s*\}\}/', '', $rendered);
+
+        // Users sometimes paste helper text from the editor into the template.
+        // If that happens, strip common helper headings so they don't appear in
+        // production emails.
+        $rendered = (string) preg_replace(
+            '/^.*(Available Variables|Available placeholders|Available Placeholders|Merge tags).*$/mi',
+            '',
+            $rendered
+        );
+
+        return $rendered;
+    }
+
+    /**
+     * @param array<string, string> $v
+     */
+    private static function defaultSubject(string $type, array $v): string
+    {
+        $site = $v['site_name'] ?? get_bloginfo('name');
+        $ref = $v['booking_reference'] ?? $v['booking_id'] ?? '';
+
+        switch ($type) {
+            case self::TYPE_BOOKING_CONFIRMATION:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('✈️ [%1$s] Booking update · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_PAYMENT_CONFIRMATION:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('✅ [%1$s] Payment received · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_PARTIAL_PAYMENT_RECEIVED:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('💳 [%1$s] Part payment received · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_BOOKING_CANCELLATION:
+            // The operator-initiated variant has no separate built-in wording:
+            // unless the operator writes their own, it reads exactly like the
+            // ordinary cancellation email. Switching it on can therefore never
+            // produce a blank or half-built message.
+            case self::TYPE_BOOKING_CANCELLATION_BY_OPERATOR:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('📋 [%1$s] Booking cancelled · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_BOOKING_REMINDER:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('🗓️ [%1$s] Your trip is coming up · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_ADMIN_NEW_BOOKING:
+                /* translators: 1: site name, 2: booking reference, 3: booking ID. */
+                return sprintf(__('🔔 [%1$s] New booking · %2$s (#%3$s)', 'yatra'), $site, $ref, $v['booking_id'] ?? '');
+
+            case self::TYPE_ADMIN_PAYMENT_RECEIVED:
+                /* translators: 1: site name, 2: booking reference, 3: booking ID. */
+                return sprintf(__('✅ [%1$s] Payment received · %2$s (#%3$s)', 'yatra'), $site, $ref, $v['booking_id'] ?? '');
+
+            case self::TYPE_ADMIN_BOOKING_CANCELLED:
+                /* translators: 1: site name, 2: booking reference, 3: booking ID. */
+                return sprintf(__('📋 [%1$s] Booking cancelled · %2$s (#%3$s)', 'yatra'), $site, $ref, $v['booking_id'] ?? '');
+
+            case self::TYPE_TRIP_CONSENT_REQUEST:
+                $formName = $v['form_name'] ?? __('consent form', 'yatra');
+
+                /* translators: 1: site name, 2: consent form name. */
+                return sprintf(__('📝 [%1$s] Action required · %2$s', 'yatra'), $site, $formName);
+
+            case self::TYPE_CUSTOMER_EMAIL_VERIFICATION:
+                /* translators: %s: site name. */
+                return sprintf(__('✉️ [%s] Verify your email address', 'yatra'), $site);
+
+            case self::TYPE_GUEST_EMAIL_VERIFICATION:
+                // Distinct subject so customers can tell apart "verify
+                // your account" from "verify to complete your booking".
+                /* translators: %s: site name. */
+                return sprintf(__('✉️ [%s] Verify your email to complete your booking', 'yatra'), $site);
+
+            case self::TYPE_ACCOUNT_EMAIL_CHANGE_REQUEST:
+                /* translators: %s: site name. */
+                return sprintf(__('✉️ [%s] Confirm your new email address', 'yatra'), $site);
+
+            case self::TYPE_ACCOUNT_EMAIL_CHANGED:
+                /* translators: %s: site name. */
+                return sprintf(__('🔔 [%s] Your email address was changed', 'yatra'), $site);
+
+            case self::TYPE_BOOKING_COMPLETED:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('🌟 [%1$s] Trip complete · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_BOOKING_EXPIRED_CUSTOMER:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('⏱️ [%1$s] Booking expired · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_ADMIN_BOOKING_EXPIRED:
+                /* translators: 1: site name, 2: booking reference, 3: booking ID. */
+                return sprintf(__('⏱️ [%1$s] Booking expired · %2$s (#%3$s)', 'yatra'), $site, $ref, $v['booking_id'] ?? '');
+
+            case self::TYPE_SCHEDULED_PAYMENT_REMINDER:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('💳 [%1$s] Upcoming payment · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_SCHEDULED_PAYMENT_SUCCEEDED:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('✅ [%1$s] Scheduled payment received · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_SCHEDULED_PAYMENT_FAILED:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('⚠️ [%1$s] Payment issue · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_ADMIN_SCHEDULED_PAYMENT_FAILED:
+                /* translators: 1: site name, 2: booking reference. */
+                return sprintf(__('⚠️ [%1$s] Scheduled payment failed · %2$s', 'yatra'), $site, $ref);
+
+            case self::TYPE_ENQUIRY_ADMIN:
+                $who = $v['customer_name'] ?? __('Customer', 'yatra');
+
+                /* translators: 1: site name, 2: customer name. */
+                return sprintf(__('💬 [%1$s] New enquiry · %2$s', 'yatra'), $site, $who);
+
+            case self::TYPE_ENQUIRY_CUSTOMER_RECEIVED:
+                /* translators: %s: site name. */
+                return sprintf(__('✉️ [%s] We received your message', 'yatra'), $site);
+
+            case self::TYPE_ENQUIRY_CUSTOMER_RESPONSE:
+                /* translators: %s: site name. */
+                return sprintf(__('💬 [%s] Re: your enquiry', 'yatra'), $site);
+
+            case self::TYPE_REVIEW_REQUEST:
+                $trip = $v['trip_name'] ?? __('your trip', 'yatra');
+
+                /* translators: 1: site name, 2: trip name. */
+                return sprintf(__('⭐ [%1$s] How was %2$s?', 'yatra'), $site, $trip);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_FIRST:
+                /* translators: %s: site name. */
+                return sprintf(__('🛒 [%s] Complete your booking', 'yatra'), $site);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_SECOND:
+                /* translators: %s: site name. */
+                return sprintf(__('⏳ [%s] Still interested? Your booking is waiting', 'yatra'), $site);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_FINAL:
+                /* translators: %s: site name. */
+                return sprintf(__('⚠️ [%s] Final reminder: complete your booking', 'yatra'), $site);
+
+            default:
+                // Pro modules register their own types via
+                // `yatra_transactional_email_type_to_keys` — they
+                // supply default copy through this filter. Returning
+                // empty string means "no extension claimed this type"
+                // and we fall back to the generic notification line.
+                $custom = (string) apply_filters(
+                    'yatra_transactional_email_default_subject',
+                    '',
+                    $type,
+                    $v
+                );
+                if ($custom !== '') {
+                    return $custom;
+                }
+                /* translators: %s: site name. */
+                return sprintf(__('✉️ [%s] Notification', 'yatra'), $site);
+        }
+    }
+
+    /**
+     * @param array<string, string> $v
+     */
+    private static function defaultBody(string $type, array $v): string
+    {
+        switch ($type) {
+            case self::TYPE_BOOKING_CONFIRMATION:
+                return EmailTemplateDefaults::fallbackTransactionalBooking($v);
+
+            case self::TYPE_PAYMENT_CONFIRMATION:
+                return EmailTemplateDefaults::fallbackTransactionalPayment($v);
+
+            case self::TYPE_PARTIAL_PAYMENT_RECEIVED:
+                return EmailTemplateDefaults::fallbackTransactionalPartialPayment($v);
+
+            case self::TYPE_BOOKING_CANCELLATION:
+            // The operator-initiated variant has no separate built-in wording:
+            // unless the operator writes their own, it reads exactly like the
+            // ordinary cancellation email. Switching it on can therefore never
+            // produce a blank or half-built message.
+            case self::TYPE_BOOKING_CANCELLATION_BY_OPERATOR:
+                return EmailTemplateDefaults::fallbackTransactionalCancellation($v);
+
+            case self::TYPE_BOOKING_REMINDER:
+                return EmailTemplateDefaults::fallbackTransactionalReminder($v);
+
+            case self::TYPE_ADMIN_NEW_BOOKING:
+                return EmailTemplateDefaults::fallbackAdminNewBooking($v);
+
+            case self::TYPE_ADMIN_PAYMENT_RECEIVED:
+                return EmailTemplateDefaults::fallbackAdminPaymentReceived($v);
+
+            case self::TYPE_ADMIN_BOOKING_CANCELLED:
+                return EmailTemplateDefaults::fallbackAdminBookingCancelled($v);
+
+            case self::TYPE_TRIP_CONSENT_REQUEST:
+                return EmailTemplateDefaults::fallbackTransactionalTripConsent($v);
+
+            case self::TYPE_CUSTOMER_EMAIL_VERIFICATION:
+                return EmailTemplateDefaults::fallbackTransactionalCustomerEmailVerification($v);
+
+            case self::TYPE_GUEST_EMAIL_VERIFICATION:
+                // Reuse the customer-verification body. The flow is
+                // similar — click a magic link to prove ownership of
+                // the address — and operators that have already
+                // customised the customer-verification copy get a
+                // consistent look across both. Differentiating copy is
+                // injected at call-time via the intro_paragraph /
+                // footer_note merge tags by the booking handler.
+                return EmailTemplateDefaults::fallbackTransactionalCustomerEmailVerification($v);
+
+            case self::TYPE_ACCOUNT_EMAIL_CHANGE_REQUEST:
+                return EmailTemplateDefaults::fallbackTransactionalAccountEmailChangeRequest($v);
+
+            case self::TYPE_ACCOUNT_EMAIL_CHANGED:
+                return EmailTemplateDefaults::fallbackTransactionalAccountEmailChanged($v);
+
+            case self::TYPE_BOOKING_COMPLETED:
+                return EmailTemplateDefaults::fallbackTransactionalBookingCompleted($v);
+
+            case self::TYPE_BOOKING_EXPIRED_CUSTOMER:
+                return EmailTemplateDefaults::fallbackTransactionalBookingExpiredCustomer($v);
+
+            case self::TYPE_ADMIN_BOOKING_EXPIRED:
+                return EmailTemplateDefaults::fallbackAdminBookingExpired($v);
+
+            case self::TYPE_SCHEDULED_PAYMENT_REMINDER:
+                return EmailTemplateDefaults::fallbackTransactionalScheduledPaymentReminder($v);
+
+            case self::TYPE_SCHEDULED_PAYMENT_SUCCEEDED:
+                return EmailTemplateDefaults::fallbackTransactionalScheduledPaymentSucceeded($v);
+
+            case self::TYPE_SCHEDULED_PAYMENT_FAILED:
+                return EmailTemplateDefaults::fallbackTransactionalScheduledPaymentFailed($v);
+
+            case self::TYPE_ADMIN_SCHEDULED_PAYMENT_FAILED:
+                return EmailTemplateDefaults::fallbackAdminScheduledPaymentFailed($v);
+
+            case self::TYPE_ENQUIRY_ADMIN:
+                return EmailTemplateDefaults::fallbackTransactionalEnquiryAdmin($v);
+
+            case self::TYPE_ENQUIRY_CUSTOMER_RECEIVED:
+                return EmailTemplateDefaults::fallbackTransactionalEnquiryReceived($v);
+
+            case self::TYPE_ENQUIRY_CUSTOMER_RESPONSE:
+                return EmailTemplateDefaults::fallbackTransactionalEnquiryResponse($v);
+
+            case self::TYPE_REVIEW_REQUEST:
+                return EmailTemplateDefaults::fallbackTransactionalReviewRequest($v);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_FIRST:
+                return EmailTemplateDefaults::fallbackTransactionalAbandonedBookingRecoveryFirst($v);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_SECOND:
+                return EmailTemplateDefaults::fallbackTransactionalAbandonedBookingRecoverySecond($v);
+
+            case self::TYPE_ABANDONED_BOOKING_RECOVERY_FINAL:
+                return EmailTemplateDefaults::fallbackTransactionalAbandonedBookingRecoveryFinal($v);
+
+            default:
+                // Pro modules register their own types via
+                // `yatra_transactional_email_type_to_keys` — they
+                // supply default body markup through this filter.
+                // Returning empty string falls back to the generic
+                // notification block.
+                $custom = (string) apply_filters(
+                    'yatra_transactional_email_default_body',
+                    '',
+                    $type,
+                    $v
+                );
+                if ($custom !== '') {
+                    return $custom;
+                }
+                return EmailTemplateLayout::customer(
+                    '✉️',
+                    __('Notification', 'yatra'),
+                    '<p style="margin:0;color:#475569;">' . esc_html__('This is an automated message from your travel site.', 'yatra') . '</p>',
+                    esc_html($v['site_name'] ?? get_bloginfo('name'))
+                );
+        }
+    }
+
+    /**
+     * Build variables from a booking row (admin / cron).
+     *
+     * Includes rich tags from {@see BookingEmailRichMergeTags::forBooking()}:
+     * `payment_gateway`, `payment_gateway_label`, `payment_schedule`, `payment_schedule_label`,
+     * `travelers_list`, `travelers_list_html`, `traveler_custom_fields_html`, `booking_custom_fields_html`,
+     * `special_requests`, `special_requests_html`.
+     *
+     * Note: `{{payment_method}}` on payment emails is the instrument label (e.g. Card) merged by callers;
+     * gateway/slug labels use `payment_gateway` / `payment_gateway_label`. Deposit vs full uses `payment_schedule*`.
+     *
+     * @return array<string, string> Filter: `yatra_booking_email_variables`.
+     */
+    public static function variablesFromBooking(object $booking): array
+    {
+        $currency = $booking->currency ?? SettingsService::getCurrency();
+        $travelDate = !empty($booking->travel_date)
+            ? mysql2date(get_option('date_format'), (string) $booking->travel_date)
+            : '';
+
+        $bookingId = (int) ($booking->id ?? 0);
+        $base = [
+            'customer_name' => trim((string) (($booking->contact_first_name ?? '') . ' ' . ($booking->contact_last_name ?? ''))),
+            'customer_first_name' => (string) ($booking->contact_first_name ?? ''),
+            'customer_last_name' => (string) ($booking->contact_last_name ?? ''),
+            'customer_email' => (string) ($booking->contact_email ?? ''),
+            'customer_phone' => (string) ($booking->contact_phone ?? ''),
+            'booking_reference' => (string) ($booking->reference ?? ''),
+            'booking_id' => (string) $bookingId,
+            'booking_url' => $bookingId > 0 ? home_url('/my-account/bookings/' . $bookingId) : home_url('/'),
+            // Trip context for per-trip template selection (Pro overrides) and
+            // for {{trip_id}}; "0" when the booking has no trip.
+            'trip_id' => (string) (int) ($booking->trip_id ?? 0),
+            'trip_name' => (string) ($booking->trip_title ?? ''),
+            'trip_url' => !empty($booking->trip_slug)
+                ? home_url('/' . SettingsService::getTripBase() . '/' . rawurlencode((string) $booking->trip_slug) . '/')
+                : home_url('/'),
+            'travel_date' => $travelDate,
+            'travelers_count' => (string) (int) ($booking->travelers_count ?? 0),
+            'total_amount_formatted' => yatra_format_price((float) ($booking->total_amount ?? 0), null, false),
+            'amount_due_formatted' => yatra_format_price((float) ($booking->amount_due ?? 0), null, false),
+            // Aliases for the legacy / customer-customised template
+            // syntax: many templates (including ones edited via Settings
+            // → Email Templates) reference `{{total_amount}}` and
+            // `{{balance_due}}` directly rather than the
+            // `_formatted` variants. Without these aliases the
+            // placeholders survived unsubstituted into the rendered
+            // email body. Aliases use the same formatted-with-currency
+            // value as the canonical keys above so templates remain
+            // visually consistent regardless of which name is used.
+            'total_amount' => yatra_format_price((float) ($booking->total_amount ?? 0), null, false),
+            'balance_due' => yatra_format_price((float) ($booking->amount_due ?? 0), null, false),
+            'amount_due' => yatra_format_price((float) ($booking->amount_due ?? 0), null, false),
+            'amount_paid' => yatra_format_price((float) ($booking->amount_paid ?? 0), null, false),
+            'amount_paid_formatted' => yatra_format_price((float) ($booking->amount_paid ?? 0), null, false),
+            'currency' => $currency,
+            'booking_status' => (string) ($booking->status ?? ''),
+            'payment_status' => (string) ($booking->payment_status ?? ''),
+            'admin_url' => admin_url('admin.php?page=yatra'),
+        ];
+
+        $rich = BookingEmailRichMergeTags::forBooking($booking);
+
+        /** @var array<string, string> $merged */
+        $merged = array_merge($base, $rich);
+
+        return apply_filters('yatra_booking_email_variables', $merged, $booking);
+    }
+
+    /**
+     * Merge tags for enquiry emails (row from EnquiryRepository::findWithTrip()).
+     *
+     * @param object $enquiry Row with name, email, phone, message, trip_title, etc.
+     * @return array<string, string>
+     */
+    public static function variablesFromEnquiry(object $enquiry, string $responsePlain = ''): array
+    {
+        $trip = trim((string) ($enquiry->trip_title ?? ''));
+        $tripSlug = (string) ($enquiry->trip_slug ?? '');
+        $tripId = isset($enquiry->trip_id) ? (int) $enquiry->trip_id : 0;
+
+        // Defense-in-depth: if repository join didn't provide trip_title/slug but we do have a trip_id,
+        // resolve the trip directly so {{trip_name}} doesn't fall back to "General enquiry".
+        if (($trip === '' || $tripSlug === '') && $tripId > 0) {
+            try {
+                $repo = new \Yatra\Repositories\TripRepository();
+                $tripRow = $repo->find($tripId);
+                if ($tripRow) {
+                    if ($trip === '' && !empty($tripRow->title)) {
+                        $trip = trim((string) $tripRow->title);
+                    }
+                    if ($tripSlug === '' && !empty($tripRow->slug)) {
+                        $tripSlug = (string) $tripRow->slug;
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Ignore: keep existing values/fallback.
+            }
+        }
+
+        $tripUrl = $tripSlug !== ''
+            ? home_url('/' . SettingsService::getTripBase() . '/' . rawurlencode($tripSlug) . '/')
+            : home_url('/');
+
+        $created = (string) ($enquiry->created_at ?? '');
+        $enquiryDate = $created !== ''
+            ? (mysql2date(get_option('date_format') . ' ' . get_option('time_format'), (string) $created) ?: date_i18n(get_option('date_format') . ' ' . get_option('time_format')))
+            : '';
+
+        $vars = [
+            'customer_name' => (string) ($enquiry->name ?? ''),
+            'customer_email' => (string) ($enquiry->email ?? ''),
+            'customer_phone' => (string) ($enquiry->phone ?? ''),
+            'enquiry_id' => (string) (int) ($enquiry->id ?? 0),
+            'enquiry_date' => $enquiryDate,
+            'subject' => (string) ($enquiry->subject ?? ''),
+            'trip_name' => $trip !== '' ? $trip : __('General enquiry', 'yatra'),
+            'trip_url' => $tripUrl,
+            'message' => nl2br(esc_html((string) ($enquiry->message ?? ''))),
+            'original_message' => (string) ($enquiry->message ?? ''),
+        ];
+
+        // Response-only tags are injected solely on the response email so the
+        // sidebar for `enquiry.created` doesn't surface tags that would render
+        // empty in that context.
+        if ($responsePlain !== '') {
+            $responseHtml = nl2br(esc_html($responsePlain));
+            $vars['response'] = $responseHtml;
+            $vars['response_message'] = $responseHtml;
+            $vars['response_date'] = date_i18n(get_option('date_format') . ' ' . get_option('time_format'));
+        }
+
+        return $vars;
+    }
+
+    /**
+     * @param object $booking Booking row (contact_*, reference, …)
+     * @param array<string, string> $extra e.g. expiry_hours, expiry_notice_html
+     * @return array<string, string>
+     */
+    public static function variablesFromBookingWithExtras(object $booking, array $extra = []): array
+    {
+        return array_merge(self::variablesFromBooking($booking), $extra);
+    }
+
+    /**
+     * The {{payment_type_label}} merge tag: a customer-facing name for a
+     * scheduled payment. It used to print the stored type as is ("installment",
+     * "final", "manual"), although the tag is documented as "Deposit, Final,
+     * Installment 2 of 4".
+     *
+     * @param string   $type   Stored payment_type.
+     * @param int|null $number Installment number, when it is one of several.
+     * @param int|null $total  How many installments the booking has, if known.
+     */
+    public static function paymentTypeLabel(string $type, ?int $number = null, ?int $total = null): string
+    {
+        switch ($type) {
+            case 'installment':
+                if ($number !== null && $number > 0 && $total !== null && $total >= $number) {
+                    /* translators: 1: installment number, 2: number of installments. */
+                    return sprintf(__('Installment %1$d of %2$d', 'yatra'), $number, $total);
+                }
+                if ($number !== null && $number > 0) {
+                    /* translators: %d: installment number. */
+                    return sprintf(__('Installment %d', 'yatra'), $number);
+                }
+                return __('Installment', 'yatra');
+            case 'final':
+                return __('Final payment', 'yatra');
+            case 'manual':
+                return __('Balance payment', 'yatra');
+            case 'deposit':
+                return __('Deposit', 'yatra');
+            case 'recurring':
+                return __('Recurring payment', 'yatra');
+            case '':
+                return '';
+            default:
+                return ucfirst(str_replace('_', ' ', $type));
+        }
+    }
+
+    /**
+     * @param object $booking      Booking row
+     * @param object $scheduledRow Scheduled payment row (amount, currency, scheduled_date, payment_type, …)
+     * @param array<string, string> $extra failure_reason, balance_after_formatted, permanent_failure, …
+     * @return array<string, string>
+     */
+    public static function variablesFromScheduledPayment(object $booking, object $scheduledRow, array $extra = []): array
+    {
+        $currency = (string) ($scheduledRow->currency ?? $booking->currency ?? SettingsService::getCurrency());
+        $amount = (float) ($scheduledRow->amount ?? 0);
+        $schedDate = !empty($scheduledRow->scheduled_date)
+            ? mysql2date(get_option('date_format'), (string) $scheduledRow->scheduled_date)
+            : '';
+
+        $base = self::variablesFromBooking($booking);
+        $base['scheduled_amount_formatted'] = yatra_format_price($amount, $currency, false);
+        $base['scheduled_date_formatted'] = $schedDate;
+        $base['payment_type_label'] = self::paymentTypeLabel(
+            (string) ($scheduledRow->payment_type ?? ''),
+            isset($scheduledRow->installment_number) && $scheduledRow->installment_number !== null ? (int) $scheduledRow->installment_number : null,
+            isset($scheduledRow->installment_total) ? (int) $scheduledRow->installment_total : null
+        );
+        $base['scheduled_payment_id'] = (string) (int) ($scheduledRow->id ?? 0);
+
+        return array_merge($base, $extra);
+    }
+}

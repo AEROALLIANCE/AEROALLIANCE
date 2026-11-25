@@ -1,0 +1,531 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Validators;
+
+use Yatra\Exceptions\ValidationException;
+
+/**
+ * Booking Validator
+ *
+ * Comprehensive validation for booking data
+ */
+class BookingValidator
+{
+    /**
+     * Statuses a booking row may legally hold.
+     *
+     * `pending_verification` is the holding state used when
+     * `require_guest_email_verification` is on: the row is created but is not
+     * actionable until the guest clicks the verification link, at which
+     * point {@see BookingSessionController::confirmEmailVerifiedBooking()}
+     * (the `pending_verification` → `pending` transition) takes over.
+     *
+     * Keep this list as the single source of truth — both validate* and
+     * sanitize use it, so adding a new status anywhere in the booking
+     * lifecycle just needs one edit here.
+     */
+    private const VALID_BOOKING_STATUSES = [
+        'pending',
+        'pending_verification',
+        'confirmed',
+        'cancelled',
+        'completed',
+        'refunded',
+        'waitlist',
+    ];
+
+    /**
+     * Accepted payment statuses — mirrors the `payment_status` ENUM on the
+     * bookings table.
+     */
+    private const VALID_PAYMENT_STATUSES = [
+        'pending',
+        'partial',
+        'paid',
+        'refunded',
+        'failed',
+    ];
+
+    /**
+     * Normalize a locale-formatted numeric string to a PHP-parseable form.
+     *
+     * Russian / European locales format money as "1 200,50" (space thousands +
+     * comma decimal), and some browsers/inputs submit that raw string. PHP's
+     * is_numeric() rejects it and (float) silently truncates it ("200,50" → 200),
+     * which surfaced to users as a generic "Booking validation failed" with no
+     * indication of the real cause. Normalize before validating/casting so we
+     * accept "1 200,50", "1.200,50" (EU), "1,200.50" (US) and "200,50" alike.
+     *
+     * @param mixed $value
+     * @return mixed Normalized string for numeric input, original value otherwise.
+     */
+    private static function normalizeNumeric($value)
+    {
+        if (is_int($value) || is_float($value)) {
+            return $value;
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $v = trim($value);
+        if ($v === '') {
+            return $v;
+        }
+
+        // Strip currency symbols and all whitespace used as thousands separators
+        // (regular space, NBSP U+00A0, narrow NBSP U+202F, thin space U+2009).
+        $v = preg_replace('/[\s\x{00A0}\x{202F}\x{2009}]/u', '', $v);
+
+        $lastComma = strrpos($v, ',');
+        $lastDot   = strrpos($v, '.');
+
+        if ($lastComma !== false && $lastDot !== false) {
+            // Both present → the right-most one is the decimal separator.
+            if ($lastComma > $lastDot) {
+                $v = str_replace('.', '', $v);   // dots are thousands
+                $v = str_replace(',', '.', $v);  // comma is decimal
+            } else {
+                $v = str_replace(',', '', $v);   // commas are thousands
+            }
+        } elseif ($lastComma !== false) {
+            // Only a comma → treat it as the decimal separator.
+            $v = str_replace(',', '.', $v);
+        }
+
+        return $v;
+    }
+
+    /**
+     * Validate booking creation data
+     */
+    public static function validateCreate(array $data): void
+    {
+        $errors = [];
+
+        // Required fields
+        if (empty($data['trip_id'])) {
+            $errors['trip_id'][] = __('Trip ID is required', 'yatra');
+        } elseif (!is_numeric($data['trip_id']) || (int)$data['trip_id'] <= 0) {
+            $errors['trip_id'][] = __('Trip ID must be a valid positive integer', 'yatra');
+        }
+
+        // Customer can be guest, so customer_id is optional (if provided, validate)
+        if (isset($data['customer_id']) && $data['customer_id'] !== '') {
+            if (!is_numeric($data['customer_id']) || (int)$data['customer_id'] <= 0) {
+                $errors['customer_id'][] = __('Customer ID must be a valid positive integer', 'yatra');
+            }
+        }
+
+        // Accept either departure_date or travel_date
+        $departureDate = $data['departure_date'] ?? $data['travel_date'] ?? null;
+        if (empty($departureDate)) {
+            $errors['departure_date'][] = __('Departure date is required', 'yatra');
+        } elseif (!self::isValidDate($departureDate)) {
+            $errors['departure_date'][] = __('Departure date must be a valid date', 'yatra');
+        } elseif (strtotime($departureDate) < strtotime('today')) {
+            $errors['departure_date'][] = __('Departure date cannot be in the past', 'yatra');
+        }
+
+        // Validate status
+        if (isset($data['status'])) {
+            if (!in_array($data['status'], self::VALID_BOOKING_STATUSES, true)) {
+                $errors['status'][] = __('Invalid booking status', 'yatra');
+            }
+        }
+
+        // Validate pricing (locale-tolerant: accept "1 200,50" / "1.200,50" etc.)
+        if (isset($data['total_amount'])) {
+            $totalAmount = self::normalizeNumeric($data['total_amount']);
+            if (!is_numeric($totalAmount) || (float)$totalAmount < 0) {
+                $errors['total_amount'][] = __('Total amount must be a valid positive number', 'yatra');
+            }
+        }
+
+        if (isset($data['paid_amount'])) {
+            $paidAmount = self::normalizeNumeric($data['paid_amount']);
+            if (!is_numeric($paidAmount) || (float)$paidAmount < 0) {
+                $errors['paid_amount'][] = __('Paid amount must be a valid positive number', 'yatra');
+            }
+        }
+
+        // Validate traveler count
+        $travelerCount = $data['total_travelers'] ?? $data['travelers_count'] ?? null;
+        if ($travelerCount !== null) {
+            if (!is_numeric($travelerCount) || (int)$travelerCount < 1) {
+                $errors['total_travelers'][] = __('Total travelers must be at least 1', 'yatra');
+            }
+        }
+
+        // Payment: booking "amount type" (full / deposit / partial) vs gateway (processor).
+        // Checkout sends both; Pro Flexible Payments uses payment_method=deposit|partial|full.
+        $bookingAmountMethods = ['full', 'partial', 'deposit'];
+        $gatewayIds = apply_filters('yatra_valid_booking_payment_gateway_ids', [
+            'cash',
+            'bank_transfer',
+            'credit_card',
+            'paypal',
+            'stripe',
+            'razorpay',
+            'pay_later',
+            'paystack',
+            'mollie',
+            'square',
+            'authorize_net',
+            'esewa',
+            'khalti',
+        ]);
+
+        if (isset($data['payment_method']) && $data['payment_method'] !== '') {
+            if (!in_array($data['payment_method'], $bookingAmountMethods, true)) {
+                // Legacy: some clients put the gateway id in payment_method only
+                if (!in_array($data['payment_method'], $gatewayIds, true)) {
+                    $errors['payment_method'][] = __('Invalid payment method', 'yatra');
+                }
+            }
+        }
+
+        if (isset($data['payment_gateway']) && $data['payment_gateway'] !== '') {
+            if (!in_array($data['payment_gateway'], $gatewayIds, true)) {
+                $errors['payment_gateway'][] = __('Invalid payment gateway', 'yatra');
+            }
+        }
+
+        // Validate email format
+        if (isset($data['customer_email']) && !empty($data['customer_email'])) {
+            if (!is_email($data['customer_email'])) {
+                $errors['customer_email'][] = __('Invalid email format', 'yatra');
+            }
+        }
+
+        if (!empty($errors)) {
+            throw new ValidationException('Booking validation failed', $errors);
+        }
+    }
+
+    /**
+     * Validate booking update data
+     */
+    public static function validateUpdate(array $data, int $bookingId): void
+    {
+        $errors = [];
+
+        // ID validation
+        if ($bookingId <= 0) {
+            $errors['id'][] = __('Invalid booking ID', 'yatra');
+        }
+
+        // Optional field validation
+        if (isset($data['trip_id']) && (!is_numeric($data['trip_id']) || (int)$data['trip_id'] <= 0)) {
+            $errors['trip_id'][] = __('Trip ID must be a valid positive integer', 'yatra');
+        }
+
+        if (isset($data['customer_id']) && (!is_numeric($data['customer_id']) || (int)$data['customer_id'] <= 0)) {
+            $errors['customer_id'][] = __('Customer ID must be a valid positive integer', 'yatra');
+        }
+
+        if (isset($data['departure_date'])) {
+            if (!self::isValidDate($data['departure_date'])) {
+                $errors['departure_date'][] = __('Departure date must be a valid date', 'yatra');
+            }
+        }
+
+        if (isset($data['status'])) {
+            if (!in_array($data['status'], self::VALID_BOOKING_STATUSES, true)) {
+                $errors['status'][] = __('Invalid booking status', 'yatra');
+            }
+        }
+
+        // Reject rather than fall through to sanitize(), which coerces an
+        // unknown value to 'pending'. On an update that silently reset a
+        // fully-paid booking to unpaid while amount_paid kept the money that had
+        // actually been received — and still reported success.
+        if (isset($data['payment_status'])) {
+            if (!in_array($data['payment_status'], self::VALID_PAYMENT_STATUSES, true)) {
+                $errors['payment_status'][] = __('Invalid payment status', 'yatra');
+            }
+        }
+
+        if (isset($data['total_amount']) && (!is_numeric(self::normalizeNumeric($data['total_amount'])) || (float)self::normalizeNumeric($data['total_amount']) < 0)) {
+            $errors['total_amount'][] = __('Total amount must be a valid positive number', 'yatra');
+        }
+
+        if (isset($data['paid_amount']) && (!is_numeric(self::normalizeNumeric($data['paid_amount'])) || (float)self::normalizeNumeric($data['paid_amount']) < 0)) {
+            $errors['paid_amount'][] = __('Paid amount must be a valid positive number', 'yatra');
+        }
+
+        if (isset($data['total_travelers']) && (!is_numeric($data['total_travelers']) || (int)$data['total_travelers'] < 1)) {
+            $errors['total_travelers'][] = __('Total travelers must be at least 1', 'yatra');
+        }
+
+        if (isset($data['payment_method'])) {
+            $validMethods = ['cash', 'bank_transfer', 'credit_card', 'paypal', 'stripe', 'razorpay'];
+            if (!in_array($data['payment_method'], $validMethods)) {
+                $errors['payment_method'][] = __('Invalid payment method', 'yatra');
+            }
+        }
+
+        if (isset($data['customer_email']) && !empty($data['customer_email']) && !is_email($data['customer_email'])) {
+            $errors['customer_email'][] = __('Invalid email format', 'yatra');
+        }
+
+        if (!empty($errors)) {
+            throw new ValidationException('Booking validation failed', $errors);
+        }
+    }
+
+    /**
+     * Sanitize booking data
+     */
+    public static function sanitize(array $data): array
+    {
+        $sanitized = [];
+
+        // Integer fields
+        if (isset($data['trip_id'])) {
+            $sanitized['trip_id'] = (int)$data['trip_id'];
+        }
+
+        if (isset($data['customer_id'])) {
+            $sanitized['customer_id'] = (int)$data['customer_id'];
+        }
+
+        if (isset($data['total_travelers'])) {
+            $sanitized['total_travelers'] = (int)$data['total_travelers'];
+        }
+        if (isset($data['travelers_count'])) {
+            $sanitized['travelers_count'] = (int)$data['travelers_count'];
+        }
+
+        // Float fields (normalize locale formatting so "200,50" stores as 200.50,
+        // not silently truncated to 200 by a bare (float) cast).
+        if (isset($data['total_amount'])) {
+            $sanitized['total_amount'] = (float)self::normalizeNumeric($data['total_amount']);
+        }
+
+        if (isset($data['paid_amount'])) {
+            $sanitized['paid_amount'] = (float)self::normalizeNumeric($data['paid_amount']);
+        }
+
+        // Date fields
+        if (isset($data['departure_date'])) {
+            $sanitized['departure_date'] = sanitize_text_field($data['departure_date']);
+        }
+        if (isset($data['travel_date'])) {
+            $sanitized['travel_date'] = sanitize_text_field($data['travel_date']);
+        }
+
+        if (isset($data['booking_date'])) {
+            $sanitized['booking_date'] = sanitize_text_field($data['booking_date']);
+        }
+
+        // Text fields
+        if (isset($data['customer_name'])) {
+            $sanitized['customer_name'] = sanitize_text_field($data['customer_name']);
+        }
+
+        if (isset($data['customer_email'])) {
+            $sanitized['customer_email'] = sanitize_email($data['customer_email']);
+        }
+
+        if (isset($data['customer_phone'])) {
+            $sanitized['customer_phone'] = sanitize_text_field($data['customer_phone']);
+        }
+
+        if (isset($data['notes'])) {
+            $sanitized['notes'] = wp_kses_post($data['notes']);
+        }
+
+        // Enum fields
+        if (isset($data['status'])) {
+            $sanitized['status'] = in_array($data['status'], self::VALID_BOOKING_STATUSES, true) ? $data['status'] : 'pending';
+        }
+
+        if (isset($data['payment_method'])) {
+            // Align with allowed frontend values (full/partial or gateway handles)
+            $validMethods = [
+                'full',
+                'partial',
+                'cash',
+                'bank_transfer',
+                'credit_card',
+                'paypal',
+                'stripe',
+                'razorpay',
+                'pay_later',
+                'paystack',
+                'mollie',
+                'square',
+                'authorize_net',
+                'esewa',
+                'khalti',
+            ];
+            $sanitized['payment_method'] = in_array($data['payment_method'], $validMethods, true)
+                ? $data['payment_method']
+                : $data['payment_method']; // keep original so validation can report exact value
+        }
+        if (isset($data['payment_gateway'])) {
+            $sanitized['payment_gateway'] = sanitize_text_field($data['payment_gateway']);
+        }
+
+        if (isset($data['payment_status'])) {
+            $validStatuses = ['pending', 'paid', 'partial', 'refunded', 'failed'];
+            $sanitized['payment_status'] = in_array($data['payment_status'], $validStatuses) ? $data['payment_status'] : 'pending';
+        }
+
+        // Tax fields
+        if (isset($data['subtotal'])) {
+            $sanitized['subtotal'] = (float)self::normalizeNumeric($data['subtotal']);
+        }
+        if (isset($data['tax_amount'])) {
+            $sanitized['tax_amount'] = (float)self::normalizeNumeric($data['tax_amount']);
+        }
+        if (isset($data['tax_rate'])) {
+            $sanitized['tax_rate'] = (float)self::normalizeNumeric($data['tax_rate']);
+        }
+        if (isset($data['tax_inclusive'])) {
+            $sanitized['tax_inclusive'] = (bool)$data['tax_inclusive'];
+        }
+        if (isset($data['tax_details'])) {
+            $sanitized['tax_details'] = $data['tax_details']; // Already JSON encoded
+        }
+
+        // Other booking fields
+        if (isset($data['currency'])) {
+            $sanitized['currency'] = sanitize_text_field($data['currency']);
+        }
+        if (isset($data['amount_due'])) {
+            $sanitized['amount_due'] = (float)self::normalizeNumeric($data['amount_due']);
+        }
+        if (isset($data['amount_paid'])) {
+            $sanitized['amount_paid'] = (float)self::normalizeNumeric($data['amount_paid']);
+        }
+        if (isset($data['discount_amount'])) {
+            $sanitized['discount_amount'] = (float)self::normalizeNumeric($data['discount_amount']);
+        }
+        if (isset($data['discount_code'])) {
+            $sanitized['discount_code'] = sanitize_text_field($data['discount_code']);
+        }
+        if (isset($data['reference'])) {
+            $sanitized['reference'] = sanitize_text_field($data['reference']);
+        }
+        if (isset($data['contact_first_name'])) {
+            $sanitized['contact_first_name'] = sanitize_text_field($data['contact_first_name']);
+        }
+        if (isset($data['contact_last_name'])) {
+            $sanitized['contact_last_name'] = sanitize_text_field($data['contact_last_name']);
+        }
+        if (isset($data['contact_email'])) {
+            $sanitized['contact_email'] = sanitize_email($data['contact_email']);
+        }
+        if (isset($data['contact_phone'])) {
+            $sanitized['contact_phone'] = sanitize_text_field($data['contact_phone']);
+        }
+        if (isset($data['contact_country'])) {
+            $sanitized['contact_country'] = sanitize_text_field($data['contact_country']);
+        }
+        // contact_data / emergency_contact arrive either as an already-encoded
+        // JSON string (some internal callers) or — from the admin BookingForm —
+        // as a plain object/array. Sanitise the array form per-value (the
+        // checkout path already sanitises its captures), and pass an
+        // already-encoded string through untouched.
+        if (isset($data['contact_data'])) {
+            $sanitized['contact_data'] = is_array($data['contact_data'])
+                ? self::sanitizeFieldMap($data['contact_data'])
+                : $data['contact_data'];
+        }
+        if (isset($data['emergency_contact'])) {
+            $sanitized['emergency_contact'] = is_array($data['emergency_contact'])
+                ? self::sanitizeFieldMap($data['emergency_contact'])
+                : $data['emergency_contact'];
+        }
+        // Travelers: array of flat field maps (field_id => value), incl. CUSTOM
+        // fields from the Pro Dynamic Form module. Previously omitted from the
+        // allowlist, which silently dropped admin traveller edits before they
+        // reached BookingService::saveTravelers(). Keys are normalised with
+        // sanitize_key (the same shape the form builder produces); scalar values
+        // only. Checkout does NOT pass a `travelers` key (it persists travellers
+        // through a separate path), so this is additive for the admin flow only.
+        if (isset($data['travelers']) && is_array($data['travelers'])) {
+            $sanitized_travelers = [];
+            foreach ($data['travelers'] as $traveler) {
+                if (!is_array($traveler)) {
+                    continue;
+                }
+                $sanitized_travelers[] = self::sanitizeFieldMap($traveler);
+            }
+            $sanitized['travelers'] = $sanitized_travelers;
+        }
+        if (isset($data['availability_id'])) {
+            $sanitized['availability_id'] = !empty($data['availability_id']) ? (int)$data['availability_id'] : null;
+        }
+        if (isset($data['user_id'])) {
+            $sanitized['user_id'] = !empty($data['user_id']) ? (int)$data['user_id'] : null;
+        }
+        if (isset($data['special_requests'])) {
+            $sanitized['special_requests'] = sanitize_textarea_field($data['special_requests']);
+        }
+        if (isset($data['newsletter_optin'])) {
+            $sanitized['newsletter_optin'] = (int)(bool)$data['newsletter_optin'];
+        }
+        if (isset($data['ip_address'])) {
+            $sanitized['ip_address'] = sanitize_text_field($data['ip_address']);
+        }
+        if (isset($data['created_at'])) {
+            $sanitized['created_at'] = sanitize_text_field($data['created_at']);
+        }
+        if (isset($data['updated_at'])) {
+            $sanitized['updated_at'] = sanitize_text_field($data['updated_at']);
+        }
+        
+        // Itinerary costs fields
+        if (isset($data['itinerary_costs'])) {
+            $sanitized['itinerary_costs'] = $data['itinerary_costs']; // Already JSON encoded
+        }
+        if (isset($data['itinerary_costs_total'])) {
+            $sanitized['itinerary_costs_total'] = (float)self::normalizeNumeric($data['itinerary_costs_total']);
+        }
+        if (isset($data['departure_time'])) {
+            $t = trim((string) $data['departure_time']);
+            $sanitized['departure_time'] = $t !== '' ? sanitize_text_field($t) : '';
+        }
+
+        return $sanitized;
+    }
+
+    /**
+     * Sanitise a flat field map (field_id => value), e.g. contact_data or
+     * emergency_contact submitted as an object by the admin BookingForm.
+     * Keys are normalised with sanitize_key (matching the form-builder /
+     * merge-tag key shape) and scalar values run through sanitize_text_field.
+     * Non-scalar values are dropped.
+     *
+     * @param array<string,mixed> $map
+     * @return array<string,string>
+     */
+    private static function sanitizeFieldMap(array $map): array
+    {
+        $clean = [];
+        foreach ($map as $key => $value) {
+            if (!is_scalar($value)) {
+                continue;
+            }
+            $clean_key = sanitize_key((string) $key);
+            if ($clean_key !== '') {
+                $clean[$clean_key] = sanitize_text_field((string) $value);
+            }
+        }
+        return $clean;
+    }
+
+    /**
+     * Check if date is valid
+     */
+    private static function isValidDate(string $date): bool
+    {
+        $d = \DateTime::createFromFormat('Y-m-d', $date);
+        return $d && $d->format('Y-m-d') === $date;
+    }
+}

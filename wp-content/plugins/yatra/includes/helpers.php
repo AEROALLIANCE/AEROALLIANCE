@@ -1,0 +1,3416 @@
+<?php
+/**
+ * Yatra Helper Functions
+ * 
+ * @package Yatra
+ */
+
+// Prevent direct access
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+use Yatra\Database\Tables\BookingsTable;
+use Yatra\Database\Tables\ClassificationsTable;
+use Yatra\Database\Tables\ReviewsTable;
+use Yatra\Database\Tables\TripsTable;
+use Yatra\Services\SettingsService;
+use Yatra\Constants\ClassificationTypes;
+
+/**
+ * Get a plugin setting value
+ * 
+ * @param string $key     Setting key
+ * @param mixed  $default Default value
+ * @return mixed
+ */
+function yatra_get_setting(string $key, $default = null)
+{
+    return SettingsService::get($key, $default);
+}
+
+/**
+ * Check if a setting is enabled
+ * 
+ * @param string $key Setting key
+ * @return bool
+ */
+function yatra_setting_enabled(string $key): bool
+{
+    return SettingsService::isEnabled($key);
+}
+
+/**
+ * Check if reviews are enabled
+ * 
+ * @return bool
+ */
+function yatra_reviews_enabled(): bool
+{
+    return SettingsService::reviewsEnabled();
+}
+
+/**
+ * Get booking form configuration
+ * 
+ * @return array
+ */
+/**
+ * @param int|null $tripId Trip being booked. Pass it from every checkout-side
+ *                         caller so per-trip field visibility (Pro) applies to
+ *                         rendering, the AJAX re-render and server validation
+ *                         alike. Omit it where the whole config is wanted.
+ */
+function yatra_get_booking_form_config(?int $tripId = null): array
+{
+    // Check if Dynamic Form Field module is enabled via Pro plugin
+    $is_dynamic_enabled = apply_filters('yatra_dynamic_form_field_enabled', false);
+    
+    if ($is_dynamic_enabled) {
+        // Pro module is active — merged config from options (filtered in SettingsService::getBookingFormConfig)
+        return SettingsService::getBookingFormConfig($tripId);
+    }
+
+    // Module off: still allow filters to adjust defaults (tests / edge integrations)
+    return apply_filters(
+        'yatra_booking_form_config',
+        SettingsService::getDefaultBookingFormConfig(),
+        $tripId
+    );
+}
+
+/**
+ * Translate a booking-form display string (label / title / description /
+ * placeholder / option label) at render time.
+ *
+ * The default booking-form strings are registered for translation in
+ * SettingsService::getDefaultBookingFormConfig() (literal __() calls, so they
+ * land in the .pot for Loco Translate). This runtime pass additionally lets a
+ * SAVED or CUSTOM label (Pro Dynamic Form module) resolve against the active
+ * locale when a matching translation exists, and returns the original string
+ * unchanged otherwise. Safe for empty/non-string input.
+ *
+ * @param mixed $string
+ * @return string
+ */
+function yatra_translate_form_string($string): string
+{
+    $string = is_scalar($string) ? (string) $string : '';
+    if ($string === '') {
+        return '';
+    }
+
+    // Dynamic gettext: the literal source strings are registered for extraction
+    // in SettingsService; this resolves them (and any matching custom label) at
+    // runtime against the loaded 'yatra' text domain.
+    return __($string, 'yatra'); // phpcs:ignore WordPress.WP.I18n.NonSingularStringLiteralText, WordPress.WP.I18n.NonSingularStringLiteralDomain
+}
+
+/**
+ * Check if user can leave a review for a trip
+ * 
+ * @param int      $trip_id Trip ID
+ * @param int|null $user_id User ID (defaults to current user)
+ * @return bool
+ */
+function yatra_can_review(int $trip_id, ?int $user_id = null): bool
+{
+    // Reviews must be enabled
+    if (!SettingsService::reviewsEnabled()) {
+        return false;
+    }
+
+    // Get user ID
+    if ($user_id === null) {
+        $user_id = get_current_user_id();
+    }
+
+    // If booking required, check if user has booked this trip
+    if (SettingsService::requireBookingForReview()) {
+        if ($user_id === 0) {
+            return false; // Guest can't review if booking required
+        }
+        
+        // Check if user has a completed booking for this trip
+        global $wpdb;
+        $table = BookingsTable::getTableName();
+        $has_booking = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} 
+             WHERE trip_id = %d AND customer_id = %d AND status = 'completed'",
+            $trip_id,
+            $user_id
+        ));
+        
+        if (!$has_booking) {
+            return false;
+        }
+    }
+
+    // Check if user already reviewed this trip (but allow if within edit window)
+    if ($user_id > 0) {
+        $existing_review = yatra_get_user_review($trip_id, $user_id);
+        if ($existing_review && !yatra_can_edit_review($existing_review)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Get user's existing review for a trip
+ * 
+ * @param int      $trip_id Trip ID
+ * @param int|null $user_id User ID (defaults to current user)
+ * @return object|null Review object or null
+ */
+function yatra_get_user_review(int $trip_id, ?int $user_id = null): ?object
+{
+    if ($user_id === null) {
+        $user_id = get_current_user_id();
+    }
+    
+    if ($user_id === 0) {
+        return null;
+    }
+    
+    global $wpdb;
+    $table = ReviewsTable::getTableName();
+    $review = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM {$table} WHERE trip_id = %d AND user_id = %d ORDER BY created_at DESC LIMIT 1",
+        $trip_id,
+        $user_id
+    ));
+    
+    return $review ?: null;
+}
+
+/**
+ * Check if a review can be edited (within 24 hours of creation and not approved)
+ * 
+ * @param object $review Review object with created_at and status fields
+ * @return bool
+ */
+function yatra_can_edit_review(object $review): bool
+{
+    if (empty($review->created_at)) {
+        return false;
+    }
+    
+    // Don't allow editing if review is approved
+    if (isset($review->status) && $review->status === 'approved') {
+        return false;
+    }
+    
+    $created_time = strtotime($review->created_at);
+    $current_time = current_time('timestamp');
+    $hours_since_creation = ($current_time - $created_time) / 3600;
+    
+    // Allow editing within 24 hours (only for pending/rejected reviews)
+    return $hours_since_creation <= 24;
+}
+
+/**
+ * Get time remaining to edit a review
+ * 
+ * @param object $review Review object with created_at field
+ * @return string Human-readable time remaining (e.g., "5 hours", "30 minutes")
+ */
+function yatra_get_review_edit_time_remaining(object $review): string
+{
+    if (empty($review->created_at)) {
+        return '';
+    }
+    
+    $created_time = strtotime($review->created_at);
+    $current_time = current_time('timestamp');
+    $seconds_since_creation = $current_time - $created_time;
+    $seconds_remaining = (24 * 3600) - $seconds_since_creation;
+    
+    if ($seconds_remaining <= 0) {
+        return '';
+    }
+    
+    $hours = floor($seconds_remaining / 3600);
+    $minutes = floor(($seconds_remaining % 3600) / 60);
+    
+    if ($hours > 0) {
+        /* translators: %d: number of hours remaining. */
+        return sprintf(_n('%d hour', '%d hours', $hours, 'yatra'), $hours);
+    }
+
+    /* translators: %d: number of minutes remaining. */
+    return sprintf(_n('%d minute', '%d minutes', $minutes, 'yatra'), $minutes);
+}
+
+/**
+ * Get the booking URL for a trip
+ * 
+ * @param string $trip_slug The trip slug
+ * @param array  $params    Optional URL parameters (date, adults, children, price)
+ * @return string The booking URL
+ */
+function yatra_get_booking_url(string $trip_slug, array $params = []): string
+{
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    // Check if using custom booking page via SettingsService
+    if (SettingsService::useCustomBookingPage()) {
+        $page_url = get_permalink(SettingsService::getBookingPageId());
+        if ($page_url) {
+            $params['trip'] = $trip_slug;
+            return add_query_arg($params, $page_url);
+        }
+    }
+    
+    // Using default dynamic URL
+    $booking_base = SettingsService::getBookingBase();
+    if ($is_plain) {
+        $params['trip'] = $trip_slug;
+
+        return add_query_arg(
+            array_merge(['yatra_page' => $booking_base], $params),
+            home_url('/')
+        );
+    }
+
+    $url = home_url('/' . $booking_base . '/' . $trip_slug);
+
+    if (!empty($params)) {
+        $url = add_query_arg($params, $url);
+    }
+    
+    return $url;
+}
+
+/**
+ * Normalized Dynamic Pricing display toggles (listing, trip page, availability).
+ *
+ * @return array{show_original_price: bool, show_savings_badge: bool, show_urgency_messages: bool}
+ */
+if (!function_exists('yatra_get_dynamic_pricing_display_flags')) {
+    function yatra_get_dynamic_pricing_display_flags(): array
+    {
+        $s = apply_filters('yatra_get_dynamic_pricing_display_settings', [
+            'show_original_price' => true,
+            'show_savings_badge' => true,
+            'show_urgency_messages' => false,
+        ]);
+
+        return [
+            'show_original_price' => filter_var($s['show_original_price'] ?? true, FILTER_VALIDATE_BOOLEAN),
+            'show_savings_badge' => filter_var($s['show_savings_badge'] ?? true, FILTER_VALIDATE_BOOLEAN),
+            'show_urgency_messages' => filter_var($s['show_urgency_messages'] ?? false, FILTER_VALIDATE_BOOLEAN),
+        ];
+    }
+}
+
+/**
+ * Urgency lines for a trip surface (listing card, sidebar, similar trips). Pro fills via yatra_trip_card_dynamic_pricing_meta.
+ *
+ * @param array<string, mixed> $context base_sale_price, base_original_price, departure_date, spots_remaining, …
+ * @return array<int, string>
+ */
+if (!function_exists('yatra_trip_card_dynamic_pricing_urgency_lines')) {
+    function yatra_trip_card_dynamic_pricing_urgency_lines(int $trip_id, array $context = []): array
+    {
+        if ($trip_id <= 0) {
+            return [];
+        }
+
+        $flags = yatra_get_dynamic_pricing_display_flags();
+        if (!$flags['show_urgency_messages']) {
+            return [];
+        }
+
+        $meta = apply_filters(
+            'yatra_trip_card_dynamic_pricing_meta',
+            ['urgency_messages' => []],
+            array_merge($context, [
+                'trip_id' => $trip_id,
+                'display' => $flags,
+            ])
+        );
+
+        if (!is_array($meta) || empty($meta['urgency_messages']) || !is_array($meta['urgency_messages'])) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($meta['urgency_messages'] as $line) {
+            $line = sanitize_text_field((string) $line);
+            if ($line !== '') {
+                $out[] = $line;
+            }
+        }
+
+        return array_values(array_unique($out));
+    }
+}
+
+/**
+ * Format price with currency
+ * 
+ * @param float       $amount   The amount to format
+ * @param string|null $currency The currency code (optional, uses global setting if not provided)
+ * @param bool        $zero_is_unknown When true (default), 0 is shown as "Contact for pricing" (trip/listing).
+ *                                     Set false for checkout, payments, and invoices where 0 is a real amount.
+ * @return string Formatted price
+ */
+if (!function_exists('yatra_format_price')) {
+    function yatra_format_price(float $amount, ?string $currency = null, bool $zero_is_unknown = true): string
+    {
+        if ($zero_is_unknown && (empty($amount) || $amount == 0)) {
+            return __('Contact for pricing', 'yatra');
+        }
+
+        $format = yatra_get_price_format_settings($currency);
+
+        // Format the amount with proper separators
+        $formatted_amount = number_format($amount, $format['decimals'], $format['decimal_separator'], $format['thousand_separator']);
+        $currency_symbol = $format['symbol'];
+        $pos = $format['position'];
+
+        if ($pos === 'right') {
+            return $formatted_amount . $currency_symbol;
+        }
+        if ($pos === 'right_space') {
+            return $formatted_amount . ' ' . $currency_symbol;
+        }
+        if ($pos === 'left') {
+            return $currency_symbol . $formatted_amount;
+        }
+
+        return $currency_symbol . ' ' . $formatted_amount;
+    }
+}
+
+/**
+ * The store's price format, as used by yatra_format_price().
+ *
+ * Also handed to frontend scripts (e.g. the listing price filter) so prices they
+ * redraw match the ones PHP printed, instead of assuming "$".
+ *
+ * @param string|null $currency Currency code; the global setting when omitted.
+ * @return array{symbol: string, position: string, decimals: int, thousand_separator: string, decimal_separator: string}
+ */
+if (!function_exists('yatra_get_price_format_settings')) {
+    function yatra_get_price_format_settings(?string $currency = null): array
+    {
+        if (empty($currency)) {
+            $currency = SettingsService::getCurrency();
+        }
+
+        // Placement: Settings UI uses left, right, left_space, right_space; legacy uses before/after.
+        $raw = strtolower(trim((string) SettingsService::getCurrencyPosition()));
+        if ($raw === 'before') {
+            $pos = 'left_space';
+        } elseif ($raw === 'after') {
+            $pos = 'right_space';
+        } else {
+            $pos = $raw;
+        }
+        if (!in_array($pos, ['left', 'right', 'left_space', 'right_space'], true)) {
+            $pos = 'left_space';
+        }
+
+        return [
+            'symbol' => yatra_get_currency_symbol((string) $currency),
+            'position' => $pos,
+            // Single source of truth: honors the admin "Number of decimals" field and
+            // stays in sync with the JS price formatter (already clamped to 0–4).
+            'decimals' => SettingsService::getPriceDecimals(),
+            'thousand_separator' => SettingsService::getString('thousand_separator', ','),
+            'decimal_separator' => SettingsService::getString('decimal_separator', '.'),
+        ];
+    }
+}
+
+/**
+ * Get currency symbol from currency code
+ * 
+ * @param string $currency_code The currency code (e.g., 'USD', 'EUR', 'NPR')
+ * @return string The currency symbol or code
+ */
+if (!function_exists('yatra_get_currency_symbol')) {
+    function yatra_get_currency_symbol(string $currency_code): string
+    {
+        $symbols = [
+            'USD' => '$',
+            'EUR' => '€',
+            'GBP' => '£',
+            'JPY' => '¥',
+            'CNY' => '¥',
+            'INR' => '₹',
+            'NPR' => 'Rs',
+            'AUD' => 'A$',
+            'CAD' => 'C$',
+            'CHF' => 'CHF',
+            'NZD' => 'NZ$',
+            'SGD' => 'S$',
+            'HKD' => 'HK$',
+            'KRW' => '₩',
+            'THB' => '฿',
+            'MYR' => 'RM',
+            'PHP' => '₱',
+            'IDR' => 'Rp',
+            'VND' => '₫',
+            'BRL' => 'R$',
+            'MXN' => 'MX$',
+            'RUB' => '₽',
+            'ZAR' => 'R',
+            'AED' => 'د.إ',
+            'SAR' => '﷼',
+            'TRY' => '₺',
+            'SEK' => 'kr',
+            'NOK' => 'kr',
+            'DKK' => 'kr',
+            'PLN' => 'zł',
+            'CZK' => 'Kč',
+            'HUF' => 'Ft',
+            'ILS' => '₪',
+            'TWD' => 'NT$',
+            'PKR' => '₨',
+            'BDT' => '৳',
+            'LKR' => 'Rs',
+            'EGP' => 'E£',
+            'NGN' => '₦',
+            'KES' => 'KSh',
+            // Ghanaian cedi – use plain symbol without the GH prefix
+            'GHS' => '₵',
+            'GHC' => '₵',
+            'ARS' => 'AR$',
+            'CLP' => 'CL$',
+            'COP' => 'CO$',
+            'PEN' => 'S/',
+        ];
+        
+        return $symbols[strtoupper($currency_code)] ?? $currency_code;
+    }
+}
+
+/**
+ * Format duration (days/nights)
+ * 
+ * @param int      $days   Number of days
+ * @param int|null $nights Number of nights (optional)
+ * @return string Formatted duration
+ */
+if (!function_exists('yatra_format_duration')) {
+    function yatra_format_duration(int $days, ?int $nights = null, ?int $hours = null): string
+    {
+        // Hour-based (single-day) tours take precedence when a positive hours
+        // value is supplied. Optional trailing arg keeps every existing
+        // two-argument call unchanged.
+        if ($hours !== null && $hours > 0) {
+            return sprintf(
+                /* translators: %d: number of hours. */
+                _n('%d hour', '%d hours', $hours, 'yatra'),
+                $hours
+            );
+        }
+
+        if ($days > 0 && $nights !== null && $nights > 0) {
+            /* translators: 1: number of days, 2: number of nights. */
+            return sprintf(__('%1$d days / %2$d nights', 'yatra'), $days, $nights);
+        }
+        if ($days > 0) {
+            return sprintf(
+                /* translators: %d: number of days. */
+                _n('%d day', '%d days', $days, 'yatra'),
+                $days
+            );
+        }
+        return __('Flexible', 'yatra');
+    }
+}
+
+/**
+ * Render SVG icon
+ * 
+ * @param string $icon_name Icon name
+ * @param string $class     Optional CSS class
+ * @return string SVG markup
+ */
+if (!function_exists('yatra_svg_icon')) {
+    function yatra_svg_icon(string $icon_name, string $class = ''): string
+    {
+        static $icons = null;
+        
+        // Load icons from JSON file once
+        if ($icons === null) {
+            $icons_file = dirname(__FILE__) . '/icons.json';
+            if (file_exists($icons_file)) {
+                $icons_data = json_decode(file_get_contents($icons_file), true);
+                $icons = [];
+                
+                // Convert JSON data to PHP array
+                foreach ($icons_data as $name => $data) {
+                    if (isset($data['svg'])) {
+                        $icons[$name] = (string) $data['svg'];
+                    }
+                }
+            } else {
+                $icons = [];
+            }
+        }
+
+        $svg = $icons[$icon_name] ?? '';
+
+        if ($svg === '' || !is_string($svg)) {
+            return '';
+        }
+
+        if ($class !== '') {
+            $class_attr = esc_attr($class);
+
+            if (preg_match('/<svg[^>]*\sclass="([^"]*)"/i', $svg, $m)) {
+                $existing = trim((string) ($m[1] ?? ''));
+                $merged = trim($existing . ' ' . $class_attr);
+                $svg = preg_replace('/(<svg[^>]*\sclass=")([^"]*)(")/i', '$1' . $merged . '$3', $svg, 1);
+            } else {
+                $svg = preg_replace('/<svg\b/i', '<svg class="' . $class_attr . '"', $svg, 1);
+            }
+        }
+
+        return (string) $svg;
+    }
+}
+
+/**
+ * Allowed Font Awesome Free icon name (maps to fa-{name} class).
+ */
+if (!function_exists('yatra_sanitize_fa_icon_slug')) {
+    function yatra_sanitize_fa_icon_slug(string $name): string
+    {
+        $n = strtolower(trim($name));
+        if ($n === '' || strlen($n) > 64) {
+            return '';
+        }
+        if (!preg_match('/^[a-z0-9-]+$/', $n)) {
+            return '';
+        }
+
+        return $n;
+    }
+}
+
+/**
+ * Normalize icon picker payload before storing (REST / services).
+ *
+ * @param array<string, mixed> $icon
+ * @return array{type: string, value: string|int, provider?: string}
+ */
+if (!function_exists('yatra_normalize_icon_picker_for_storage')) {
+    function yatra_normalize_icon_picker_for_storage(array $icon): array
+    {
+        $type = isset($icon['type']) && $icon['type'] === 'image' ? 'image' : 'icon';
+        $value = $icon['value'] ?? '';
+        if ($type === 'image') {
+            return [
+                'type' => 'image',
+                'value' => is_numeric($value) ? (int) $value : sanitize_text_field((string) $value),
+            ];
+        }
+        $provider = isset($icon['provider']) ? sanitize_key((string) $icon['provider']) : 'yatra';
+        if (!in_array($provider, ['yatra', 'fa-solid', 'fa-regular'], true)) {
+            $provider = 'yatra';
+        }
+
+        return [
+            'type' => 'icon',
+            'value' => sanitize_text_field((string) $value),
+            'provider' => $provider,
+        ];
+    }
+}
+
+/**
+ * Markup for a stored icon picker value (Yatra SVG registry, Font Awesome, or image).
+ *
+ * @param array<string, mixed>|string|null $picker Serialized JSON string, array, or null.
+ * @return string Safe HTML (empty string if nothing renderable).
+ */
+if (!function_exists('yatra_stored_picker_icon_markup')) {
+    function yatra_stored_picker_icon_markup($picker, string $default_yatra_slug = 'mountain', string $class = ''): string
+    {
+        $class = trim($class);
+        $class_attr = $class !== '' ? ' ' . esc_attr($class) : '';
+
+        if ($picker === null || $picker === '') {
+            return function_exists('yatra_svg_icon') ? yatra_svg_icon($default_yatra_slug, $class) : '';
+        }
+        if (is_string($picker) && strpos($picker, '{') === 0) {
+            $picker = json_decode($picker, true);
+        }
+        if (!is_array($picker) || !isset($picker['type'])) {
+            if (is_string($picker)) {
+                $slug = trim($picker);
+
+                return $slug !== '' && function_exists('yatra_svg_icon')
+                    ? yatra_svg_icon($slug, $class)
+                    : yatra_svg_icon($default_yatra_slug, $class);
+            }
+
+            return function_exists('yatra_svg_icon') ? yatra_svg_icon($default_yatra_slug, $class) : '';
+        }
+
+        if ($picker['type'] === 'image' && !empty($picker['value'])) {
+            $image_url = is_numeric($picker['value'])
+                ? wp_get_attachment_url((int) $picker['value'])
+                : (string) $picker['value'];
+            if ($image_url) {
+                $style = 'width:24px;height:24px;object-fit:cover;border-radius:4px;';
+
+                return '<img src="' . esc_url($image_url) . '" alt="" class="' . esc_attr(trim('yatra-picker-img-icon ' . $class)) . '" style="' . esc_attr($style) . '" loading="lazy" decoding="async" />';
+            }
+
+            return function_exists('yatra_svg_icon') ? yatra_svg_icon('image', $class) : '';
+        }
+
+        if ($picker['type'] === 'icon' && !empty($picker['value'])) {
+            $provider = isset($picker['provider']) ? sanitize_key((string) $picker['provider']) : 'yatra';
+            if ($provider === 'fa-solid' || $provider === 'fa-regular') {
+                $slug = yatra_sanitize_fa_icon_slug((string) $picker['value']);
+                if ($slug === '') {
+                    return function_exists('yatra_svg_icon') ? yatra_svg_icon($default_yatra_slug, $class) : '';
+                }
+                $fa_prefix = $provider === 'fa-regular' ? 'fa-regular' : 'fa-solid';
+
+                return '<i class="' . esc_attr($fa_prefix . ' fa-' . $slug . $class_attr) . '" aria-hidden="true"></i>';
+            }
+
+            return function_exists('yatra_svg_icon')
+                ? yatra_svg_icon((string) $picker['value'], $class)
+                : '';
+        }
+
+        return function_exists('yatra_svg_icon') ? yatra_svg_icon($default_yatra_slug, $class) : '';
+    }
+}
+
+/**
+ * Translated display label for trip meal_plan stored slug (matches admin Trip Builder options).
+ *
+ * @param string|null $slug Raw value from DB (e.g. half_board, "Half Board").
+ */
+if (!function_exists('yatra_meal_plan_label')) {
+    function yatra_meal_plan_label(?string $slug): string
+    {
+        if ($slug === null || $slug === '') {
+            return '';
+        }
+        $s = strtolower(trim(preg_replace('/[\s\-]+/', '_', $slug), " \t\n\r\0\x0B_-"));
+        switch ($s) {
+            case 'breakfast':
+                return __('Breakfast Only', 'yatra');
+            case 'half_board':
+                return __('Half Board (Breakfast + Dinner)', 'yatra');
+            case 'full_board':
+                return __('Full Board (All Meals)', 'yatra');
+            case 'all_inclusive':
+                return __('All Inclusive', 'yatra');
+            case 'none':
+                return __('No Meals Included', 'yatra');
+            default:
+                return ucwords(str_replace('_', ' ', $s));
+        }
+    }
+}
+
+/**
+ * Translated itinerary entry item type label for frontend (matches admin item type names).
+ */
+if (!function_exists('yatra_itinerary_item_type_label')) {
+    function yatra_itinerary_item_type_label(string $type): string
+    {
+        $t = trim($type);
+        switch ($t) {
+            case 'Meal':
+                return __('Meal', 'yatra');
+            case 'Activity':
+                return __('Activity', 'yatra');
+            case 'Accommodation':
+                return __('Accommodation', 'yatra');
+            case 'Transportation':
+                return __('Transportation', 'yatra');
+            case 'Rest':
+                return __('Rest', 'yatra');
+            default:
+                return $t;
+        }
+    }
+}
+
+/**
+ * Extract SVG icon slug from a stored icon field (same shape as admin / archive cards).
+ *
+ * @param mixed $icon Raw value from DB (serialized array with type/value, URL, attachment id, or legacy slug string).
+ */
+function yatra_icon_slug_from_stored_field($icon): string
+{
+    if ($icon === null || $icon === '') {
+        return '';
+    }
+
+    $icon = maybe_unserialize($icon);
+
+    if (is_array($icon)) {
+        $type  = $icon['type'] ?? $icon[0] ?? '';
+        $value = $icon['value'] ?? $icon[1] ?? '';
+        if ($type === 'icon' && !empty($value) && is_string($value)) {
+            $provider = isset($icon['provider']) ? sanitize_key((string) $icon['provider']) : 'yatra';
+            if ($provider === 'fa-solid' || $provider === 'fa-regular') {
+                return '';
+            }
+
+            return $value;
+        }
+
+        return '';
+    }
+
+    if (is_string($icon)) {
+        if (filter_var($icon, FILTER_VALIDATE_URL)) {
+            return '';
+        }
+        $slug = trim($icon);
+
+        return $slug !== '' ? $slug : '';
+    }
+
+    return '';
+}
+
+/**
+ * SVG markup for archive listing CTAs: use admin icon when present and valid in icons.json; else default slug.
+ *
+ * @param string $resolved_icon_slug From the listing loop (same source as card hero icon when type is "icon").
+ * @param string $default_slug       icons.json key when no admin icon.
+ */
+function yatra_archive_listing_cta_icon_markup(string $resolved_icon_slug, string $default_slug, string $class = 'yatra-btn-icon'): string
+{
+    $slug = trim($resolved_icon_slug);
+    if ($slug !== '' && function_exists('yatra_svg_icon')) {
+        $out = yatra_svg_icon($slug, $class);
+        if ($out !== '') {
+            return $out;
+        }
+    }
+
+    $fallback = trim($default_slug);
+    if ($fallback !== '' && function_exists('yatra_svg_icon')) {
+        return yatra_svg_icon($fallback, $class);
+    }
+
+    return '';
+}
+
+/**
+ * Icon slug for trip listing card "View Details" — category, then destination, then difficulty (backend order).
+ *
+ * @param array<int, object|array<string, mixed>> $categories  Trip categories from getCategories()
+ * @param array<int, object|array<string, mixed>> $destinations Trip destinations from getDestinations()
+ * @param array<string, mixed>                    $difficulty   From Trip::getDifficulty()
+ */
+function yatra_trip_listing_card_cta_icon_slug(array $categories, array $destinations, array $difficulty): string
+{
+    foreach ($categories as $row) {
+        if (empty($row)) {
+            continue;
+        }
+        $raw = is_object($row) ? ($row->icon ?? null) : ($row['icon'] ?? null);
+        $slug = yatra_icon_slug_from_stored_field($raw);
+        if ($slug !== '') {
+            return $slug;
+        }
+    }
+
+    foreach ($destinations as $row) {
+        if (empty($row)) {
+            continue;
+        }
+        $raw = is_object($row) ? ($row->icon ?? null) : ($row['icon'] ?? null);
+        $slug = yatra_icon_slug_from_stored_field($raw);
+        if ($slug !== '') {
+            return $slug;
+        }
+    }
+
+    if (!empty($difficulty['icon']) && is_string($difficulty['icon'])) {
+        $try = trim($difficulty['icon']);
+        if ($try !== '') {
+            return $try;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Get booking base URL slug
+ * 
+ * @return string The booking base slug
+ */
+function yatra_get_booking_base(): string
+{
+    // Check if using custom booking page
+    if (SettingsService::useCustomBookingPage()) {
+        $booking_page_id = SettingsService::getBookingPageId();
+        if ($booking_page_id > 0) {
+            $page = get_post($booking_page_id);
+            if ($page) {
+                return $page->post_name;
+            }
+        }
+    }
+    
+    return SettingsService::getBookingBase();
+}
+
+/**
+ * Check if the current page is a booking page
+ * 
+ * @return bool
+ */
+function yatra_is_booking_page(): bool
+{
+    global $wp_query;
+    
+    // Check for custom booking page
+    if (SettingsService::useCustomBookingPage()) {
+        $booking_page_id = SettingsService::getBookingPageId();
+        if ($booking_page_id > 0 && is_page($booking_page_id)) {
+            return true;
+        }
+    }
+    
+    $booking_base = SettingsService::getBookingBase();
+    if (!empty($wp_query->get('yatra_page')) && (string) $wp_query->get('yatra_page') === $booking_base) {
+        return true;
+    }
+    
+    // Check for dynamic booking URL
+    return !empty($wp_query->get('yatra_booking_trip_slug'));
+}
+
+/**
+ * Get the global trip object
+ * 
+ * Similar to WordPress get_post(), this function returns the current trip object
+ * when on a single trip page.
+ * 
+ * @return object|null The trip object or null if not on a trip page
+ */
+function yatra_get_trip(): ?object
+{
+    global $trip;
+    return $trip ?? null;
+}
+
+/**
+ * Check if we're on a single trip page
+ * 
+ * @return bool True if on a single trip page
+ */
+function yatra_is_single_trip(): bool
+{
+    
+    global $wp_query;
+    return !empty($wp_query->get('yatra_trip_id'));
+}
+
+/**
+ * Get a trip field value with default fallback
+ * 
+ * @param string $field   The field name
+ * @param mixed  $default Default value if field is empty
+ * @return mixed The field value or default
+ */
+function yatra_get_trip_field(string $field, $default = '')
+{
+    global $trip;
+    
+    if (!$trip || !isset($trip->$field)) {
+        return $default;
+    }
+    
+    return $trip->$field ?: $default;
+}
+
+/**
+ * Echo a trip field value with escaping
+ * 
+ * @param string $field   The field name
+ * @param string $escape  Escape function: 'html', 'attr', 'url', 'js', 'none'
+ * @param mixed  $default Default value if field is empty
+ */
+function yatra_trip_field(string $field, string $escape = 'html', $default = ''): void
+{
+    $value = yatra_get_trip_field($field, $default);
+    
+    switch ($escape) {
+        case 'html':
+            echo esc_html($value);
+            break;
+        case 'attr':
+            echo esc_attr($value);
+            break;
+        case 'url':
+            echo esc_url($value);
+            break;
+        case 'js':
+            echo esc_js($value);
+            break;
+        case 'none':
+        case 'kses':
+            echo wp_kses_post($value);
+            break;
+        default:
+            echo esc_html($value);
+    }
+}
+
+/**
+ * ============================================
+ * BRAND / WHITE LABEL HELPERS (THIN WRAPPERS)
+ * ============================================
+ *
+ * The free plugin owns the function NAMES (so callers in plugin row meta,
+ * admin menu, PDF templates, etc. work without conditional `function_exists`
+ * checks), but every override lives in Yatra Pro's White Label module.
+ *
+ * Each helper here just applies a filter; Pro's WhiteLabel module registers
+ * filter callbacks when the module is enabled AND an Agency-tier license is
+ * active. Without Pro, every filter no-ops and these return the defaults —
+ * which is the correct behavior for a free-only install.
+ *
+ * Option storage, REST endpoints, sanitization, plugin-list rebranding,
+ * brand-color CSS injection, and dependency-link rewriting all live in
+ * yatra-pro/app/Modules/WhiteLabel/ — NOT here.
+ */
+
+/**
+ * Public URL for the Yatra brand icon (admin menu + React sidebar).
+ * Defaults to the bundled `yatra-icon.png`; Pro overrides via the
+ * `yatra_brand_icon_url` filter when a White Label logo is configured.
+ */
+function yatra_get_brand_icon_url(): string
+{
+    $default = '';
+    if (defined('YATRA_PLUGIN_PATH') && defined('YATRA_PLUGIN_URL')) {
+        $candidates = [
+            'assets/images/yatra-icon.png',
+            'assets/images/yara-icon.png',
+        ];
+        foreach ($candidates as $relative) {
+            $file = YATRA_PLUGIN_PATH . $relative;
+            if (!is_readable($file)) {
+                continue;
+            }
+            $default = add_query_arg(
+                'ver',
+                (string) filemtime($file),
+                YATRA_PLUGIN_URL . $relative
+            );
+            break;
+        }
+    }
+
+    return (string) apply_filters('yatra_brand_icon_url', $default);
+}
+
+/**
+ * Whether the Agency White Label module is active and may override branding.
+ * Pro returns true via the `yatra_white_label_active` filter when its
+ * WhiteLabel module is enabled AND the license tier is Agency.
+ */
+function yatra_is_white_label_active(): bool
+{
+    return (bool) apply_filters('yatra_white_label_active', false);
+}
+
+/**
+ * Read a single white-label setting with a default fallback. Backed by a
+ * filter so option access stays in Pro.
+ *
+ * @param mixed $default
+ * @return mixed
+ */
+function yatra_get_white_label_setting(string $key, $default = '')
+{
+    return apply_filters('yatra_white_label_setting', $default, $key);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function yatra_get_white_label_settings(): array
+{
+    $value = apply_filters('yatra_white_label_settings', []);
+    return is_array($value) ? $value : [];
+}
+
+/**
+ * Branding for generated PDFs (invoice, voucher, itinerary).
+ *
+ * Free ships an unbranded default — the header keeps whatever colour the
+ * document already used and no logo is shown — so nothing changes for a site
+ * without Yatra Pro. The White Label module hooks these filters to supply the
+ * operator's own logo and colour, exactly as it already does for
+ * `yatra_brand_icon_url` and friends.
+ *
+ * Kept as filters rather than reading White Label options directly so free never
+ * depends on Pro, and so a site can brand its PDFs from a theme or snippet
+ * without the module at all.
+ *
+ * @param string $defaultHeaderColor The document's existing header colour, so
+ *                                   each PDF keeps its own look when unbranded.
+ * @return array{logo_url: string, header_color: string}
+ */
+function yatra_get_pdf_branding(string $defaultHeaderColor): array
+{
+    $logo = (string) apply_filters('yatra_pdf_branding_logo_url', '');
+    $color = (string) apply_filters('yatra_pdf_branding_header_color', $defaultHeaderColor);
+
+    // Only accept a well-formed hex colour; anything else falls back to the
+    // document default rather than emitting broken CSS into the PDF.
+    if (!preg_match('/^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/', $color)) {
+        $color = $defaultHeaderColor;
+    }
+
+    $logo = esc_url_raw(trim($logo));
+
+    return [
+        'logo_url'     => $logo,
+        'header_color' => $color,
+    ];
+}
+
+/**
+ * Customer-facing label for a payment gateway id.
+ *
+ * Returns the same **Gateway Title** the checkout shows — the operator's custom
+ * title when they set one, otherwise the gateway's own translated title — so
+ * invoices, the confirmation page and the checkout all name a gateway the same
+ * way. Falls back to the prettified id (the historical behaviour) when the
+ * gateway is not registered any more, e.g. a Pro gateway while Pro is inactive,
+ * so an old document still reads sensibly.
+ *
+ * @param string|null $gatewayId Gateway id / slug as stored on the payment or booking.
+ * @param string      $fallback  Used when no id is stored at all.
+ */
+function yatra_payment_gateway_label(?string $gatewayId, string $fallback = ''): string
+{
+    $id = trim((string) $gatewayId);
+    if ($id === '') {
+        return $fallback;
+    }
+
+    if (class_exists(\Yatra\PaymentGateways\PaymentGatewayRegistry::class)) {
+        $title = \Yatra\PaymentGateways\PaymentGatewayRegistry::getInstance()->resolveGatewayTitle($id);
+        if ($title !== '') {
+            return $title;
+        }
+    }
+
+    // Only a slug-shaped value is a gateway id we may prettify. Anything else
+    // is operator free text — a manually recorded payment stores whatever they
+    // typed ("Cash on arrival", "SEPA Direct Debit") — and is returned exactly
+    // as entered rather than re-cased.
+    if (!preg_match('/^[A-Za-z0-9_-]+$/', $id)) {
+        return $id;
+    }
+
+    return ucwords(str_replace(['_', '-'], ' ', $id));
+}
+
+/**
+ * Are partial payments possible on this site at all?
+ *
+ * True when deposits or partial payments are switched on globally. Used to
+ * decide whether part-payment specific features (such as the separate
+ * "part payment received" email template) are relevant — there is no point
+ * showing them to an operator who only ever takes payment in full.
+ */
+function yatra_partial_payments_enabled(): bool
+{
+    $enabled = \Yatra\Services\SettingsService::isEnabled('partial_payment')
+        || \Yatra\Services\SettingsService::isEnabled('enable_deposit')
+        || \Yatra\Services\SettingsService::isEnabled('deposit_required');
+
+    return (bool) apply_filters('yatra_partial_payments_enabled', $enabled);
+}
+
+/**
+ * How many stars to draw for an average rating.
+ *
+ * Rounds to the NEAREST half star rather than flooring. Flooring made a 4.9
+ * average draw four-and-a-half stars, which reads as a mistake sitting next to
+ * the printed "4.9" — a 4.9 is five stars to anyone looking at it.
+ *
+ *   4.9 -> 5      4.7 -> 4.5    4.4 -> 4.5    4.2 -> 4
+ *
+ * Returns the number of solid stars and whether a half star follows them, so
+ * every surface (confirmation page, reviews block, listing cards) draws the
+ * same rating identically.
+ *
+ * @return array{full:int, half:bool}
+ */
+function yatra_rating_star_parts($rating): array
+{
+    $rating = max(0.0, min(5.0, (float) $rating));
+
+    // Work in half-star units so the rounding is a single, obvious step.
+    $halves = (int) round($rating * 2);
+
+    return [
+        'full' => intdiv($halves, 2),
+        'half' => ($halves % 2) === 1,
+    ];
+}
+
+/**
+ * Branded plugin name shown in admin menu, plugin list, and PDFs.
+ */
+function yatra_get_brand_name(): string
+{
+    return (string) apply_filters('yatra_brand_name', 'Yatra');
+}
+
+/**
+ * Branded company/author name (replaces "MantraBrain").
+ */
+function yatra_get_brand_company(): string
+{
+    return (string) apply_filters('yatra_brand_company', 'MantraBrain');
+}
+
+/**
+ * Public website URL for the branded product.
+ */
+function yatra_get_brand_website_url(): string
+{
+    $url = (string) apply_filters('yatra_brand_website_url', 'https://wpyatra.com/');
+    return $url !== '' ? esc_url_raw($url) : 'https://wpyatra.com/';
+}
+
+/**
+ * Support URL surfaced in admin notices and the plugin row.
+ */
+function yatra_get_brand_support_url(): string
+{
+    $url = (string) apply_filters(
+        'yatra_brand_support_url',
+        'https://wordpress.org/support/plugin/yatra/reviews/?filter=5'
+    );
+    return $url !== '' ? esc_url_raw($url) : 'https://wordpress.org/support/plugin/yatra/reviews/?filter=5';
+}
+
+
+/**
+ * ============================================
+ * BOOKING SESSION MANAGEMENT
+ * ============================================
+ */
+
+/**
+ * Start WordPress session if not already started
+ */
+function yatra_start_session(): void
+{
+    // Start output buffering to prevent accidental output from breaking sessions
+    if (!ob_get_level()) {
+        ob_start();
+    }
+    
+    if (session_status() === PHP_SESSION_NONE && !headers_sent()) {
+        // Set session cookie parameters for better compatibility
+        if (PHP_VERSION_ID >= 70300) {
+            session_set_cookie_params([
+                'lifetime' => 0,
+                'path' => defined('COOKIEPATH') ? COOKIEPATH : '/',
+                'domain' => defined('COOKIE_DOMAIN') ? COOKIE_DOMAIN : '',
+                'secure' => is_ssl(),
+                'httponly' => true,
+                'samesite' => 'Lax'
+            ]);
+        }
+        session_start();
+    }
+}
+
+/**
+ * Set booking session data
+ * 
+ * @param array $data Booking data to store
+ */
+function yatra_set_booking_session(array $data): void
+{
+    yatra_start_session();
+    
+    // Clear any existing remaining payment session to avoid conflicts
+    unset($_SESSION['yatra_remaining']);
+    
+    $session_data = array_merge(
+        $_SESSION['yatra_booking'] ?? [],
+        $data,
+        ['timestamp' => time()]
+    );
+    
+    $_SESSION['yatra_booking'] = $session_data;
+    
+    // ALWAYS store in transient as backup (not just for REST API)
+    // This ensures data persists across all request types
+    // Generate or reuse booking token
+    $booking_token = $_SESSION['yatra_booking_token'] ?? 'yatra_booking_' . wp_generate_password(32, false);
+    $_SESSION['yatra_booking_token'] = $booking_token;
+    $session_data['booking_token'] = $booking_token;
+    
+    // Store in transient (expires in 30 minutes)
+    try {
+        $transient_set = set_transient($booking_token, $session_data, 1800);
+    } catch (Exception $e) {
+        // Continue without transient - session fallback will be used
+    }
+    
+    }
+
+/**
+ * Get booking session data
+ * 
+ * @param string|null $key Specific key to retrieve, or null for all data
+ * @param mixed $default Default value if key not found
+ * @return mixed
+ */
+function yatra_get_booking_session(?string $key = null, $default = null)
+{
+    yatra_start_session();
+    
+    $booking_data = $_SESSION['yatra_booking'] ?? [];
+    
+    // If session is empty, try to restore from transient (REST API → page load transition)
+    if (empty($booking_data) || empty($booking_data['trip_id'])) {
+        // Check for booking token in URL or session
+        $booking_token = $_GET['booking_token'] ?? $_SESSION['yatra_booking_token'] ?? null;
+        
+        if ($booking_token) {
+            try {
+                $transient_data = get_transient($booking_token);
+                
+                if ($transient_data && is_array($transient_data) && !empty($transient_data['trip_id'])) {
+                    // Validate transient data integrity
+                    if (isset($transient_data['timestamp']) && (time() - $transient_data['timestamp']) < 1800) {
+                        $booking_data = $transient_data;
+                        // Restore to session
+                        $_SESSION['yatra_booking'] = $booking_data;
+                        $_SESSION['yatra_booking_token'] = $booking_token;
+                    }
+                }
+            } catch (Exception $e) {
+                // Continue without transient data
+            }
+        }
+    }
+    
+    // Check if session is expired (30 minutes)
+    if (!empty($booking_data['timestamp'])) {
+        $session_age = time() - $booking_data['timestamp'];
+        if ($session_age > 1800) { // 30 minutes
+            yatra_clear_booking_session();
+            return $key ? $default : [];
+        }
+    }
+    
+    if ($key === null) {
+        return $booking_data;
+    }
+    
+    return $booking_data[$key] ?? $default;
+}
+
+/**
+ * Clear booking session data (PHP session, booking token, and REST backup transient).
+ *
+ * Without removing the token and transient, yatra_get_booking_session() can repopulate
+ * checkout data from the transient on the next request after a completed booking.
+ */
+function yatra_clear_booking_session(): void
+{
+    yatra_start_session();
+
+    $token = $_SESSION['yatra_booking_token'] ?? null;
+    if (is_string($token) && $token !== '') {
+        delete_transient($token);
+    }
+
+    unset($_SESSION['yatra_booking'], $_SESSION['yatra_booking_token']);
+}
+
+/**
+ * Check if booking session exists and is valid
+ * 
+ * @return bool
+ */
+function yatra_has_booking_session(): bool
+{
+    $booking_data = yatra_get_booking_session();
+    return !empty($booking_data) && !empty($booking_data['trip_id']);
+}
+
+/**
+ * Fire {@see 'yatra_booking_confirmed'} when a booking reaches `confirmed` from a non-confirmed status.
+ *
+ * Core always fired `yatra_booking_status_changed`; Pro modules (Trip Consent, Google Calendar) listen
+ * on this dedicated action. Call this after any code path that sets a booking to `confirmed` without
+ * going through {@see \Yatra\Services\BookingService::updateStatus()}.
+ *
+ * Async payment-completion paths (gateway webhooks / return handlers, scheduled
+ * payments) confirm the booking with a direct DB write, bypassing
+ * updateStatus(). Pass $fromDirectConfirm = true from those paths so this
+ * function replicates the customer-facing side effects updateStatus() would
+ * have run — the "booking confirmed" email AND the `yatra_booking_status_changed`
+ * action that status-based listeners (Pro Email Automation, cache invalidation,
+ * inventory sync) rely on. The manual / checkout / waitlist paths leave it false
+ * because they already run those side effects themselves; passing true there
+ * would double-fire them.
+ *
+ * @param int    $bookingId        Booking ID.
+ * @param string $previousStatus   Booking status in the database immediately before confirming.
+ * @param bool   $fromDirectConfirm True for confirmations that bypassed updateStatus().
+ */
+function yatra_trigger_booking_confirmed(int $bookingId, string $previousStatus, bool $fromDirectConfirm = false): void
+{
+    if ($bookingId < 1 || $previousStatus === 'confirmed') {
+        return;
+    }
+
+    $repo = new \Yatra\Repositories\BookingRepository();
+    $booking = $repo->findWithTrip($bookingId);
+
+    if (!$booking || ($booking->status ?? '') !== 'confirmed') {
+        return;
+    }
+
+    if ($fromDirectConfirm) {
+        // Mirror BookingService::updateStatus(): send the confirmation email and
+        // fire the generic status-change action for status-based listeners. Only
+        // async/direct confirms reach here with true — the manual, checkout and
+        // waitlist paths fire these themselves, so this never double-fires.
+        (new \Yatra\Services\BookingService())->sendBookingConfirmedEmail($bookingId);
+        do_action('yatra_booking_status_changed', $bookingId, $previousStatus, 'confirmed');
+    }
+
+    /**
+     * Booking reached confirmed status (was not confirmed before this transition).
+     *
+     * @param int    $bookingId Booking ID.
+     * @param object $booking   Row from {@see \Yatra\Repositories\BookingRepository::findWithTrip()}.
+     */
+    do_action('yatra_booking_confirmed', $bookingId, $booking);
+}
+
+/**
+ * Fire `yatra_booking_cancelled` for a booking that has just been cancelled.
+ *
+ * The action is documented and listened to (Google Calendar removes its event,
+ * the Pro webhook `booking.cancelled` and the WhatsApp cancellation template are
+ * bound to it) but nothing in the plugin ever fired it: only Channel Manager's
+ * OTA ingest did, so an in-app cancellation reached none of those listeners.
+ *
+ * Call it from the specific transition sites — not from a global
+ * `yatra_booking_status_changed` listener — so the OTA path, which already
+ * fires this action itself, cannot double-fire.
+ *
+ * @param int    $bookingId      Booking ID.
+ * @param string $previousStatus Status before the transition.
+ */
+function yatra_trigger_booking_cancelled(int $bookingId, string $previousStatus): void
+{
+    if ($bookingId < 1 || $previousStatus === 'cancelled') {
+        return;
+    }
+
+    $repo = new \Yatra\Repositories\BookingRepository();
+    $booking = $repo->findWithTrip($bookingId);
+
+    // Only announce a cancellation that actually stuck.
+    if (!$booking || ($booking->status ?? '') !== 'cancelled') {
+        return;
+    }
+
+    /**
+     * Booking reached cancelled status (was not cancelled before this transition).
+     *
+     * @param int    $bookingId Booking ID.
+     * @param object $booking   Row from {@see \Yatra\Repositories\BookingRepository::findWithTrip()}.
+     */
+    do_action('yatra_booking_cancelled', $bookingId, $booking);
+}
+
+/**
+ * Resolve the "Auto-Confirm Bookings" mode.
+ *
+ * Modes:
+ *   - 'none'   — never auto-confirm; every booking stays pending for manual review.
+ *   - 'online' — auto-confirm only when a successful ONLINE gateway payment
+ *                (Stripe, PayPal, Razorpay, …) settles the balance in full.
+ *                Deposits / partial payments and offline methods (bank transfer,
+ *                pay-later) stay pending.
+ *   - 'all'    — auto-confirm every booking at checkout, paid or not.
+ *
+ * No migration is stored: the value is resolved on the fly. When the operator
+ * has never chosen a mode (no `yatra_auto_confirm_mode` option), we derive it
+ * from the legacy boolean `auto_confirm_bookings` so each site keeps its ACTUAL
+ * behaviour from the released (buggy) version:
+ *   - true  → 'all'    (it confirmed every booking at checkout)
+ *   - false → 'online' (online payments auto-confirmed anyway — that was the
+ *                        bug — while offline methods stayed pending)
+ * The first time the operator saves the setting, the chosen mode is stored and
+ * becomes authoritative. New installs default to 'online' (see the default in
+ * SettingsController / SettingsService).
+ *
+ * @return string One of: none | online | all.
+ */
+function yatra_get_auto_confirm_mode(): string
+{
+    $raw = get_option('yatra_auto_confirm_mode', null);
+    if (is_string($raw)) {
+        $mode = strtolower(trim($raw));
+        if (in_array($mode, ['none', 'online', 'all'], true)) {
+            return $mode;
+        }
+    }
+
+    // Never configured: preserve the site's experienced behaviour.
+    return \Yatra\Services\SettingsService::isEnabled('auto_confirm_bookings') ? 'all' : 'online';
+}
+
+/**
+ * How far ahead (in months) the storefront lets customers see and book dates.
+ *
+ * Reads `availability_horizon_months` (Settings → Booking). The default, 12, is
+ * the value that was hard-coded before it became configurable, so a site that
+ * never touches the setting behaves exactly as before. Anything outside 1–36
+ * falls back to 12 rather than blanking the calendar. Callers that pass their
+ * own explicit date range (REST `to_date`, the OTA inventory sync, admin
+ * previews) are not affected by this at all.
+ *
+ * Developers can adjust the horizon per request:
+ *
+ *   add_filter('yatra_availability_horizon_months', fn($m) => is_page('summer') ? 6 : $m);
+ *
+ * @return int Months, 1–36.
+ */
+function yatra_get_availability_horizon_months(): int
+{
+    $months = (int) \Yatra\Services\SettingsService::getInt('availability_horizon_months', 12);
+    if ($months < 1 || $months > 36) {
+        $months = 12;
+    }
+
+    /**
+     * Filter the storefront booking horizon.
+     *
+     * @param int $months Horizon in months (1–36).
+     */
+    $filtered = (int) apply_filters('yatra_availability_horizon_months', $months);
+
+    return ($filtered < 1 || $filtered > 36) ? $months : $filtered;
+}
+
+/**
+ * The last date (Y-m-d) the storefront offers: the start date plus the horizon.
+ *
+ * Mirrors the `date('Y-m-d', strtotime('+12 months'))` expression the callers
+ * used before, so with the default setting the result is byte-identical.
+ *
+ * @param string|null $fromDate Start date (Y-m-d). Defaults to today.
+ * @return string Y-m-d.
+ */
+function yatra_get_availability_horizon_date(?string $fromDate = null): string
+{
+    $base = ($fromDate !== null && $fromDate !== '' && strtotime($fromDate) !== false)
+        ? (int) strtotime($fromDate)
+        : time();
+    $ts = strtotime('+' . yatra_get_availability_horizon_months() . ' months', $base);
+
+    return date('Y-m-d', $ts !== false ? $ts : (int) strtotime('+12 months', $base));
+}
+
+/**
+ * Decide whether a successful payment should auto-confirm the booking.
+ *
+ * This runs on the ONLINE payment-completion path. It confirms when the
+ * "Auto-Confirm Bookings" mode is 'all', or when the mode is 'online' AND the
+ * payment settles the balance in full ($fullyPaid). Mode 'none' — and an
+ * 'online' deposit / partial payment — leaves the booking `pending`.
+ *
+ * The $fullyPaid flag is still passed to the `yatra_confirm_booking_on_payment`
+ * filter so an operator who wants the older "confirm once fully paid" behaviour
+ * can opt back in without touching core:
+ *
+ *   add_filter('yatra_confirm_booking_on_payment',
+ *       function ($shouldConfirm, $fullyPaid) { return $shouldConfirm || $fullyPaid; }, 10, 2);
+ *
+ * @param bool $fullyPaid Whether the booking's balance is now zero.
+ * @param int  $bookingId Booking ID (passed to the filter for context).
+ * @return bool True to set the booking to `confirmed`.
+ */
+function yatra_should_confirm_booking_on_payment(bool $fullyPaid, int $bookingId = 0): bool
+{
+    $mode = yatra_get_auto_confirm_mode();
+    //   'all'    -> always confirm on a successful payment.
+    //   'online' -> confirm only when the payment settles the balance in full;
+    //               a deposit / partial online payment leaves it pending until
+    //               the balance is paid.
+    //   'none'   -> never.
+    $shouldConfirm = ($mode === 'all') || ($mode === 'online' && $fullyPaid);
+    // Backward compatibility for the filter's 4th argument: since 3.0.10 it has
+    // been the old on/off toggle's value. The toggle maps on → 'all' and
+    // off → 'online', so only 'all' may report true here — a legacy-off site
+    // (now 'online') must keep handing existing callbacks `false`. Read the
+    // full mode with yatra_get_auto_confirm_mode() instead of this flag.
+    $autoConfirm = ($mode === 'all');
+
+    /**
+     * Filter whether a completed payment auto-confirms the booking.
+     *
+     * @param bool $shouldConfirm Default: true for mode 'all', or mode 'online' when $fullyPaid.
+     * @param bool $fullyPaid     Whether the balance is now zero.
+     * @param int  $bookingId     Booking ID.
+     * @param bool $autoConfirm   The old on/off toggle's value — true only for mode
+     *                            'all' (unchanged meaning for callbacks written
+     *                            against 3.0.10–3.0.14). Use yatra_get_auto_confirm_mode()
+     *                            to distinguish 'online' from 'none'.
+     */
+    return (bool) apply_filters('yatra_confirm_booking_on_payment', $shouldConfirm, $fullyPaid, $bookingId, $autoConfirm);
+}
+
+/**
+ * Determine whether a `yatra_payment_completed` payment settled the balance in
+ * full, from the raw action args.
+ *
+ * `yatra_payment_completed` fires with either an array payload carrying
+ * `booking_id`, or the ($bookingId, $gateway, $txnId, $array) signature — so we
+ * sniff the id out of the args, then read the booking's current `amount_due`.
+ * Uses the same `amount_due <= 0` test as the transactional payment email and
+ * the Email Automation event, so every channel agrees on partial vs full.
+ *
+ * @param array<int, mixed> $hookArgs Raw args the action passed.
+ * @return bool|null True = paid in full, false = partial/deposit, null = unknown.
+ */
+function yatra_payment_completed_is_full(array $hookArgs): ?bool
+{
+    $bookingId = 0;
+    foreach ($hookArgs as $a) {
+        if (is_array($a) && (int) ($a['booking_id'] ?? 0) > 0) {
+            $bookingId = (int) $a['booking_id'];
+            break;
+        }
+        if ($bookingId === 0 && is_numeric($a)) {
+            $bookingId = (int) $a;
+        }
+    }
+
+    if ($bookingId < 1) {
+        return null;
+    }
+
+    $booking = (new \Yatra\Repositories\BookingRepository())->find($bookingId);
+    if (!$booking) {
+        return null;
+    }
+
+    return (float) ($booking->amount_due ?? 0) <= 0;
+}
+
+/**
+ * Gate for the split payment events (`payment.received` = full,
+ * `payment.partial_received` = deposit) which both bind to
+ * `yatra_payment_completed`. Returns true when the given event should be
+ * delivered for this payment, so notification dispatchers (webhooks, WhatsApp)
+ * fire only the matching one. Non-payment events are never gated.
+ *
+ * @param array<int, mixed> $hookArgs Raw args the action passed.
+ */
+function yatra_payment_event_applies(string $eventKey, array $hookArgs): bool
+{
+    if ($eventKey !== 'payment.received' && $eventKey !== 'payment.partial_received') {
+        return true;
+    }
+
+    $isFull = yatra_payment_completed_is_full($hookArgs);
+    if ($isFull === null) {
+        // Can't determine the balance — deliver the "received" (full) event and
+        // suppress the partial one, matching the historical default.
+        $isFull = true;
+    }
+
+    return $eventKey === 'payment.received' ? $isFull : !$isFull;
+}
+
+/**
+ * ============================================
+ * REMAINING PAYMENT SESSION MANAGEMENT
+ * ============================================
+ */
+
+/**
+ * Set remaining payment session data
+ * 
+ * @param array $data Remaining payment data to store
+ */
+function yatra_set_remaining_session(array $data): void
+{
+    yatra_start_session();
+    
+    // Clear checkout session fully (including token + transient) before remaining-payment flow
+    yatra_clear_booking_session();
+    
+    $_SESSION['yatra_remaining'] = array_merge(
+        $data,
+        ['timestamp' => time()]
+    );
+    
+    // Ensure session data is written to storage immediately
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+}
+
+/**
+ * Get remaining payment session data
+ * 
+ * @param string|null $key Specific key to retrieve, or null for all data
+ * @param mixed $default Default value if key not found
+ * @return mixed
+ */
+function yatra_get_remaining_session(?string $key = null, $default = null)
+{
+    yatra_start_session();
+    
+    $remaining_data = $_SESSION['yatra_remaining'] ?? [];
+    
+    // Check if session is expired (30 minutes)
+    if (!empty($remaining_data['timestamp'])) {
+        $session_age = time() - $remaining_data['timestamp'];
+        if ($session_age > 1800) { // 30 minutes
+            yatra_clear_remaining_session();
+            return $key ? $default : [];
+        }
+    }
+    
+    if ($key === null) {
+        return $remaining_data;
+    }
+    
+    return $remaining_data[$key] ?? $default;
+}
+
+/**
+ * Clear remaining payment session data
+ */
+function yatra_clear_remaining_session(): void
+{
+    yatra_start_session();
+    unset($_SESSION['yatra_remaining']);
+}
+
+/**
+ * Check if remaining payment session exists and is valid
+ * 
+ * @return bool
+ */
+function yatra_has_remaining_session(): bool
+{
+    $remaining_data = yatra_get_remaining_session();
+    return !empty($remaining_data) && !empty($remaining_data['booking_id']);
+}
+
+/**
+ * Get the active checkout session type
+ * 
+ * @return string|null 'remaining' if remaining session exists, 'booking' if booking session exists, null if neither
+ */
+function yatra_get_checkout_session_type(): ?string
+{
+    if (yatra_has_remaining_session()) {
+        return 'remaining';
+    }
+    
+    if (yatra_has_booking_session()) {
+        return 'booking';
+    }
+    
+    return null;
+}
+
+/**
+ * Get the active checkout session data (remaining or booking)
+ * 
+ * @return array Session data with 'type' key indicating session type
+ */
+function yatra_get_active_checkout_session(): array
+{
+    if (yatra_has_remaining_session()) {
+        $data = yatra_get_remaining_session();
+        $data['session_type'] = 'remaining';
+        return $data;
+    }
+    
+    if (yatra_has_booking_session()) {
+        $data = yatra_get_booking_session();
+        $data['session_type'] = 'booking';
+        return $data;
+    }
+    
+    return [];
+}
+
+/**
+ * Get booking/checkout URL
+ * 
+ * Logic:
+ * 1. If custom booking page is set → return that page's URL
+ * 2. Otherwise → return dynamic URL using booking_base from settings (e.g., /bookings/)
+ * 
+ * @return string Booking URL
+ */
+function yatra_get_checkout_url(): string
+{
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    // Check if custom booking page is set via SettingsService
+    if (SettingsService::useCustomBookingPage()) {
+        $page_id = SettingsService::getBookingPageId();
+        if ($page_id > 0) {
+            return get_permalink($page_id);
+        }
+    }
+    
+    // Default dynamic URL using booking base from settings
+    $base = SettingsService::getBookingBase();
+    if ($is_plain) {
+        return add_query_arg(['yatra_page' => $base], home_url('/'));
+    }
+
+    return home_url('/' . $base . '/');
+}
+
+/**
+ * Front-end URL for booking confirmation for a given reference.
+ *
+ * Booking confirmation is pageless: Yatra serves it via rewrite rules and query vars,
+ * not a WordPress page permalink. Pretty URLs use /{booking_base}/confirmation/{reference}/.
+ * Plain permalinks use ?yatra_booking_confirmation={reference}.
+ *
+ * To use a real WordPress page as the base (advanced), filter {@see 'yatra_booking_confirmation_base_url'}.
+ * Legacy /booking-confirmation/{reference}/ remains registered in rewrites for old links.
+ *
+ * @param string $reference Booking reference segment (may be empty for base URL only).
+ * @return string Full URL.
+ */
+function yatra_get_booking_confirmation_url(string $reference = ''): string
+{
+    $reference = (string) $reference;
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        if ($reference === '') {
+            $url = home_url('/');
+        } else {
+            $url = add_query_arg('yatra_booking_confirmation', $reference, home_url('/'));
+        }
+    } else {
+        $booking_base = trim((string) SettingsService::getBookingBase(), '/');
+        if ($booking_base === '') {
+            $booking_base = 'book';
+        }
+        $confirmSeg = trim((string) SettingsService::getPermalinkBases()['booking_flow_confirmation_segment'], '/');
+        if ($confirmSeg === '') {
+            $confirmSeg = 'confirmation';
+        }
+        $virtual_base = home_url('/' . $booking_base . '/' . $confirmSeg . '/');
+
+        /**
+         * Override the base URL for booking confirmation (before the reference path segment).
+         * Return a non-empty string to use a custom base (e.g. get_permalink( $page_id )).
+         * Default null keeps the pageless virtual URL from Settings → booking base.
+         *
+         * @param string|null $base_url  Custom base, or null to use virtual URL.
+         * @param string      $reference Booking reference (may be empty).
+         */
+        $base_url = apply_filters('yatra_booking_confirmation_base_url', null, $reference);
+        if (!is_string($base_url) || $base_url === '') {
+            $base_url = $virtual_base;
+        }
+
+        if ($reference === '') {
+            $url = trailingslashit($base_url);
+        } else {
+            $url = trailingslashit($base_url) . $reference . '/';
+        }
+    }
+
+    /**
+     * Filter the booking confirmation URL.
+     *
+     * @param string $url       Built URL.
+     * @param string $reference Booking reference (may be empty).
+     */
+    return (string) apply_filters('yatra_booking_confirmation_url', $url, $reference);
+}
+
+/**
+ * Front-end URL to verify a customer email (checkout registration / account).
+ *
+ * Pretty permalinks: /yatra-verify-email/{token}/ (rewrite + query var).
+ * Plain permalinks: ?yatra_verify_email={token} on the home URL (same as {@see \Yatra\Core\Routing\PermalinkCanonical}).
+ *
+ * @param string $secure_token URL-safe token (base64-derived; only [A-Za-z0-9_-] used in the path/query).
+ */
+function yatra_get_email_verification_url(string $secure_token): string
+{
+    $t = preg_replace('/[^a-zA-Z0-9_-]/', '', (string) $secure_token) ?? '';
+    if ($t === '') {
+        return home_url('/');
+    }
+
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        $url = add_query_arg('yatra_verify_email', $t, home_url('/'));
+    } else {
+        $prefix = SettingsService::getPermalinkBases()['email_verification_prefix'];
+        $url = trailingslashit(home_url('/' . $prefix . '/' . $t . '/'));
+    }
+
+    /**
+     * Filter the customer email verification URL.
+     *
+     * @param string $url   Full verification URL.
+     * @param string $token Sanitized token segment.
+     */
+    return (string) apply_filters('yatra_email_verification_url', $url, $t);
+}
+
+/**
+ * ============================================
+ * ARCHIVE LISTING (plain permalinks pagination)
+ * ============================================
+ */
+
+/**
+ * Items per page from WordPress Reading settings ("Blog pages show at most").
+ * Used for Yatra front-end listings (trips, taxonomies, activity/destination/category archives).
+ *
+ * @return int At least 1.
+ */
+function yatra_get_posts_per_page(): int
+{
+    $n = absint((int) get_option('posts_per_page', 10));
+
+    return (int) apply_filters('yatra_posts_per_page', max(1, $n));
+}
+
+/**
+ * Current page number for Yatra archive templates (activity, destination, trip category).
+ * Handles plain URLs where WordPress may use {@see 'paged'} or {@see 'page'} on the front page.
+ */
+function yatra_get_archive_listing_paged(): int
+{
+    if (isset($_GET['paged']) && $_GET['paged'] !== '') {
+        return max(1, absint(wp_unslash($_GET['paged'])));
+    }
+
+    if (!empty($_GET['yatra_page']) && isset($_GET['page']) && $_GET['page'] !== '') {
+        return max(1, absint(wp_unslash($_GET['page'])));
+    }
+
+    $p = (int) get_query_var('paged');
+    if ($p > 0) {
+        return max(1, $p);
+    }
+
+    $p = (int) get_query_var('page');
+
+    return max(1, $p);
+}
+
+/**
+ * Result summary for destination / activity / trip-category browse pages (parity with trip grid header).
+ *
+ * @param string $items_label Plural noun, e.g. translated "destinations".
+ */
+function yatra_archive_browse_results_line(int $start, int $end, int $total, int $page, int $pages, string $items_label): string
+{
+    if ($total <= 0) {
+        return '';
+    }
+
+    return sprintf(
+        /* translators: 1–2: range, 3: total, 4: item type, 5–6: pagination */
+        __('Showing %1$d–%2$d of %3$d %4$s (page %5$d of %6$d)', 'yatra'),
+        $start,
+        $end,
+        $total,
+        $items_label,
+        $page,
+        $pages
+    );
+}
+
+/**
+ * Request path (leading slash, no query string) for same-page links. Strips /page/N/ pagination segments.
+ */
+function yatra_get_current_request_path_for_query_urls(): string
+{
+    $request_uri = isset($_SERVER['REQUEST_URI']) ? (string) wp_unslash($_SERVER['REQUEST_URI']) : '/';
+    $base_path = strtok($request_uri, '?') ?: '/';
+    $base_path = rtrim((string) $base_path, '/');
+    $base_path = preg_replace('#/page/[0-9]+#', '', $base_path);
+    $base_path = rtrim($base_path, '/');
+
+    if ($base_path === '') {
+        return '/';
+    }
+
+    return $base_path[0] === '/' ? $base_path : '/' . $base_path;
+}
+
+/**
+ * Full URL for the same archive request with a different page (preserves yatra_page and other args).
+ * Uses the current request path so /destination/, /activity/, /trip-category/ stay on the same listing.
+ */
+function yatra_build_archive_listing_url(int $page_num): string
+{
+    $params = !empty($_GET) && is_array($_GET) ? wp_unslash($_GET) : [];
+
+    $qvYatra = (string) get_query_var('yatra_page');
+    if ($qvYatra !== '' && (!isset($params['yatra_page']) || $params['yatra_page'] === '')) {
+        $params['yatra_page'] = $qvYatra;
+    }
+
+    if (!empty($params['yatra_page']) || isset($params['yatra_trip'])) {
+        unset($params['page']);
+    }
+
+    if ($page_num > 1) {
+        $params['paged'] = (string) $page_num;
+    } else {
+        unset($params['paged'], $params['page']);
+    }
+
+    $path = yatra_get_current_request_path_for_query_urls();
+    $query = http_build_query($params);
+
+    return esc_url($path . ($query !== '' ? '?' . $query : ''));
+}
+
+/**
+ * Same request path with a different paged query arg (strips an existing /page/N/ segment first).
+ * For taxonomy trip lists and other templates not rooted at home_url('/').
+ */
+function yatra_build_current_request_paged_url(int $page_num): string
+{
+    $page_num = max(1, $page_num);
+    $params = !empty($_GET) && is_array($_GET) ? wp_unslash($_GET) : [];
+
+    if ($page_num > 1) {
+        $params['paged'] = (string) $page_num;
+    } else {
+        unset($params['paged'], $params['page']);
+    }
+
+    $path = yatra_get_current_request_path_for_query_urls();
+    $query = http_build_query($params);
+
+    return esc_url($path . ($query !== '' ? '?' . $query : ''));
+}
+
+/**
+ * Same request path with trip sort (TripRepository / TripListingService). Resets pagination.
+ *
+ * @param string $sort Allowed: '' (recommended), most_popular, price_low, price_high, rating_high, duration_short, duration_long.
+ */
+function yatra_build_current_request_sort_url(string $sort): string
+{
+    $allowed = ['', 'most_popular', 'price_low', 'price_high', 'rating_high', 'duration_short', 'duration_long'];
+    if (!in_array($sort, $allowed, true)) {
+        $sort = '';
+    }
+
+    $params = !empty($_GET) && is_array($_GET) ? wp_unslash($_GET) : [];
+    unset($params['paged'], $params['page']);
+    if ($sort !== '') {
+        $params['sort'] = $sort;
+    } else {
+        unset($params['sort']);
+    }
+
+    $path = yatra_get_current_request_path_for_query_urls();
+    $query = http_build_query($params);
+
+    return esc_url($path . ($query !== '' ? '?' . $query : ''));
+}
+
+/**
+ * Compare two archive listing rows (activity, destination, or category) by sort key.
+ */
+function yatra_compare_archive_listing_row_pair(object $a, object $b, string $sort): int
+{
+    $nameA   = isset($a->name) ? strtolower((string) $a->name) : '';
+    $nameB   = isset($b->name) ? strtolower((string) $b->name) : '';
+    $tripsA  = isset($a->trips_count) ? (int) $a->trips_count : 0;
+    $tripsB  = isset($b->trips_count) ? (int) $b->trips_count : 0;
+    $ratingA = isset($a->avg_rating) ? (float) $a->avg_rating : 0.0;
+    $ratingB = isset($b->avg_rating) ? (float) $b->avg_rating : 0.0;
+
+    switch ($sort) {
+        case 'trips_desc':
+            return $tripsB <=> $tripsA;
+        case 'trips_asc':
+            return $tripsA <=> $tripsB;
+        case 'name_asc':
+            return $nameA <=> $nameB;
+        case 'name_desc':
+            return $nameB <=> $nameA;
+        case 'rating_desc':
+        default:
+            $cmp = $ratingB <=> $ratingA;
+            if (0 === $cmp) {
+                return $tripsB <=> $tripsA;
+            }
+
+            return $cmp;
+    }
+}
+
+/**
+ * Invokable comparator for {@see yatra_sort_archive_listing_stats_rows()}.
+ *
+ * @internal
+ */
+final class Yatra_Archive_Listing_Stats_Comparator
+{
+    /** @var string */
+    private $sort;
+
+    public function __construct(string $sort)
+    {
+        $this->sort = $sort;
+    }
+
+    /**
+     * @param object $a
+     * @param object $b
+     */
+    public function __invoke($a, $b): int
+    {
+        return yatra_compare_archive_listing_row_pair($a, $b, $this->sort);
+    }
+}
+
+/**
+ * Sort archive listing rows in place (stats objects from repository).
+ */
+function yatra_sort_archive_listing_stats_rows(array &$items, string $sort): void
+{
+    if (empty($items)) {
+        return;
+    }
+
+    usort($items, new Yatra_Archive_Listing_Stats_Comparator($sort));
+}
+
+/**
+ * Sort dropdown URL: same archive, page reset to 1, yatra_sort applied (preserves yatra_page etc.).
+ */
+function yatra_build_archive_listing_sort_url(string $yatra_sort): string
+{
+    $params = !empty($_GET) && is_array($_GET) ? wp_unslash($_GET) : [];
+    unset($params['paged'], $params['page']);
+    if (!empty($params['yatra_page']) || isset($params['yatra_trip'])) {
+        unset($params['page']);
+    }
+    $params['yatra_sort'] = $yatra_sort;
+
+    $path = yatra_get_current_request_path_for_query_urls();
+    $query = http_build_query($params);
+
+    return esc_url($path . ($query !== '' ? '?' . $query : ''));
+}
+
+/**
+ * ============================================
+ * PERMALINK HELPERS
+ * ============================================
+ */
+
+/**
+ * Get destination permalink
+ * 
+ * @param object|int $destination Destination object with slug property, or destination ID
+ * @return string Destination permalink URL
+ */
+function yatra_get_destination_permalink($destination): string
+{
+    $original = $destination;
+
+    if (is_numeric($destination)) {
+        global $wpdb;
+        $table = ClassificationsTable::getTableName();
+        $destination = $wpdb->get_row($wpdb->prepare(
+            "SELECT slug FROM {$table} WHERE id = %d AND type = %s",
+            (int) $destination,
+            ClassificationTypes::DESTINATION
+        ));
+    }
+
+    $slug = is_object($destination) ? ($destination->slug ?? '') : '';
+
+    if (empty($slug)) {
+        return '';
+    }
+
+    $base = SettingsService::getDestinationBase();
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        $key = preg_replace('/[^a-z0-9_-]/i', '', $base) ?: 'destination';
+
+        $url = add_query_arg([$key => $slug], home_url('/'));
+    } else {
+        $url = home_url('/' . $base . '/' . $slug . '/');
+    }
+
+    /** @var string $url Override full destination URL or path (plain/pretty handled above). Third arg: slug. */
+    return (string) apply_filters('yatra_destination_permalink', $url, $original, $slug);
+}
+
+/**
+ * Get activity permalink
+ * 
+ * @param object|int $activity Activity object with slug property, or activity ID
+ * @return string Activity permalink URL
+ */
+function yatra_get_activity_permalink($activity): string
+{
+    $original = $activity;
+
+    if (is_numeric($activity)) {
+        global $wpdb;
+        $table = ClassificationsTable::getTableName();
+        $activity = $wpdb->get_row($wpdb->prepare(
+            "SELECT slug FROM {$table} WHERE id = %d AND type = %s",
+            (int) $activity,
+            ClassificationTypes::ACTIVITY
+        ));
+    }
+
+    $slug = is_object($activity) ? ($activity->slug ?? '') : '';
+
+    if (empty($slug)) {
+        return '';
+    }
+
+    $base = SettingsService::getActivityBase();
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        $key = preg_replace('/[^a-z0-9_-]/i', '', $base) ?: 'activity';
+
+        $url = add_query_arg([$key => $slug], home_url('/'));
+    } else {
+        $url = home_url('/' . $base . '/' . $slug . '/');
+    }
+
+    /** @var string $url Override full activity URL. Third arg: slug. */
+    return (string) apply_filters('yatra_activity_permalink', $url, $original, $slug);
+}
+
+/**
+ * Get trip category permalink
+ * 
+ * @param object|int $category Category object with slug property, or category ID
+ * @return string Category permalink URL
+ */
+function yatra_get_category_permalink($category): string
+{
+    $original = $category;
+
+    if (is_numeric($category)) {
+        global $wpdb;
+        $table = ClassificationsTable::getTableName();
+        $category = $wpdb->get_row($wpdb->prepare(
+            "SELECT slug FROM {$table} WHERE id = %d AND type = %s",
+            (int) $category,
+            ClassificationTypes::CATEGORY
+        ));
+    }
+
+    $slug = is_object($category) ? ($category->slug ?? '') : '';
+
+    if (empty($slug)) {
+        return '';
+    }
+
+    $base = SettingsService::getTripCategoryBase();
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        $key = preg_replace('/[^a-z0-9_-]/i', '', $base) ?: 'trip-category';
+
+        $url = add_query_arg([$key => $slug], home_url('/'));
+    } else {
+        $url = home_url('/' . $base . '/' . $slug . '/');
+    }
+
+    /** @var string $url Override full trip-category URL. Third arg: slug. */
+    return (string) apply_filters('yatra_category_permalink', $url, $original, $slug);
+}
+
+/**
+ * Get trip permalink
+ * 
+ * @param object|int $trip Trip object with slug property, or trip ID
+ * @return string Trip permalink URL
+ */
+function yatra_get_trip_permalink($trip): string
+{
+    $original = $trip;
+
+    if (is_numeric($trip)) {
+        global $wpdb;
+        $table = TripsTable::getTableName();
+        $trip = $wpdb->get_row($wpdb->prepare(
+            "SELECT slug FROM {$table} WHERE id = %d",
+            (int) $trip
+        ));
+    }
+
+    $slug = is_object($trip) ? ($trip->slug ?? '') : '';
+
+    if (empty($slug)) {
+        return '';
+    }
+
+    $base = SettingsService::getTripBase();
+    $permalink_structure = get_option('permalink_structure');
+    $is_plain = empty($permalink_structure);
+
+    if ($is_plain) {
+        $key = preg_replace('/[^a-z0-9_-]/i', '', $base) ?: 'trip';
+
+        $url = add_query_arg([$key => $slug], home_url('/'));
+    } else {
+        $url = home_url('/' . $base . '/' . $slug . '/');
+    }
+
+    /** @var string $url Override full trip URL. Third arg: slug. */
+    return (string) apply_filters('yatra_trip_permalink', $url, $original, $slug);
+}
+
+/**
+ * Canonical URL for the trip archive / filter listing (respects Settings trip base).
+ * Plain permalinks use ?yatra_page={base}; pretty permalinks use /{base}/.
+ */
+function yatra_get_trip_listing_url(): string
+{
+    $base = SettingsService::getTripBase();
+    $base = preg_replace('/[^a-zA-Z0-9_-]/', '', (string) $base) ?: 'trip';
+    $permalink_structure = (string) get_option('permalink_structure', '');
+
+    if ($permalink_structure === '') {
+        $url = esc_url(add_query_arg('yatra_page', $base, home_url('/')));
+    } else {
+        $url = trailingslashit(home_url('/' . $base . '/'));
+    }
+
+    return (string) apply_filters('yatra_trip_listing_url', $url, $base);
+}
+
+/**
+ * Canonical URL for browse-all taxonomy listings (destinations, activities, trip categories).
+ * Plain permalinks use ?yatra_page={base}; pretty permalinks use /{base}/.
+ *
+ * @param string $listing_type One of: destination, activity, category
+ */
+function yatra_get_taxonomy_listing_url(string $listing_type): string
+{
+    $map = [
+        'destination' => SettingsService::getDestinationBase(),
+        'activity' => SettingsService::getActivityBase(),
+        'category' => SettingsService::getTripCategoryBase(),
+    ];
+    $base = $map[$listing_type] ?? '';
+    $base = preg_replace('/[^a-zA-Z0-9_-]/', '', (string) $base) ?: 'destination';
+    $permalink_structure = (string) get_option('permalink_structure', '');
+
+    if ($permalink_structure === '') {
+        $url = esc_url(add_query_arg('yatra_page', $base, home_url('/')));
+    } else {
+        $url = trailingslashit(home_url('/' . $base . '/'));
+    }
+
+    return (string) apply_filters('yatra_taxonomy_listing_url', $url, $listing_type, $base);
+}
+
+/**
+ * Decode trips.price_types for listing-card logic (DB may store JSON string or array).
+ *
+ * @return array<int, array<string, mixed>>
+ */
+function yatra_trip_listing_decode_price_types(object $trip): array
+{
+    $pts = $trip->price_types ?? null;
+    if (is_string($pts) && $pts !== '') {
+        $decoded = json_decode($pts, true);
+        $pts = is_array($decoded) ? $decoded : [];
+    } elseif (!is_array($pts)) {
+        $pts = [];
+    }
+    if ($pts === [] && method_exists($trip, 'getPriceTypes')) {
+        $got = $trip->getPriceTypes();
+        $pts = is_array($got) ? $got : [];
+    }
+
+    return $pts;
+}
+
+/**
+ * Lowercase keys for traveler tier labels (used to strip mis-tagged classifications).
+ *
+ * @return array<string, true>
+ */
+function yatra_trip_listing_traveler_tier_label_keys(object $trip): array
+{
+    if (($trip->pricing_type ?? '') !== 'traveler_based') {
+        return [];
+    }
+    $keys = [];
+    foreach (yatra_trip_listing_decode_price_types($trip) as $pt) {
+        if (!is_array($pt)) {
+            continue;
+        }
+        foreach (['label', 'category_label', 'title'] as $k) {
+            if (!empty($pt[$k]) && is_string($pt[$k])) {
+                $t = strtolower(trim($pt[$k]));
+                if ($t !== '') {
+                    $keys[$t] = true;
+                }
+                break;
+            }
+        }
+    }
+
+    return $keys;
+}
+
+/**
+ * Ordered unique labels for the listing card “Traveler types” row.
+ *
+ * @return list<string>
+ */
+function yatra_trip_listing_traveler_type_labels_for_card(object $trip): array
+{
+    if (($trip->pricing_type ?? '') !== 'traveler_based') {
+        return [];
+    }
+    $labels = [];
+    $seen = [];
+    foreach (yatra_trip_listing_decode_price_types($trip) as $pt) {
+        if (!is_array($pt)) {
+            continue;
+        }
+        foreach (['label', 'category_label', 'title'] as $k) {
+            if (!empty($pt[$k]) && is_string($pt[$k])) {
+                $lab = trim($pt[$k]);
+                if ($lab === '') {
+                    break;
+                }
+                $lk = strtolower($lab);
+                if (!isset($seen[$lk])) {
+                    $seen[$lk] = true;
+                    $labels[] = $lab;
+                }
+                break;
+            }
+        }
+    }
+
+    return $labels;
+}
+
+/**
+ * Format start → end for listing cards; avoids repeating the same country when both
+ * strings are "City, Country".
+ */
+function yatra_format_trip_listing_route_line(string $start, string $end): string
+{
+    $start = trim($start);
+    $end = trim($end);
+    if ($start === '') {
+        return $end;
+    }
+    if ($end === '') {
+        return $start;
+    }
+    if (strcasecmp($start, $end) === 0) {
+        return $start;
+    }
+    if (strpos($start, ',') !== false && strpos($end, ',') !== false) {
+        $s_parts = array_map('trim', explode(',', $start, 2));
+        $e_parts = array_map('trim', explode(',', $end, 2));
+        if (count($s_parts) === 2 && count($e_parts) === 2
+            && strcasecmp($s_parts[1], $e_parts[1]) === 0) {
+            return $s_parts[0] . ' → ' . $e_parts[0] . ', ' . $s_parts[1];
+        }
+    }
+
+    return $start . ' → ' . $end;
+}
+
+/**
+ * Human label for trip_type column (listing card meta).
+ */
+function yatra_trip_listing_trip_type_label(?string $trip_type): string
+{
+    $t = (string) $trip_type;
+    $map = [
+        'single_day' => __('Single day', 'yatra'),
+        'multi_day' => __('Multi-day', 'yatra'),
+        'flexible' => __('Flexible', 'yatra'),
+    ];
+
+    return $map[$t] ?? '';
+}
+
+/**
+ * Rating block for listing cards: prefers SQL aggregates (average_rating, review_count)
+ * when the hydrated reviews array is empty.
+ *
+ * @param array{has_rating: bool, average_rating: float, review_count: int, formatted_rating: string} $from_reviews
+ * @return array{has_rating: bool, average_rating: float, review_count: int, formatted_rating: string}
+ */
+function yatra_trip_listing_card_rating_data(object $trip, array $from_reviews): array
+{
+    $has = !empty($from_reviews['has_rating']);
+    $avg = (float) ($from_reviews['average_rating'] ?? 0);
+    $cnt = (int) ($from_reviews['review_count'] ?? 0);
+    $fmt = (string) ($from_reviews['formatted_rating'] ?? '0.0');
+
+    if ($cnt === 0 || !$has || $avg <= 0) {
+        $q_avg = isset($trip->average_rating) ? (float) $trip->average_rating : null;
+        $q_cnt = isset($trip->review_count) ? (int) $trip->review_count : null;
+        if (($q_cnt === null || $q_cnt === 0) && isset($trip->reviews_count)) {
+            $q_cnt = (int) $trip->reviews_count;
+        }
+        if ($q_cnt !== null && $q_cnt > 0 && $q_avg !== null && $q_avg > 0) {
+            $avg = round($q_avg, 1);
+            $cnt = $q_cnt;
+            $fmt = number_format($avg, 1);
+            $has = true;
+        }
+    }
+
+    return [
+        'has_rating' => $has && $avg > 0 && $cnt > 0,
+        'average_rating' => $avg,
+        'review_count' => $cnt,
+        'formatted_rating' => $fmt,
+    ];
+}
+
+/**
+ * Avoid repeating the same classification label in the destination, activity, and category
+ * rows on listing cards (traveler tier labels wrongly linked as classifications, or same
+ * term attached in multiple roles).
+ *
+ * @param array<int, object> $destinations
+ * @param array<int, object> $activities
+ * @param array<int, object> $categories
+ * @return array{0: array<int, object>, 1: array<int, object>, 2: array<int, object>}
+ */
+function yatra_trip_listing_filter_classification_duplicates(array $destinations, array $activities, array $categories, object $trip): array
+{
+    $tier_keys = yatra_trip_listing_traveler_tier_label_keys($trip);
+
+    $strip_tiers = static function (array $items) use ($tier_keys): array {
+        if ($tier_keys === []) {
+            return $items;
+        }
+
+        return array_values(array_filter($items, static function ($item) use ($tier_keys) {
+            $n = strtolower(trim((string) ($item->name ?? '')));
+
+            return $n === '' || !isset($tier_keys[$n]);
+        }));
+    };
+
+    $destinations = $strip_tiers($destinations);
+    $activities = $strip_tiers($activities);
+    $categories = $strip_tiers($categories);
+
+    $seen = [];
+    $dedupe = static function (array $items) use (&$seen): array {
+        $out = [];
+        foreach ($items as $item) {
+            $n = strtolower(trim((string) ($item->name ?? '')));
+            if ($n === '') {
+                $out[] = $item;
+                continue;
+            }
+            if (isset($seen[$n])) {
+                continue;
+            }
+            $seen[$n] = true;
+            $out[] = $item;
+        }
+
+        return $out;
+    };
+
+    $destinations = $dedupe($destinations);
+    $activities = $dedupe($activities);
+    $categories = $dedupe($categories);
+
+    return [$destinations, $activities, $categories];
+}
+
+/**
+ * Check if we're on a trip listing page
+ * 
+ * @return bool True if on a trip listing page
+ */
+function yatra_is_trip_listing(): bool
+{
+    global $yatra_trip_list;
+
+    // Check for trip list context (base trip listing page)
+    if (!empty($yatra_trip_list)) {
+        return true;
+    }
+
+    // Check if we're on the main trips listing page
+    $trip_base = SettingsService::getTripBase();
+    $request_uri = $_SERVER['REQUEST_URI'] ?? '';
+    $parsed_url = parse_url($request_uri, PHP_URL_PATH);
+    
+    if ($parsed_url && strpos($parsed_url, '/' . $trip_base) === 0) {
+        $path_parts = array_values(array_filter(explode('/', trim($parsed_url, '/'))));
+        if ($path_parts === [] || ($path_parts[0] ?? '') !== $trip_base) {
+            return false;
+        }
+        // /trip/ or /trip/page/2/ (WordPress paged archives)
+        if (count($path_parts) === 1) {
+            return true;
+        }
+        if (count($path_parts) === 3 && ($path_parts[1] ?? '') === 'page' && ctype_digit((string) ($path_parts[2] ?? ''))) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Check if we're on a taxonomy page (destination, activity, category)
+ * 
+ * @return bool True if on a taxonomy page
+ */
+function yatra_is_taxonomy_page(): bool
+{
+    global $yatra_taxonomy_data;
+    return !empty($yatra_taxonomy_data);
+}
+
+/**
+ * Check if we're on an activity listing page
+ * 
+ * @return bool True if on an activity listing page
+ */
+function yatra_is_activity_listing(): bool
+{
+    return isset($_GET['yatra_page_type']) && $_GET['yatra_page_type'] === 'activities';
+}
+
+/**
+ * Check if we're on a destination listing page
+ * 
+ * @return bool True if on a destination listing page
+ */
+function yatra_is_destination_listing(): bool
+{
+    return isset($_GET['yatra_page_type']) && $_GET['yatra_page_type'] === 'destinations';
+}
+
+/**
+ * Check if we're on an account page
+ * 
+ * @return bool True if on an account page
+ */
+function yatra_is_account_page(): bool
+{
+    if (!empty($GLOBALS['yatra_loading_react_account_page'])) {
+        return true;
+    }
+
+    if ((string) get_query_var('yatra_account_page') !== '') {
+        return true;
+    }
+
+    global $post;
+    if ($post && function_exists('has_shortcode') && isset($post->post_content)
+        && has_shortcode((string) $post->post_content, 'yatra_my_account')) {
+        return true;
+    }
+
+    if (!$post) {
+        return false;
+    }
+
+    $accountPageId = get_option('yatra_my_account_page');
+    return $accountPageId && (int) $post->ID === (int) $accountPageId;
+}
+
+/**
+ * Get difficulty level permalink
+ * 
+ * @param object|int $difficulty Difficulty object with slug property, or difficulty ID
+ * @return string Difficulty permalink URL
+ */
+function yatra_get_difficulty_permalink($difficulty): string
+{
+    if (is_numeric($difficulty)) {
+        global $wpdb;
+        $table = ClassificationsTable::getTableName();
+        $difficulty = $wpdb->get_row($wpdb->prepare(
+            "SELECT slug FROM {$table} WHERE id = %d AND type = %s",
+            (int) $difficulty,
+            ClassificationTypes::DIFFICULTY
+        ));
+    }
+    
+    $slug = is_object($difficulty) ? ($difficulty->slug ?? '') : '';
+    
+    if (empty($slug)) {
+        return '';
+    }
+    
+    $base = SettingsService::getString('difficulty_base', 'difficulty');
+    
+    return home_url('/' . $base . '/' . $slug . '/');
+}
+
+/**
+ * Load a template file with theme override support
+ *
+ * This function allows themes to override plugin templates by placing them in:
+ * theme/yatra/template-name.php
+ *
+ * If no theme override exists, loads from plugin templates directory.
+ *
+ * @param string $template_name Template file name (without .php extension)
+ * @param array  $args          Arguments to extract and make available in template
+ * @param string $template_path Template path within plugin (default: 'templates/')
+ * @param array  $data          Alternative data array (won't be extracted, available as $data)
+ * @return void
+ */
+function yatra_get_template(string $template_name, array $args = [], string $template_path = 'templates/', array $data = []): void
+{
+    $template_name = ltrim($template_name, '/');
+    
+    // Check if theme has override
+    $theme_template = locate_template([
+        'yatra/' . $template_name . '.php',
+        'yatra/' . $template_name
+    ]);
+    
+    if ($theme_template) {
+        // Load from theme
+        $template_file = $theme_template;
+    } else {
+        // Load from plugin
+        $template_file = YATRA_PLUGIN_PATH . ltrim($template_path, '/') . '/' . $template_name . '.php';
+    }
+    
+    // Extract arguments to make them available as individual variables
+    if (!empty($args)) {
+        extract($args);
+    }
+    
+    // Make data available as $data array (not extracted)
+    if (!empty($data)) {
+        $data = $data;
+    }
+    
+    // Include the template
+    if (file_exists($template_file)) {
+        include $template_file;
+    }
+}
+
+/**
+ * Enqueue single trip scripts and styles
+ *
+ * @return void
+ */
+function yatra_enqueue_single_trip_scripts(): void
+{
+    // Only enqueue on single trip pages
+    if (!is_single() || get_post_type() !== 'trip') {
+        return;
+    }
+    
+    // Enqueue the single trip JavaScript
+    wp_enqueue_script(
+        'yatra-single-trip',
+        YATRA_PLUGIN_URL . 'assets/js/single-trip.js',
+        ['jquery', 'yatra-trip'],
+        YATRA_VERSION,
+        true
+    );
+    
+    // Localize script data
+    global $trip;
+    if ($trip) {
+        wp_localize_script(
+            'yatra-single-trip',
+            'yatraSingleTripData',
+            [
+                'tripId' => (int) $trip->id,
+                'basePrice' => (float) ($trip->base_price ?? 0),
+                'currencySymbol' => yatra_get_currency_symbol(\Yatra\Services\SettingsService::getCurrency()),
+                'apiUrls' => [
+                    'groupDiscounts' => rest_url('yatra/v1/discounts/group-discounts')
+                ]
+            ]
+        );
+    }
+}
+
+/**
+ * Calculate base price for single trip display using CalculationService
+ * 
+ * @param object $trip Trip object
+ * @return array Pricing data including base_price, has_availability, has_traveler_pricing, pricing_type
+ */
+function yatra_single_trip_calculate_base_price($trip) {
+    // Check if availability dates exist (PRIORITY)
+    $has_availability = !empty($trip->availability_dates) && is_array($trip->availability_dates) && count($trip->availability_dates) > 0;
+    
+    // Determine pricing type from trip settings
+    $pricing_type = $trip->pricing_type ?? 'regular';
+    $has_traveler_pricing = ($pricing_type === 'traveler_based' && !empty($trip->price_types));
+    
+    // Use CalculationService for consistent pricing
+    $calculationService = new \Yatra\Services\CalculationService();
+    
+    // Determine base price using CalculationService logic
+    $trip_price = 0;
+    
+    if ($has_availability) {
+        // Page-load pricing priority (traveler-based):
+        // - If a default category is marked at trip-level, use that as the base price.
+        // - Otherwise fall back to lowest price across availability (legacy behavior).
+        $default_trip_price = 0.0;
+        if ($has_traveler_pricing && !empty($trip->price_types) && is_array($trip->price_types)) {
+            $default_price_type = null;
+            foreach ($trip->price_types as $pt) {
+                if (is_array($pt)) {
+                    $pt = (object) $pt;
+                }
+                if (!empty($pt->is_default)) {
+                    $default_price_type = $pt;
+                    break;
+                }
+            }
+            if ($default_price_type) {
+                $default_trip_price = (float) ($default_price_type->effective_price
+                    ?? $default_price_type->discounted_price
+                    ?? $default_price_type->original_price
+                    ?? 0);
+            }
+        }
+
+        if ($default_trip_price > 0) {
+            $trip_price = $default_trip_price;
+        } else {
+            // Get the lowest price from availability dates
+            $min_price = PHP_FLOAT_MAX;
+            foreach ($trip->availability_dates as $avail) {
+                $avail_price = $avail->effective_price ?? $avail->original_price ?? 0;
+                if ($avail_price > 0 && $avail_price < $min_price) {
+                    $min_price = $avail_price;
+                }
+
+                // Also check price_types within availability if traveler-based
+                if (!empty($avail->price_types) && is_array($avail->price_types)) {
+                    foreach ($avail->price_types as $pt) {
+                        $pt = (object)$pt;
+                        $pt_price = (float)($pt->effective_price ?? $pt->discounted_price ?? $pt->original_price ?? 0);
+                        if ($pt_price > 0 && $pt_price < $min_price) {
+                            $min_price = $pt_price;
+                        }
+                    }
+                }
+            }
+
+            // If no price found from availability, check traveler-based pricing
+            if ($min_price >= PHP_FLOAT_MAX && $has_traveler_pricing) {
+                foreach ($trip->price_types as $pt) {
+                    $pt = is_array($pt) ? (object) $pt : $pt;
+                    $pt_price = (float)($pt->effective_price ?? $pt->discounted_price ?? $pt->original_price ?? 0);
+                    if ($pt_price > 0 && $pt_price < $min_price) {
+                        $min_price = $pt_price;
+                    }
+                }
+            }
+
+            $trip_price = ($min_price < PHP_FLOAT_MAX) ? $min_price : ($trip->sale_price ?: $trip->original_price);
+        }
+    } elseif ($has_traveler_pricing) {
+        // Get default or first traveler category price
+        $default_price_type = null;
+        foreach ($trip->price_types as $pt) {
+            if (!empty($pt->is_default)) {
+                $default_price_type = $pt;
+                break;
+            }
+        }
+        if (!$default_price_type && !empty($trip->price_types)) {
+            $default_price_type = $trip->price_types[0];
+        }
+
+        // Get the price from the price type - check multiple possible fields
+        if ($default_price_type) {
+            $trip_price = 0;
+            // Try effective_price first, then discounted_price, then original_price
+            if (!empty($default_price_type->effective_price) && $default_price_type->effective_price > 0) {
+                $trip_price = (float)$default_price_type->effective_price;
+            } elseif (!empty($default_price_type->discounted_price) && $default_price_type->discounted_price > 0) {
+                $trip_price = (float)$default_price_type->discounted_price;
+            } elseif (!empty($default_price_type->original_price) && $default_price_type->original_price > 0) {
+                $trip_price = (float)$default_price_type->original_price;
+            } elseif (!empty($default_price_type->sale_price) && $default_price_type->sale_price > 0) {
+                $trip_price = (float)$default_price_type->sale_price;
+            }
+
+            // If still no price, try to get the minimum from all price types
+            if ($trip_price <= 0) {
+                foreach ($trip->price_types as $pt) {
+                    $pt_price = (float)($pt->effective_price ?? $pt->discounted_price ?? $pt->original_price ?? 0);
+                    if ($pt_price > 0 && ($trip_price <= 0 || $pt_price < $trip_price)) {
+                        $trip_price = $pt_price;
+                    }
+                }
+            }
+        } else {
+            $trip_price = $trip->sale_price ?: $trip->original_price;
+        }
+    } else {
+        // Regular pricing
+        $trip_price = $trip->sale_price > 0 ? $trip->sale_price : $trip->original_price;
+    }
+
+    // Apply CalculationService filter for dynamic pricing (pro plugins)
+    $base_price = apply_filters('yatra_calculate_base_amount', $trip_price, [
+        'trip_price' => $trip_price,
+        'travelers_count' => 1,
+        'traveler_counts' => ['default' => 1],
+        'pricing_type' => $pricing_type,
+        'price_types' => $trip->price_types ?? [],
+        'trip_id' => $trip->id ?? 0
+    ]);
+
+    return [
+        'base_price' => $base_price,
+        'has_availability' => $has_availability,
+        'has_traveler_pricing' => $has_traveler_pricing,
+        'pricing_type' => $pricing_type
+    ];
+}
+
+/**
+ * Get group discounts data for single trip
+ * 
+ * @param int $trip_id Trip ID
+ * @return array Group discounts data including has_group_discounts and group_discounts_data
+ */
+function yatra_single_trip_get_group_discounts($trip_id) {
+    $has_group_discounts = false;
+    $group_discounts_data = [];
+    $trip_id = (int) $trip_id;
+
+    if ($trip_id <= 0) {
+        return [
+            'has_group_discounts' => false,
+            'group_discounts_data' => [],
+        ];
+    }
+
+    try {
+        // Direct controller path avoids rest_do_request / loopback issues on single-trip templates.
+        if (class_exists(\Yatra\Controllers\DiscountController::class)) {
+            $ctrl = new \Yatra\Controllers\DiscountController();
+            $payload = $ctrl->getPublicGroupDiscountDiscoverabilityForTrip($trip_id);
+            $discounts = isset($payload['discounts']) && is_array($payload['discounts']) ? $payload['discounts'] : [];
+            if (!empty($payload['has_group_discounts']) && $discounts !== []) {
+                return [
+                    'has_group_discounts' => true,
+                    'group_discounts_data' => $discounts,
+                ];
+            }
+        }
+
+        $row = null;
+
+        // Fallback: internal REST then HTTP (e.g. if controller unavailable).
+        if (class_exists('\WP_REST_Request') && function_exists('rest_do_request')) {
+            $request = new \WP_REST_Request('GET', '/yatra/v1/discounts/group-discounts');
+            $request->set_param('trip_ids', [$trip_id]);
+            $rest_response = rest_do_request($request);
+            if ($rest_response instanceof \WP_REST_Response && $rest_response->get_status() === 200) {
+                $row = yatra_single_trip_parse_group_discounts_payload($rest_response->get_data(), $trip_id);
+            }
+        }
+
+        if (!is_array($row)) {
+            $api_url = add_query_arg(
+                ['trip_ids' => [$trip_id]],
+                rest_url('yatra/v1/discounts/group-discounts')
+            );
+            $response = wp_remote_get($api_url, [
+                'timeout' => 6,
+                'headers' => [
+                    'Accept' => 'application/json',
+                ],
+            ]);
+
+            if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+                $data = json_decode(wp_remote_retrieve_body($response), true);
+                $row = yatra_single_trip_parse_group_discounts_payload($data, $trip_id);
+            }
+        }
+
+        if (is_array($row) && !empty($row['has_group_discounts']) && !empty($row['discounts']) && is_array($row['discounts'])) {
+            $has_group_discounts = true;
+            $group_discounts_data = $row['discounts'];
+        }
+    } catch (Exception $e) {
+        $has_group_discounts = false;
+    }
+
+    return [
+        'has_group_discounts' => $has_group_discounts,
+        'group_discounts_data' => $group_discounts_data,
+    ];
+}
+
+/**
+ * Extract the per-trip object from a group-discounts REST payload (handles optional wrappers).
+ *
+ * @param mixed $data
+ * @return array<string, mixed>|null
+ */
+function yatra_single_trip_parse_group_discounts_payload($data, int $trip_id): ?array {
+    if (!is_array($data)) {
+        return null;
+    }
+    if (isset($data['data']) && is_array($data['data'])) {
+        $data = $data['data'];
+    }
+    $keyStr = (string) $trip_id;
+    $row = $data[$trip_id] ?? $data[$keyStr] ?? null;
+
+    return is_array($row) ? $row : null;
+}
+
+/**
+ * Payload for single-trip booking UI JS (sidebar date/traveler pricing + group tiers).
+ * Kept in yatraTripData instead of large HTML data-* attributes on .yatra-booking-card.
+ *
+ * @param object $trip Trip model
+ * @return array{pricingType: string, sidebarAvailability: array<int, array<string, mixed>>, sidebarGroupDiscounts: array<int, array<string, mixed>>}
+ */
+function yatra_single_trip_get_client_booking_payload($trip): array {
+    $empty = [
+        'pricingType' => 'regular',
+        'sidebarAvailability' => [],
+        'sidebarGroupDiscounts' => [],
+    ];
+
+    if (!is_object($trip) || empty($trip->id)) {
+        return $empty;
+    }
+
+    $pricing_data = function_exists('yatra_single_trip_calculate_base_price')
+        ? yatra_single_trip_calculate_base_price($trip)
+        : ['has_availability' => false, 'pricing_type' => $trip->pricing_type ?? 'regular'];
+
+    $pricing_type = (string) ($pricing_data['pricing_type'] ?? ($trip->pricing_type ?? 'regular'));
+    $has_availability = !empty($pricing_data['has_availability']);
+
+    $availability = [];
+    if ($has_availability && method_exists($trip, 'getAvailabilityDates')) {
+        foreach ($trip->getAvailabilityDates() as $avail) {
+            if (!is_object($avail)) {
+                continue;
+            }
+            $price_types_raw = !empty($avail->price_types) && is_array($avail->price_types) ? $avail->price_types : [];
+            $price_types = [];
+            foreach ($price_types_raw as $pt) {
+                if (is_object($pt)) {
+                    $decoded = json_decode(wp_json_encode($pt), true);
+                    $price_types[] = is_array($decoded) ? $decoded : [];
+                } elseif (is_array($pt)) {
+                    $price_types[] = $pt;
+                }
+            }
+
+            $availability[] = [
+                'id' => (int) ($avail->id ?? 0),
+                'date' => $avail->departure_date ?? '',
+                'departure_date' => $avail->departure_date ?? '',
+                'return_date' => (isset($avail->return_date) && $avail->return_date !== '')
+                    ? $avail->return_date
+                    : (isset($avail->arrival_date) ? $avail->arrival_date : null),
+                'price' => $avail->effective_price ?? $avail->original_price ?? 0,
+                'original_price' => $avail->original_price ?? 0,
+                'discounted_price' => $avail->discounted_price ?? null,
+                'seats_available' => $avail->seats_available ?? 0,
+                'seats_total' => $avail->seats_total ?? 0,
+                'status' => $avail->status ?? '',
+                'is_limited' => (bool) ($avail->is_limited ?? false),
+                'is_sold_out' => (bool) ($avail->is_sold_out ?? false),
+                'pricing_type' => $price_types !== [] ? 'traveler_based' : $pricing_type,
+                'price_types' => $price_types,
+            ];
+        }
+    }
+
+    $sidebar_group_discounts = [];
+    if (function_exists('yatra_single_trip_get_group_discounts')) {
+        $gd = yatra_single_trip_get_group_discounts((int) $trip->id);
+        $cards = isset($gd['group_discounts_data']) && is_array($gd['group_discounts_data'])
+            ? $gd['group_discounts_data']
+            : [];
+        $sidebar_group_discounts = apply_filters('yatra_advanced_discount_enabled', false) ? $cards : [];
+        $sidebar_group_discounts = array_values(array_map(static function ($row) {
+            if (is_object($row)) {
+                $decoded = json_decode(wp_json_encode($row), true);
+
+                return is_array($decoded) ? $decoded : [];
+            }
+
+            return $row;
+        }, $sidebar_group_discounts));
+    }
+
+    return [
+        'pricingType' => $pricing_type,
+        'sidebarAvailability' => $availability,
+        'sidebarGroupDiscounts' => $sidebar_group_discounts,
+    ];
+}
+
+// Hook into WordPress enqueue system
+add_action('wp_enqueue_scripts', 'yatra_enqueue_single_trip_scripts');
+
+// Yatra page type detection functions
+if (!function_exists('yatra_is_trip_page')) {
+    function yatra_is_trip_page() {
+        global $trip;
+        return isset($trip) && !empty($trip);
+    }
+}
+
+if (!function_exists('yatra_is_destination_page')) {
+    function yatra_is_destination_page() {
+        global $destination, $yatra_taxonomy_data;
+        
+        // Check direct global first
+        if (isset($destination) && !empty($destination)) {
+            return true;
+        }
+        
+        // Check taxonomy data
+        if (isset($yatra_taxonomy_data) && !empty($yatra_taxonomy_data) && $yatra_taxonomy_data->type === 'destination') {
+            return true;
+        }
+        
+        return false;
+    }
+}
+
+if (!function_exists('yatra_is_activity_page')) {
+    function yatra_is_activity_page() {
+        global $activity, $yatra_taxonomy_data;
+        
+        // Check direct global first
+        if (isset($activity) && !empty($activity)) {
+            return true;
+        }
+        
+        // Check taxonomy data
+        if (isset($yatra_taxonomy_data) && !empty($yatra_taxonomy_data) && $yatra_taxonomy_data->type === 'activity') {
+            return true;
+        }
+        
+        return false;
+    }
+}
+
+if (!function_exists('yatra_is_category_page')) {
+    function yatra_is_category_page() {
+        global $category, $yatra_taxonomy_data;
+        
+        // Check direct global first
+        if (isset($category) && !empty($category)) {
+            return true;
+        }
+        
+        // Check taxonomy data
+        if (isset($yatra_taxonomy_data) && !empty($yatra_taxonomy_data) && $yatra_taxonomy_data->type === 'category') {
+            return true;
+        }
+        
+        return false;
+    }
+}
+
+if (!function_exists('yatra_is_trip_archive_page')) {
+    function yatra_is_trip_archive_page() {
+        $current_url = $_SERVER['REQUEST_URI'] ?? '';
+        $current_path = parse_url($current_url, PHP_URL_PATH) ?? '';
+        $trip_base = \Yatra\Services\SettingsService::getTripBase();
+        
+        // Check for both /trip/ and /trip patterns
+        $pattern1 = '/' . $trip_base . '/';
+        $pattern2 = '/' . $trip_base;
+        
+        return (strpos($current_path, $pattern1) !== false || $current_path === $pattern2) && !yatra_is_trip_page();
+    }
+}
+
+// Yatra only has trip archive pages - no destination/activity/category archive pages
+
+if (!function_exists('yatra_is_listing_page')) {
+    function yatra_is_listing_page() {
+        $current_url = $_SERVER['REQUEST_URI'] ?? '';
+        $current_path = parse_url($current_url, PHP_URL_PATH) ?? '';
+        return strpos($current_path, '/listing-') !== false;
+    }
+}
+
+if (!function_exists('yatra_is_yatra_page')) {
+    function yatra_is_yatra_page() {
+        return yatra_is_trip_page() || 
+               yatra_is_destination_page() || 
+               yatra_is_activity_page() || 
+               yatra_is_category_page() ||
+               yatra_is_trip_archive_page() || 
+               yatra_is_listing_page();
+    }
+}
+
+if ( ! function_exists( 'yatra_get_header' ) ) {
+    
+function yatra_get_header( $header_name = null ) {
+    global $wp_version;
+
+    // When the template is being rendered as the body of the yatra/page-content
+    // server block inside a block-template canvas, the canvas already emits the
+    // doctype/html/head/body and the site header template part. Re-emitting them
+    // here would nest <html>/<body> and duplicate the header — so we no-op.
+    if (
+        class_exists( '\\Yatra\\Core\\Template\\FseTemplates' )
+        && \Yatra\Core\Template\FseTemplates::isRenderingInsideCanvas()
+    ) {
+        return;
+    }
+
+    if (
+        version_compare( $wp_version, '5.9', '>=' ) &&
+        function_exists( 'wp_is_block_theme' ) &&
+        wp_is_block_theme()
+    ) {
+        /*
+         * Full-site editing themes often omit add_theme_support( 'title-tag' ); the document title is
+         * injected via template canvas using _block_template_render_title_tag (unconditional). Yatra
+         * renders this minimal head instead of canvas, so _wp_render_title_tag would no-op and the
+         * page would have no <title>. Mirror canvas: print title here and drop duplicate core hooks.
+         */
+        remove_action( 'wp_head', '_wp_render_title_tag', 1 );
+        remove_action( 'wp_head', '_block_template_render_title_tag', 1 );
+        ?>
+        <!doctype html>
+            <html <?php language_attributes(); ?>>
+            <head>
+                <meta charset="<?php bloginfo( 'charset' ); ?>">
+                <title><?php echo esc_html( wp_get_document_title() ); ?></title>
+                <?php wp_head(); ?>
+            </head>
+
+            <body <?php body_class(); ?>>
+            <?php wp_body_open(); ?>
+                <div class="wp-site-blocks">
+                    <header class="wp-block-template-part site-header">
+                        <?php block_header_area(); ?>
+                    </header>
+        <?php
+    } else {
+        get_header( $header_name );
+    }
+}
+}
+
+if ( ! function_exists( 'yatra_block_support_styles' ) ) {
+    function yatra_block_support_styles() {
+        // Bail early if function does not exists.
+        if ( ! function_exists( 'wp_style_engine_get_stylesheet_from_context' ) ) {
+            return;
+        }
+
+        $core_styles_keys         = array( 'block-supports' );
+
+        $compiled_core_stylesheet = '';
+
+        foreach ( $core_styles_keys as $style_key ) {
+            $compiled_core_stylesheet .= wp_style_engine_get_stylesheet_from_context( $style_key, array() );
+        }
+
+        if ( empty( $compiled_core_stylesheet ) ) {
+            return;
+        }
+
+        wp_register_style( 'yatra-block-supports', false );
+        wp_enqueue_style( 'yatra-block-supports' );
+        wp_add_inline_style( 'yatra-block-supports', $compiled_core_stylesheet );
+    }
+}
+
+if ( ! function_exists( 'yatra_get_footer' ) ) {
+
+	function yatra_get_footer( $footer_name = null ) {
+		global $wp_version;
+
+		// Mirror of yatra_get_header(): when rendered inside the FSE canvas via
+		// the yatra/page-content block, the canvas already emits the footer
+		// template part and closes <body>/<html>. No-op here to avoid duplicates.
+		if (
+			class_exists( '\\Yatra\\Core\\Template\\FseTemplates' )
+			&& \Yatra\Core\Template\FseTemplates::isRenderingInsideCanvas()
+		) {
+			return;
+		}
+
+		if (
+			version_compare( $wp_version, '5.9', '>=' ) &&
+			function_exists( 'wp_is_block_theme' ) &&
+			wp_is_block_theme()
+		) {
+			?>
+			<footer class="wp-block-template-part site-footer">
+			<?php block_footer_area(); ?>
+			</footer>
+			</div>
+            <?php yatra_block_support_styles(); ?>
+			<?php wp_footer(); ?>
+			</body>
+			</html>
+			<?php
+		} else {
+			get_footer( $footer_name );
+		}
+	}
+}
+
+/**
+ * Render tab icon (supports both SVG icons and images)
+ * 
+ * @param mixed $icon_data Icon data (string, array, or object)
+ * @param string $default_icon Default icon name
+ * @param string $css_class CSS class for the icon
+ * @param string $label Label for alt text
+ * @return void Echoes the icon HTML
+ */
+if (!function_exists('yatra_render_tab_icon')) {
+    function yatra_render_tab_icon($icon_data, $default_icon = 'book', $css_class = '', $label = '') {
+        if (empty($icon_data)) {
+            echo function_exists('yatra_svg_icon') ? yatra_svg_icon($default_icon, $css_class) : '';
+
+            return;
+        }
+        if (is_string($icon_data) && strpos($icon_data, '{') === 0) {
+            $icon_data = json_decode($icon_data, true);
+        }
+        if (is_object($icon_data)) {
+            $icon_data = (array) $icon_data;
+        }
+        if (is_array($icon_data) && isset($icon_data['type']) && $icon_data['type'] === 'image' && !empty($icon_data['value'])) {
+            $image_url = is_numeric($icon_data['value'])
+                ? wp_get_attachment_url((int) $icon_data['value'])
+                : $icon_data['value'];
+            if ($image_url) {
+                $size_style = strpos($css_class, 'sticky-nav') !== false ? 'width: 18px; height: 18px;' : 'width: 24px; height: 24px;';
+                echo '<img src="' . esc_url($image_url) . '" alt="' . esc_attr($label) . '" class="' . esc_attr($css_class) . '" style="' . esc_attr($size_style) . ' object-fit: cover; border-radius: 4px;">';
+
+                return;
+            }
+        }
+        // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- markup built from sanitized picker / SVG registry
+        echo yatra_stored_picker_icon_markup($icon_data, $default_icon, $css_class);
+    }
+}
+
+if (!function_exists('yatra_listing_sidebar_filter_visible_cap')) {
+    /**
+     * How many sidebar checkbox rows to show before "Show more" on the trip listing.
+     *
+     * Filter: {@see 'yatra_listing_sidebar_filter_visible_count'} — default 8, clamped 3–40.
+     *
+     * @return int
+     */
+    function yatra_listing_sidebar_filter_visible_cap(): int
+    {
+        $n = (int) apply_filters('yatra_listing_sidebar_filter_visible_count', 8);
+
+        return max(3, min(40, $n));
+    }
+}
+
+if (!function_exists('yatra_wishlist_enabled')) {
+    /**
+     * Whether wishlist UI and REST should be active (Yatra Pro + setting).
+     */
+    function yatra_wishlist_enabled(): bool
+    {
+        return \Yatra\Services\SettingsService::wishlistEnabled();
+    }
+}
+
+if (!function_exists('yatra_usage_track_event')) {
+    /**
+     * Record an anonymous product telemetry event (requires opt-in).
+     *
+     * @param string $event Event key (sanitized).
+     * @param int    $delta Counter increment.
+     */
+    function yatra_usage_track_event(string $event, int $delta = 1): void
+    {
+        if (!class_exists(\Yatra\Services\StatsUsage::class)) {
+            return;
+        }
+        \Yatra\Services\StatsUsage::instance()->record_event($event, $delta);
+    }
+}

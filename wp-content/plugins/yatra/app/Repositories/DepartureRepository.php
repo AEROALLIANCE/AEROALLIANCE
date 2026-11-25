@@ -1,0 +1,878 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Repositories;
+
+use Yatra\Models\Departure;
+use Yatra\Database\Tables\DeparturesTable;
+
+/**
+ * Departure Repository
+ * Handles database operations for trip departures
+ * 
+ * Table: wp_yatra_trip_departures
+ * 
+ * Fields:
+ * - id (primary key)
+ * - trip_id
+ * - date (YYYY-MM-DD)
+ * - time (HH:MM:SS, nullable)
+ * - max_capacity
+ * - booked_count
+ * - status (upcoming|full|past|cancelled)
+ * - source (manual|recurring_generated)
+ * - price_override (nullable)
+ * - price_by_traveler_type (JSON)
+ * - notes (nullable)
+ * - created_at
+ * - updated_at
+ */
+class DepartureRepository extends BaseRepository
+{
+    /**
+     * Get table name
+     */
+    protected function getTableName(): string
+    {
+        return DeparturesTable::getTableName();
+    }
+
+    /**
+     * Find by ID
+     */
+    public function find(int $id, bool $includeDeleted = false): ?\stdClass
+    {
+        $result = parent::find($id, $includeDeleted);
+        return $result ? (object) Departure::fromArray((array) $result)->toArray() : null;
+    }
+
+    /**
+     * Find by ID and return Departure model
+     */
+    public function findModel(int $id): ?Departure
+    {
+        $result = parent::find($id);
+        return $result ? Departure::fromArray((array) $result) : null;
+    }
+
+    /**
+     * Find a departure by trip, start date (or date), and optional time
+     */
+    public function findByTripIdAndStartDate(int $tripId, string $date, ?string $time = null): ?Departure
+    {
+        $table = esc_sql($this->table);
+        $where = ['trip_id = %d'];
+        $params = [$tripId];
+
+        // prefer start_date if exists, else fall back to date column
+        $columns = $this->wpdb->get_col("DESCRIBE {$table}");
+        $hasStartDate = in_array('start_date', $columns, true);
+
+        if ($hasStartDate) {
+            $where[] = '((start_date IS NOT NULL AND start_date = %s) OR (start_date IS NULL AND date = %s))';
+            $params[] = $date;
+            $params[] = $date;
+        } else {
+            $where[] = 'date = %s';
+            $params[] = $date;
+        }
+
+        if ($time !== null && $time !== '') {
+            $where[] = 'time = %s';
+            $params[] = $time;
+        }
+
+        $query = "SELECT * FROM {$table} WHERE " . implode(' AND ', $where) . " LIMIT 1";
+        $row = $this->wpdb->get_row($this->wpdb->prepare($query, ...$params), ARRAY_A);
+
+        return $row ? Departure::fromArray($row) : null;
+    }
+
+    /**
+     * Find all departures across all trips
+     * 
+     * @param array $filters Filters: status, date_from, date_to, source
+     * @return array Array of Departure models
+     */
+    public function findAll(array $filters = []): array
+    {
+        $table = esc_sql($this->table);
+        [$where, $params] = $this->whereForAll($filters);
+
+        $query = "SELECT * FROM `{$table}` WHERE " . implode(' AND ', $where);
+        // id as a final tiebreaker: rows sharing a date + time would otherwise
+        // have no stable order, so a paginated list could repeat or skip them
+        // across pages.
+        $query .= " ORDER BY date ASC, time ASC, id ASC";
+
+        if (!empty($filters['per_page'])) {
+            $perPage = (int) $filters['per_page'];
+            $page = max(1, (int) ($filters['page'] ?? 1));
+            $offset = ($page - 1) * $perPage;
+            $query .= " LIMIT %d OFFSET %d";
+            $params[] = $perPage;
+            $params[] = $offset;
+        }
+
+        // Every dynamic value in this query goes through $params, so with no
+        // filters applied the SQL carries no placeholders at all — and calling
+        // prepare() on a placeholder-free query is what WordPress warns about
+        // ("The query argument of wpdb::prepare() must have a placeholder").
+        // Only prepare when there is something to bind.
+        $results = empty($params)
+            ? $this->wpdb->get_results($query, ARRAY_A)
+            : $this->wpdb->get_results($this->wpdb->prepare($query, ...$params), ARRAY_A);
+
+        return array_map(function ($row) {
+            return Departure::fromArray($row);
+        }, $results ?: []);
+    }
+
+    /**
+     * Count departures across all trips matching the SAME filters as findAll()
+     * (page / per_page are ignored). This is the true total behind a paginated
+     * list — sharing whereForAll() means the count can never drift from the
+     * rows findAll() returns.
+     *
+     * @param array $filters Same filters as findAll().
+     */
+    public function countAll(array $filters = []): int
+    {
+        $table = esc_sql($this->table);
+        [$where, $params] = $this->whereForAll($filters);
+
+        $query = "SELECT COUNT(*) FROM `{$table}` WHERE " . implode(' AND ', $where);
+
+        // Same prepare guard as findAll(): no placeholders when nothing is bound.
+        return (int) (empty($params)
+            ? $this->wpdb->get_var($query)
+            : $this->wpdb->get_var($this->wpdb->prepare($query, ...$params)));
+    }
+
+    /**
+     * WHERE fragments + prepare params shared by findAll() and countAll(), so
+     * the list and its total are always built from identical conditions.
+     *
+     * @param array $filters Filters: status, availability, date_from, date_to,
+     *                       source, include_past, past_only.
+     * @return array{0: string[], 1: array}
+     */
+    private function whereForAll(array $filters): array
+    {
+        $where = ['1=1']; // Always true for base condition
+        $params = [];
+        
+        // Status filter. 'past' is date-derived (see Departure::calculateStatus),
+        // NOT the stored status column — that column is only kept current by the
+        // daily cron, so filtering status = 'past' hid every departure that had
+        // taken place whenever the cron had not run. Match 'past' by date instead;
+        // all other statuses (upcoming/full/cancelled/trash) use the stored value.
+        $statusIsPast = (!empty($filters['status']) && $filters['status'] === 'past');
+        if (!empty($filters['status']) && $filters['status'] !== 'all') {
+            if ($statusIsPast) {
+                $where[] = "(
+                    (end_date IS NOT NULL AND end_date < CURDATE())
+                    OR (end_date IS NULL AND start_date IS NOT NULL AND start_date < CURDATE())
+                    OR (end_date IS NULL AND start_date IS NULL AND date < CURDATE())
+                )";
+            } else {
+                $this->applyStatusClause((string) $filters['status'], $where, $params);
+            }
+        }
+
+        // Independent capacity filter (see applyAvailabilityClause).
+        $this->applyAvailabilityClause($filters, $where);
+
+        // Free-text search on date / notes (see applySearchClause).
+        $this->applySearchClause($filters, $where, $params);
+
+        // Date range filter - simple approach
+        if (isset($filters['date_from']) && is_string($filters['date_from']) && trim($filters['date_from']) !== '') {
+            $dateFrom = trim($filters['date_from']);
+            // Validate date format AND that it's a real date
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom) && strtotime($dateFrom) !== false) {
+                $where[] = 'date >= %s';
+                $params[] = $dateFrom;
+            }
+        }
+        
+        if (isset($filters['date_to']) && is_string($filters['date_to']) && trim($filters['date_to']) !== '') {
+            $dateTo = trim($filters['date_to']);
+            // Validate date format AND that it's a real date
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo) && strtotime($dateTo) !== false) {
+                $where[] = 'date <= %s';
+                $params[] = $dateTo;
+            }
+        }
+        
+        // Source filter
+        if (!empty($filters['source']) && $filters['source'] !== 'all') {
+            $where[] = 'source = %s';
+            $params[] = $filters['source'];
+        }
+        
+        // Past/upcoming filter. Never exclude past dates when the caller is asking
+        // for the 'past' status — that combination is contradictory and returned
+        // nothing (the exact reason completed departures vanished from the Past tab).
+        if (isset($filters['include_past'])) {
+            if (!$filters['include_past'] && !$statusIsPast) {
+                $where[] = 'date >= CURDATE()';
+            }
+        }
+
+        // Past-only filter — for the "Past Departures" archive. Deliberately
+        // DATE-based (mirrors the end_date ?: start_date ?: date precedence used
+        // when marking departures past) rather than checking status = 'past':
+        // that stored status is only kept current by the daily cron, so relying
+        // on it made departures that had already taken place disappear entirely
+        // whenever the cron had not run. Date is the source of truth.
+        if (!empty($filters['past_only'])) {
+            // start_date / end_date are nullable DATE columns (never ''), so guard
+            // with IS NULL / IS NOT NULL — comparing a DATE column to '' errors
+            // under MySQL strict mode.
+            $where[] = "(
+                (end_date IS NOT NULL AND end_date < CURDATE())
+                OR (end_date IS NULL AND start_date IS NOT NULL AND start_date < CURDATE())
+                OR (end_date IS NULL AND start_date IS NULL AND date < CURDATE())
+            )";
+        }
+        
+        return [$where, $params];
+    }
+
+    /**
+     * Find departures by trip ID
+     * 
+     * @param int $tripId Trip ID
+     * @param array $filters Filters: status, date_from, date_to, source
+     * @return array Array of Departure models
+     */
+    public function findByTripId(int $tripId, array $filters = []): array
+    {
+        $table = esc_sql($this->table);
+        [$where, $params] = $this->whereForTrip($tripId, $filters);
+
+        $query = "SELECT * FROM `{$table}` WHERE " . implode(' AND ', $where);
+        // id as a final tiebreaker so pagination over rows sharing a date + time
+        // is stable (see findAll()).
+        $query .= " ORDER BY date ASC, time ASC, id ASC";
+
+        if (!empty($filters['per_page'])) {
+            $perPage = (int) $filters['per_page'];
+            $page = max(1, (int) ($filters['page'] ?? 1));
+            $offset = ($page - 1) * $perPage;
+            $query .= " LIMIT %d OFFSET %d";
+            $params[] = $perPage;
+            $params[] = $offset;
+        }
+
+        $results = $this->wpdb->get_results(
+            $this->wpdb->prepare($query, ...$params),
+            ARRAY_A
+        );
+
+        return array_map(function ($row) {
+            return Departure::fromArray($row);
+        }, $results ?: []);
+    }
+
+    /**
+     * WHERE fragments + prepare params shared by findByTripId() and
+     * countByTripId(), so a trip's list and its total are always built from
+     * identical conditions. trip_id is always the first bound param.
+     *
+     * @param int   $tripId  Trip ID.
+     * @param array $filters Filters: status, availability, date_from, date_to,
+     *                       source, include_past, past_only.
+     * @return array{0: string[], 1: array}
+     */
+    private function whereForTrip(int $tripId, array $filters): array
+    {
+        $table = esc_sql($this->table);
+        $where = ['trip_id = %d'];
+        $params = [$tripId];
+        
+        // Status filter. 'past' is date-derived (see Departure::calculateStatus),
+        // NOT the stored status column — that column is only kept current by the
+        // daily cron, so filtering status = 'past' hid every departure that had
+        // taken place whenever the cron had not run. Match 'past' by date instead;
+        // all other statuses (upcoming/full/cancelled/trash) use the stored value.
+        $statusIsPast = (!empty($filters['status']) && $filters['status'] === 'past');
+        if (!empty($filters['status']) && $filters['status'] !== 'all') {
+            if ($statusIsPast) {
+                $where[] = "(
+                    (end_date IS NOT NULL AND end_date < CURDATE())
+                    OR (end_date IS NULL AND start_date IS NOT NULL AND start_date < CURDATE())
+                    OR (end_date IS NULL AND start_date IS NULL AND date < CURDATE())
+                )";
+            } else {
+                $this->applyStatusClause((string) $filters['status'], $where, $params);
+            }
+        }
+
+        // Independent capacity filter (see applyAvailabilityClause).
+        $this->applyAvailabilityClause($filters, $where);
+
+        // Free-text search on date / notes (see applySearchClause).
+        $this->applySearchClause($filters, $where, $params);
+
+        // Date range filter - check both start_date and date columns
+        $columns = $this->wpdb->get_col("DESCRIBE {$table}");
+        $hasStartDate = in_array('start_date', $columns, true);
+        
+        if (!empty($filters['date_from']) && trim($filters['date_from']) !== '') {
+            if ($hasStartDate) {
+                // NOTE: start_date is a DATE column in some installs; comparing to "" can trigger
+                // "Incorrect DATE value: ''" under strict SQL modes. Treat "0000-00-00" as empty.
+                $where[] = '((start_date IS NOT NULL AND start_date <> %s AND start_date >= %s) OR ((start_date IS NULL OR start_date = %s) AND date >= %s))';
+                $params[] = '0000-00-00';
+                $params[] = $filters['date_from'];
+                $params[] = '0000-00-00';
+                $params[] = $filters['date_from'];
+            } else {
+                $where[] = 'date >= %s';
+                $params[] = $filters['date_from'];
+            }
+        }
+        
+        if (!empty($filters['date_to']) && trim($filters['date_to']) !== '') {
+            if ($hasStartDate) {
+                // See note above re strict DATE comparisons and empty string.
+                $where[] = '((start_date IS NOT NULL AND start_date <> %s AND start_date <= %s) OR ((start_date IS NULL OR start_date = %s) AND date <= %s))';
+                $params[] = '0000-00-00';
+                $params[] = $filters['date_to'];
+                $params[] = '0000-00-00';
+                $params[] = $filters['date_to'];
+            } else {
+                $where[] = 'date <= %s';
+                $params[] = $filters['date_to'];
+            }
+        }
+        
+        // Source filter
+        if (!empty($filters['source']) && $filters['source'] !== 'all') {
+            $where[] = 'source = %s';
+            $params[] = $filters['source'];
+        }
+        
+        // Past/upcoming filter. Never exclude past dates when the caller is asking
+        // for the 'past' status — that combination is contradictory and returned
+        // nothing (the exact reason completed departures vanished from the Past tab).
+        if (isset($filters['include_past'])) {
+            if (!$filters['include_past'] && !$statusIsPast) {
+                $where[] = 'date >= CURDATE()';
+            }
+        }
+
+        // Past-only filter — for the "Past Departures" archive. Deliberately
+        // DATE-based (mirrors the end_date ?: start_date ?: date precedence used
+        // when marking departures past) rather than checking status = 'past':
+        // that stored status is only kept current by the daily cron, so relying
+        // on it made departures that had already taken place disappear entirely
+        // whenever the cron had not run. Date is the source of truth.
+        if (!empty($filters['past_only'])) {
+            // start_date / end_date are nullable DATE columns (never ''), so guard
+            // with IS NULL / IS NOT NULL — comparing a DATE column to '' errors
+            // under MySQL strict mode.
+            $where[] = "(
+                (end_date IS NOT NULL AND end_date < CURDATE())
+                OR (end_date IS NULL AND start_date IS NOT NULL AND start_date < CURDATE())
+                OR (end_date IS NULL AND start_date IS NULL AND date < CURDATE())
+            )";
+        }
+        
+        return [$where, $params];
+    }
+
+    /**
+     * Find past departures by trip ID
+     */
+    public function findPastByTripId(int $tripId, array $filters = []): array
+    {
+        // Match by date, not the stored status column (see past_only in
+        // findByTripId) — a departure that has taken place must appear here even
+        // if the daily status cron has not yet marked it 'past'.
+        $filters['past_only'] = true;
+        $filters['include_past'] = true;
+        return $this->findByTripId($tripId, $filters);
+    }
+
+    /**
+     * Find upcoming departures by trip ID
+     */
+    public function findUpcomingByTripId(int $tripId, array $filters = []): array
+    {
+        $filters['include_past'] = false;
+        return $this->findByTripId($tripId, $filters);
+    }
+
+    /**
+     * Find departure by trip ID and date (backward compatibility - uses start_date)
+     */
+    public function findByTripIdAndDate(int $tripId, string $date, ?string $time = null): ?Departure
+    {
+        return $this->findByTripIdAndStartDate($tripId, $date, $time);
+    }
+
+    /**
+     * Count departures for one trip matching the SAME filters as findByTripId()
+     * (page / per_page are ignored) — the true total behind a paginated list.
+     *
+     * Previously this kept its own, simpler WHERE (literal status = 'past'
+     * instead of the date-derived match, plain `date` columns instead of the
+     * start_date-aware range, no past_only), so it could disagree with the
+     * rows findByTripId() returned. Sharing whereForTrip() makes that
+     * impossible.
+     *
+     * @param int   $tripId  Trip ID.
+     * @param array $filters Same filters as findByTripId().
+     */
+    public function countByTripId(int $tripId, array $filters = []): int
+    {
+        $table = esc_sql($this->table);
+        [$where, $params] = $this->whereForTrip($tripId, $filters);
+
+        $query = "SELECT COUNT(*) FROM `{$table}` WHERE " . implode(' AND ', $where);
+
+        // trip_id is always bound, so there is always a placeholder to prepare.
+        return (int) $this->wpdb->get_var($this->wpdb->prepare($query, ...$params));
+    }
+
+    /**
+     * Create a departure
+     */
+    public function create(array $data): int
+    {
+        $table = esc_sql($this->table);
+        
+        // Check which columns exist in the table
+        $columns = $this->wpdb->get_col("DESCRIBE {$table}");
+        $hasStartDate = in_array('start_date', $columns, true);
+        $hasEndDate = in_array('end_date', $columns, true);
+        
+        // Handle start_date and end_date - support both old 'date' and new format
+        $startDate = !empty($data['start_date']) ? $data['start_date'] : ($data['date'] ?? '');
+        $endDate = $data['end_date'] ?? '';
+        
+        $insertData = [
+            'trip_id' => (int) ($data['trip_id'] ?? 0),
+            'date' => sanitize_text_field($startDate), // Always include for backward compatibility
+            'time' => !empty($data['time']) ? sanitize_text_field($data['time']) : null,
+            'max_capacity' => (int) ($data['max_capacity'] ?? 0),
+            'booked_count' => (int) ($data['booked_count'] ?? 0),
+            'status' => sanitize_text_field($data['status'] ?? 'upcoming'),
+            'source' => sanitize_text_field($data['source'] ?? 'booking_created'),
+            'price_override' => !empty($data['price_override']) ? (float) $data['price_override'] : null,
+            'notes' => !empty($data['notes']) ? sanitize_textarea_field($data['notes']) : null,
+            'created_at' => current_time('mysql'),
+            'updated_at' => current_time('mysql'),
+        ];
+        
+        // Only add start_date and end_date if columns exist
+        if ($hasStartDate) {
+            $insertData['start_date'] = sanitize_text_field($startDate);
+        }
+        if ($hasEndDate && !empty($endDate)) {
+            $insertData['end_date'] = sanitize_text_field($endDate);
+        }
+        
+        // Only add total_revenue if column exists
+        $hasTotalRevenue = in_array('total_revenue', $columns, true);
+        if ($hasTotalRevenue) {
+            $insertData['total_revenue'] = !empty($data['total_revenue']) ? (float) $data['total_revenue'] : 0.00;
+        }
+        
+        // Handle price_by_traveler_type as JSON
+        if (!empty($data['price_by_traveler_type'])) {
+            $insertData['price_by_traveler_type'] = is_array($data['price_by_traveler_type'])
+                ? wp_json_encode($data['price_by_traveler_type'])
+                : $data['price_by_traveler_type'];
+        } else {
+            $insertData['price_by_traveler_type'] = null;
+        }
+        
+        // Calculate status if not provided
+        if (empty($data['status'])) {
+            $departure = Departure::fromArray($insertData);
+            $insertData['status'] = $departure->calculateStatus();
+        }
+        
+        // Build format array dynamically based on what we're inserting
+        $formats = [];
+        foreach ($insertData as $key => $value) {
+            if (in_array($key, ['trip_id', 'max_capacity', 'booked_count'], true)) {
+                $formats[] = '%d';
+            } elseif (in_array($key, ['price_override'], true)) {
+                $formats[] = '%f';
+            } else {
+                $formats[] = '%s';
+            }
+        }
+        
+        $this->wpdb->insert($table, $insertData, $formats);
+        
+        return $this->wpdb->insert_id;
+    }
+
+    /**
+     * Update a departure
+     */
+    public function update(int $id, array $data): bool
+    {
+        $table = esc_sql($this->table);
+        
+        // Check which columns exist
+        $columns = $this->wpdb->get_col("DESCRIBE {$table}");
+        $hasStartDate = in_array('start_date', $columns, true);
+        $hasEndDate = in_array('end_date', $columns, true);
+        
+        $updateData = [];
+        
+        if (isset($data['trip_id'])) $updateData['trip_id'] = (int) $data['trip_id'];
+        
+        // Handle date fields - support both old 'date' and new 'start_date'/'end_date'
+        if (isset($data['start_date'])) {
+            if ($hasStartDate) {
+                $updateData['start_date'] = sanitize_text_field($data['start_date']);
+            }
+            $updateData['date'] = sanitize_text_field($data['start_date']); // Always update date for backward compatibility
+        } elseif (isset($data['date'])) {
+            $updateData['date'] = sanitize_text_field($data['date']);
+            if ($hasStartDate) {
+                $updateData['start_date'] = $updateData['date']; // Sync start_date
+            }
+        }
+        
+        if (isset($data['end_date']) && $hasEndDate) {
+            $updateData['end_date'] = sanitize_text_field($data['end_date']);
+        }
+        if (isset($data['time'])) $updateData['time'] = !empty($data['time']) ? sanitize_text_field($data['time']) : null;
+        if (isset($data['max_capacity'])) $updateData['max_capacity'] = (int) $data['max_capacity'];
+        if (isset($data['booked_count'])) $updateData['booked_count'] = (int) $data['booked_count'];
+        if (isset($data['status'])) $updateData['status'] = sanitize_text_field($data['status']);
+        if (isset($data['source'])) $updateData['source'] = sanitize_text_field($data['source']);
+        if (isset($data['price_override'])) $updateData['price_override'] = !empty($data['price_override']) ? (float) $data['price_override'] : null;
+        
+        // Only update total_revenue if column exists
+        $hasTotalRevenue = in_array('total_revenue', $columns, true);
+        if (isset($data['total_revenue']) && $hasTotalRevenue) {
+            $updateData['total_revenue'] = !empty($data['total_revenue']) ? (float) $data['total_revenue'] : 0.00;
+        }
+        
+        if (isset($data['notes'])) $updateData['notes'] = !empty($data['notes']) ? sanitize_textarea_field($data['notes']) : null;
+        
+        if (isset($data['price_by_traveler_type'])) {
+            $updateData['price_by_traveler_type'] = is_array($data['price_by_traveler_type'])
+                ? wp_json_encode($data['price_by_traveler_type'])
+                : $data['price_by_traveler_type'];
+        }
+        
+        $updateData['updated_at'] = current_time('mysql');
+        
+        // Recalculate status if date or capacity changed
+        if (isset($updateData['start_date']) || isset($updateData['end_date']) || isset($updateData['date']) || 
+            isset($updateData['max_capacity']) || isset($updateData['booked_count'])) {
+            // Get current departure to merge with updates
+            $current = $this->findModel($id);
+            if ($current) {
+                $merged = array_merge($current->toArray(), $updateData);
+                $departure = Departure::fromArray($merged);
+                $updateData['status'] = $departure->calculateStatus();
+            }
+        }
+        
+        if (empty($updateData)) {
+            return false;
+        }
+        
+        $formats = [];
+        foreach ($updateData as $value) {
+            if (is_int($value)) {
+                $formats[] = '%d';
+            } elseif (is_float($value)) {
+                $formats[] = '%f';
+            } else {
+                $formats[] = '%s';
+            }
+        }
+        
+        return (bool) $this->wpdb->update(
+            $table,
+            $updateData,
+            ['id' => $id],
+            $formats,
+            ['%d']
+        );
+    }
+
+    /**
+     * Atomically increment booked count, refusing the write when it
+     * would exceed max_capacity.
+     *
+     * The capacity guard lives in the SQL WHERE clause — not in PHP —
+     * so concurrent writers can't both read "we have room" and then
+     * both succeed. Each writer's UPDATE either updates 1 row (the
+     * reservation succeeded; capacity was decremented atomically) or
+     * 0 rows (the seats were taken between read and write; the caller
+     * should treat this as "departure full").
+     *
+     * `max_capacity = 0` or NULL means "unlimited" — the guard
+     * intentionally allows unlimited writes in that case.
+     *
+     * Returns true only when 1 row was actually updated. Previous
+     * behaviour returned true unconditionally, which created a
+     * check-then-act overbooking race in `DepartureService::
+     * incrementBookedCount()`.
+     */
+    public function incrementBookedCount(int $id, int $amount = 1, bool $force = false): bool
+    {
+        if ($amount <= 0 || $id <= 0) return false;
+
+        $table = esc_sql($this->table);
+
+        // The capacity guard (`booked_count + %d <= max_capacity`) is
+        // the right default for direct bookings — it stops the website
+        // checkout from overselling a seat that's no longer there.
+        //
+        // For external-channel bookings (Viator / GetYourGuide / any
+        // OTA webhook) the seat has ALREADY been sold on the OTA. We
+        // MUST record the booking locally even if our view of capacity
+        // says "no room left" — refusing to record would just hide the
+        // oversell from the operator and make reconciliation impossible.
+        // Callers that own that case pass `$force = true` and the
+        // capacity clause is dropped from the WHERE.
+        $sql = "UPDATE `{$table}`
+                SET booked_count = booked_count + %d,
+                    updated_at = %s
+                WHERE id = %d";
+        $args = [$amount, current_time('mysql'), $id];
+
+        if (!$force) {
+            $sql .= "
+                   AND (max_capacity IS NULL
+                        OR max_capacity = 0
+                        OR booked_count + %d <= max_capacity)";
+            $args[] = $amount;
+        }
+
+        $result = $this->wpdb->query($this->wpdb->prepare($sql, $args));
+
+        if ($result === false) return false;       // SQL error
+        if ((int) $result === 0) return false;     // capacity guard rejected the write (only possible when !$force)
+
+        // Recalculate status only when the reservation actually landed.
+        $departure = $this->findModel($id);
+        if ($departure) {
+            $this->update($id, ['status' => $departure->calculateStatus()]);
+        }
+
+        return true;
+    }
+
+    /**
+     * Decrement booked count
+     */
+    public function decrementBookedCount(int $id, int $amount = 1): bool
+    {
+        $table = esc_sql($this->table);
+        
+        $this->wpdb->query($this->wpdb->prepare(
+            "UPDATE `{$table}` 
+             SET booked_count = GREATEST(0, booked_count - %d), 
+                 updated_at = %s
+             WHERE id = %d",
+            $amount,
+            current_time('mysql'),
+            $id
+        ));
+        
+        // Recalculate status
+        $departure = $this->findModel($id);
+        if ($departure) {
+            $this->update($id, ['status' => $departure->calculateStatus()]);
+        }
+        
+        return true;
+    }
+
+    /**
+     * Delete a departure.
+     *
+     * The booking-level policy lives in DepartureService::delete(), which is the
+     * only caller — this performs the row removal itself.
+     */
+    public function delete(int $id): bool
+    {
+        $departure = $this->findModel($id);
+
+        if (!$departure) {
+            return false;
+        }
+
+        // This previously required source === 'recurring_generated', a value the
+        // plugin never writes (departures are `booking_created` or `manual`, see
+        // Departure::$source), so the guard could never pass and every departure
+        // was undeletable.
+        $table = esc_sql($this->table);
+
+        return (bool) $this->wpdb->delete($table, ['id' => $id], ['%d']);
+    }
+
+    /**
+     * Recalculate status for all departures (for cron job)
+     */
+    public function recalculateAllStatuses(): int
+    {
+        $table = esc_sql($this->table);
+        $today = date('Y-m-d');
+        
+        // The effective date is end_date ?: start_date ?: date. start_date and
+        // end_date are nullable DATE columns (never ''), so guard with IS NULL /
+        // IS NOT NULL — comparing a DATE column to '' errors under MySQL strict
+        // mode, which previously made this whole recalculation fail silently.
+        $pastCond = "(
+            (end_date IS NOT NULL AND end_date < %s) OR
+            (end_date IS NULL AND start_date IS NOT NULL AND start_date < %s) OR
+            (end_date IS NULL AND start_date IS NULL AND date < %s)
+        )";
+        $futureCond = "(
+            (end_date IS NOT NULL AND end_date >= CURDATE()) OR
+            (end_date IS NULL AND start_date IS NOT NULL AND start_date >= CURDATE()) OR
+            (end_date IS NULL AND start_date IS NULL AND date >= CURDATE())
+        )";
+
+        // Update past departures.
+        $this->wpdb->query($this->wpdb->prepare(
+            "UPDATE `{$table}`
+             SET status = 'past', updated_at = %s
+             WHERE {$pastCond}
+             AND status != 'cancelled'",
+            current_time('mysql'),
+            $today,
+            $today,
+            $today
+        ));
+
+        // Update full departures - future dates only.
+        $this->wpdb->query(
+            "UPDATE `{$table}`
+             SET status = 'full', updated_at = NOW()
+             WHERE booked_count >= max_capacity
+             AND max_capacity > 0
+             AND {$futureCond}
+             AND status NOT IN ('cancelled', 'past')"
+        );
+
+        // Update upcoming departures - future dates only.
+        $this->wpdb->query(
+            "UPDATE `{$table}`
+             SET status = 'upcoming', updated_at = NOW()
+             WHERE {$futureCond}
+             AND booked_count < max_capacity
+             AND status NOT IN ('cancelled', 'past', 'full')"
+        );
+        
+        return $this->wpdb->rows_affected;
+    }
+
+    /**
+     * Add the stored-status clause for a list filter.
+     *
+     * 'upcoming' is INCLUSIVE of 'full': a departure at capacity is still a
+     * future departure. The status column conflates lifecycle with capacity
+     * (the cron overwrites 'upcoming' with 'full'), which made the Upcoming
+     * tab silently drop full departures. Capacity is its own dimension —
+     * filter it with the `availability` filter instead. 'full' remains
+     * matchable on its own so existing API consumers are unaffected.
+     *
+     * @param string $status   Requested status (never 'all' / 'past' here).
+     * @param array  $where    WHERE fragments (by reference).
+     * @param array  $params   Prepare params (by reference).
+     */
+    private function applyStatusClause(string $status, array &$where, array &$params): void
+    {
+        if ($status === 'upcoming') {
+            // Fixed literals — nothing user-supplied, so no placeholder needed.
+            $where[] = "status IN ('upcoming', 'full')";
+            return;
+        }
+
+        $where[] = 'status = %s';
+        $params[] = $status;
+    }
+
+    /**
+     * Independent capacity filter, derived from booked_count / max_capacity —
+     * the source of truth — rather than the stored status, which the daily
+     * cron can leave stale. max_capacity <= 0 means unlimited (never full).
+     *
+     *   available — has room (unbooked or partially booked)
+     *   partial   — some bookings, but not full
+     *   full      — at or over capacity
+     *
+     * Absent or unrecognised values add no clause, so existing callers and
+     * API consumers see no change (additive / backward compatible).
+     *
+     * @param array $filters Raw filters.
+     * @param array $where   WHERE fragments (by reference).
+     */
+    private function applyAvailabilityClause(array $filters, array &$where): void
+    {
+        $availability = isset($filters['availability']) ? (string) $filters['availability'] : '';
+
+        // Every branch is a fixed literal; the value only selects a branch.
+        switch ($availability) {
+            case 'available':
+                $where[] = '(max_capacity <= 0 OR booked_count < max_capacity)';
+                break;
+            case 'partial':
+                $where[] = '(booked_count > 0 AND (max_capacity <= 0 OR booked_count < max_capacity))';
+                break;
+            case 'full':
+                $where[] = '(max_capacity > 0 AND booked_count >= max_capacity)';
+                break;
+        }
+    }
+
+    /**
+     * Free-text search for the admin list ("Search by date or notes"): matches
+     * the departure date (start — `date` is kept in sync with start_date), the
+     * end date, or the notes. The term is bound through esc_like() and a %s
+     * placeholder, so `%` / `_` / quotes in it are literal and nothing is ever
+     * interpolated into SQL. A blank / whitespace-only term adds no clause.
+     *
+     * Lives in the shared WHERE builders, so a search narrows the rows, the
+     * pagination total and the tab counts identically.
+     *
+     * @param array $filters Raw filters.
+     * @param array $where   WHERE fragments (by reference).
+     * @param array $params  Prepare params (by reference).
+     */
+    private function applySearchClause(array $filters, array &$where, array &$params): void
+    {
+        $term = isset($filters['search']) ? trim((string) $filters['search']) : '';
+        if ($term === '') {
+            return;
+        }
+
+        $like = '%' . $this->wpdb->esc_like($term) . '%';
+
+        // DATE columns are cast explicitly so this is a plain string LIKE under
+        // every SQL mode (no implicit DATE/string coercion, which strict modes
+        // reject for some comparisons). NULL end_date / notes simply don't match.
+        $where[] = '(CAST(date AS CHAR) LIKE %s OR CAST(end_date AS CHAR) LIKE %s OR notes LIKE %s)';
+        $params[] = $like;
+        $params[] = $like;
+        $params[] = $like;
+    }
+
+    /**
+     * Check if table supports soft delete
+     */
+    protected function hasSoftDelete(): bool
+    {
+        return false;
+    }
+}
+

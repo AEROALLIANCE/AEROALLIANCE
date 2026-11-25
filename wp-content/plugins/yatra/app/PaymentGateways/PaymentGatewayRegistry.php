@@ -1,0 +1,482 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\PaymentGateways;
+
+/**
+ * Payment Gateway Registry
+ * Manages registration and retrieval of payment gateways
+ */
+class PaymentGatewayRegistry
+{
+    private static ?PaymentGatewayRegistry $instance = null;
+    private array $gateways = [];
+
+    private function __construct()
+    {
+        // Register built-in gateways
+        $this->registerBuiltInGateways();
+        
+        // Allow third-party plugins to register their gateways
+        do_action('yatra_register_payment_gateways', $this);
+    }
+
+    public static function getInstance(): self
+    {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * Register built-in payment gateways (Free version)
+     * Only PayLater and PayPal are included in free version
+     * Premium gateways are registered by Yatra Pro via 'yatra_register_payment_gateways' hook
+     */
+    private function registerBuiltInGateways(): void
+    {
+        // Free gateways - always available
+        $freeGateways = [
+            Gateways\PayLater\PayLaterGateway::class,      // Book Now Pay Later - Free
+            Gateways\PayPal\PayPalGateway::class,          // PayPal - Free
+        ];
+
+        foreach ($freeGateways as $gatewayClass) {
+            if (class_exists($gatewayClass)) {
+                $this->register(new $gatewayClass());
+            }
+        }
+        
+        // Premium gateways are registered by Yatra Pro plugin
+        // via the 'yatra_register_payment_gateways' action hook
+    }
+
+    /**
+     * Register a payment gateway
+     */
+    public function register(PaymentGatewayInterface $gateway): void
+    {
+        $this->gateways[$gateway->getId()] = $gateway;
+    }
+
+    /**
+     * Get a specific gateway by ID
+     */
+    public function get(string $id): ?PaymentGatewayInterface
+    {
+        return $this->gateways[$id] ?? null;
+    }
+
+    /**
+     * Get all registered gateways
+     */
+    public function getAll(): array
+    {
+        return $this->gateways;
+    }
+
+    /**
+     * Get all enabled/available gateways
+     */
+    public function getAvailable(): array
+    {
+        return array_filter($this->gateways, fn($gateway) => $gateway->isAvailable());
+    }
+
+    /**
+     * Gateways enabled in settings (may still lack API keys). Used for checkout UI.
+     *
+     * @return array<string, PaymentGatewayInterface>
+     */
+    public function getEnabledGateways(): array
+    {
+        return array_filter($this->gateways, fn($gateway) => $gateway->isEnabled());
+    }
+
+    /**
+     * Get list of premium gateway IDs (requires Yatra Pro)
+     */
+    public function getPremiumGatewayIds(): array
+    {
+        return [
+            'stripe',
+            'razorpay',
+            'mollie',
+            'paystack',
+            'square',
+            'authorize_net',
+            'bank_transfer',
+        ];
+    }
+    
+    /**
+     * Check if a gateway is premium (requires Pro)
+     */
+    public function isPremiumGateway(string $gatewayId): bool
+    {
+        return in_array($gatewayId, $this->getPremiumGatewayIds(), true);
+    }
+    
+    /**
+     * Check if Yatra Pro is active
+     */
+    private function isProActive(): bool
+    {
+        return defined('YATRA_PRO_VERSION') && class_exists('YatraPro\Plugin');
+    }
+
+    /**
+     * Get gateway definitions for admin settings UI
+     * Shows all gateways (registered + premium placeholders) with Pro badges
+     */
+    public function getDefinitions(): array
+    {
+        $definitions = [];
+        $isProActive = $this->isProActive();
+
+        // Add registered gateways
+        foreach ($this->gateways as $id => $gateway) {
+            $config = $gateway->getConfig();
+            $isPremium = $this->isPremiumGateway($id);
+            
+            $definitions[$id] = [
+                'id' => $id,
+                'title' => $gateway->getTitle(),
+                'description' => $gateway->getDescription(),
+                'icon' => $gateway->getIcon(),
+                'sandbox_url' => $gateway->getSandboxUrl(),
+                'is_offline' => $gateway->isOffline(),
+                'supports' => $gateway->getSupports(),
+                'fields' => $gateway->getConfigFields(),
+                'config' => $config,
+                'enabled' => !empty($config['enabled']),
+                'is_premium' => $isPremium,
+                'requires_pro' => $isPremium && !$isProActive,
+            ];
+        }
+        
+        // Add premium gateway placeholders if Pro is not active
+        if (!$isProActive) {
+            $premiumPlaceholders = $this->getPremiumGatewayPlaceholders();
+            foreach ($premiumPlaceholders as $id => $placeholder) {
+                // Only add if not already registered
+                if (!isset($definitions[$id])) {
+                    $definitions[$id] = $placeholder;
+                }
+            }
+        }
+
+        return $definitions;
+    }
+    
+    /**
+     * Get premium gateway placeholders for UI when Pro is not active
+     */
+    private function getPremiumGatewayPlaceholders(): array
+    {
+        return [
+            'stripe' => [
+                'id' => 'stripe',
+                'title' => __('Stripe', 'yatra'),
+                'description' => __('Accept credit card payments via Stripe', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/stripe.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds', 'subscriptions'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'razorpay' => [
+                'id' => 'razorpay',
+                'title' => __('Razorpay', 'yatra'),
+                'description' => __('Accept payments via Razorpay (India)', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/razorpay.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'mollie' => [
+                'id' => 'mollie',
+                'title' => __('Mollie', 'yatra'),
+                'description' => __('Accept payments via Mollie (Europe)', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/mollie.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'paystack' => [
+                'id' => 'paystack',
+                'title' => __('Paystack', 'yatra'),
+                'description' => __('Accept payments via Paystack (Africa)', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/paystack.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'square' => [
+                'id' => 'square',
+                'title' => __('Square', 'yatra'),
+                'description' => __('Accept payments via Square (US/Canada)', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/square.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'authorize_net' => [
+                'id' => 'authorize_net',
+                'title' => __('Authorize.Net', 'yatra'),
+                'description' => __('Accept payments via Authorize.Net (US)', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/authorize-net.svg',
+                'sandbox_url' => '',
+                'is_offline' => false,
+                'supports' => ['refunds'],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+            'bank_transfer' => [
+                'id' => 'bank_transfer',
+                'title' => __('Bank Transfer', 'yatra'),
+                'description' => __('Accept manual bank transfer payments', 'yatra'),
+                'icon' => YATRA_PLUGIN_URL . 'assets/images/payment-gateways/bank_transfer.svg',
+                'sandbox_url' => '',
+                'is_offline' => true,
+                'supports' => [],
+                'fields' => [],
+                'config' => ['enabled' => false],
+                'enabled' => false,
+                'is_premium' => true,
+                'requires_pro' => true,
+            ],
+        ];
+    }
+
+    /**
+     * The gateway's customer-facing title — the same label the checkout shows.
+     *
+     * Prefers the operator's stored title, but ONLY when they actually
+     * customized it: the gateway's default title is persisted into the config
+     * at install time, and using that stored English string would shadow the
+     * translatable getTitle(). A genuine custom value (operator free-text, not
+     * translatable) is honored as-is.
+     *
+     * Works for any registered gateway, enabled or not, so a document about a
+     * past payment still names the gateway correctly after it was switched
+     * off. Returns '' when the id belongs to no registered gateway (e.g. a Pro
+     * gateway while Pro is inactive) so callers can fall back to the raw id.
+     */
+    public function resolveGatewayTitle(string $gatewayId): string
+    {
+        $gateway = $this->get($gatewayId);
+        if (!$gateway) {
+            return '';
+        }
+
+        $config = $gateway->getConfig();
+        $storedTitle = isset($config['title']) ? (string) $config['title'] : '';
+
+        return self::isOperatorLabel($gatewayId, 'title', $storedTitle, $gateway->getDefaultTitle())
+            ? $storedTitle
+            : $gateway->getTitle();
+    }
+
+    /**
+     * Labels that early installs wrote into `yatra_gateway_configs` as plain
+     * English literals.
+     *
+     * The installer seeded a title and description per gateway, and some of
+     * those seeds never matched the gateway class's own default — pay_later's
+     * description and Stripe's, for instance. A stored value that differs from
+     * the class default looks exactly like an operator customization, so the
+     * checkout preferred the seeded English string and the translated
+     * getTitle()/getDescription() were never reached: the payment section of
+     * the booking form stayed English however complete the translation was.
+     *
+     * Recognising the seeds here fixes existing sites without rewriting their
+     * stored settings, so an operator's genuine custom wording is still
+     * honoured and nothing is lost if they later clear it.
+     */
+    private const LEGACY_SEEDED_LABELS = [
+        'pay_later' => [
+            'title' => ['Book Now, Pay Later'],
+            'description' => ['Allow customers to reserve now and pay before the trip'],
+        ],
+        'stripe' => [
+            'title' => ['Stripe'],
+            'description' => ['Accept credit and debit cards'],
+        ],
+        'paypal' => [
+            'title' => ['PayPal'],
+            'description' => ['Accept PayPal payments'],
+        ],
+        'razorpay' => [
+            'title' => ['Razorpay'],
+            'description' => ['Accept payments via Razorpay'],
+        ],
+        'square' => [
+            'title' => ['Square'],
+            'description' => ['Accept payments via Square'],
+        ],
+        'authorize_net' => [
+            'title' => ['Authorize.net'],
+            'description' => ['Accept payments via Authorize.net'],
+        ],
+        'bank_transfer' => [
+            'title' => ['Bank Transfer'],
+            'description' => ['Accept manual bank transfer payments'],
+        ],
+    ];
+
+    /**
+     * Is this stored label the operator's own wording, rather than a default
+     * that was persisted on their behalf?
+     *
+     * Only an operator's own wording should win over the gateway's translatable
+     * getter — a persisted default must fall through so it can be translated.
+     *
+     * @param string $field 'title' or 'description'
+     */
+    private static function isOperatorLabel(string $gatewayId, string $field, string $stored, string $classDefault): bool
+    {
+        if ($stored === '' || $stored === $classDefault) {
+            return false;
+        }
+
+        return !in_array($stored, self::LEGACY_SEEDED_LABELS[$gatewayId][$field] ?? [], true);
+    }
+
+    /**
+     * Gateways to show on checkout: all enabled in settings.
+     * Configuration is validated when processing payment (see processPayment).
+     */
+    public function getForCheckout(): array
+    {
+        $checkoutGateways = [];
+
+        foreach ($this->getEnabledGateways() as $id => $gateway) {
+            $config = $gateway->getConfig();
+            // Prefer a stored title/description ONLY when the operator actually
+            // customized it. The gateway's default title/description gets
+            // persisted into the config at install time, and using that stored
+            // English string here shadowed the translatable getTitle()/
+            // getDescription() — so the checkout label never translated. When
+            // the stored value equals the gateway's built-in default, fall
+            // through to the translated getter; a genuine custom value (which
+            // is operator free-text, not translatable) is still honored.
+            $storedDescription = isset($config['description']) ? (string) $config['description'] : '';
+            $checkoutGateways[] = [
+                'id' => $id,
+                'title' => $this->resolveGatewayTitle($id),
+                'description' => self::isOperatorLabel($id, 'description', $storedDescription, $gateway->getDefaultDescription())
+                    ? $storedDescription
+                    : $gateway->getDescription(),
+                'icon' => !empty($config['icon']) ? $config['icon'] : $gateway->getIcon(),
+                'is_offline' => $gateway->isOffline(),
+                'supports' => $gateway->getSupports(),
+                'is_configured' => $gateway->isProperlyConfigured(),
+            ];
+        }
+
+        return $checkoutGateways;
+    }
+
+    /**
+     * Save gateway configuration
+     */
+    public function saveGatewayConfig(string $gatewayId, array $config): bool
+    {
+        $gateway = $this->get($gatewayId);
+        if (!$gateway) {
+            return false;
+        }
+        return $gateway->saveConfig($config);
+    }
+
+    /**
+     * Process payment through a gateway
+     */
+    public function processPayment(string $gatewayId, array $paymentData): array
+    {
+        $gateway = $this->get($gatewayId);
+        
+        if (!$gateway) {
+            return [
+                'success' => false,
+                'error' => __('Payment gateway not found', 'yatra'),
+            ];
+        }
+
+        if (!$gateway->isEnabled()) {
+            return [
+                'success' => false,
+                'error' => __('Payment gateway is not available', 'yatra'),
+            ];
+        }
+
+        if (!$gateway->isProperlyConfigured()) {
+            return [
+                'success' => false,
+                'error' => GatewayUserMessages::gatewayNotConfigured($gateway),
+                'code' => 'gateway_not_configured',
+            ];
+        }
+
+        return $gateway->processPayment($paymentData);
+    }
+    
+    /**
+     * Enqueue scripts for all available gateways
+     */
+    public function enqueueScripts(): void
+    {
+        foreach ($this->getAvailable() as $gateway) {
+            if (method_exists($gateway, 'enqueueScripts')) {
+                $gateway->enqueueScripts();
+            }
+        }
+    }
+    
+    /**
+     * Get frontend data for all available gateways
+     */
+    public function getFrontendData(): array
+    {
+        $data = [];
+        
+        foreach ($this->getAvailable() as $id => $gateway) {
+            if (method_exists($gateway, 'getFrontendData')) {
+                $data[$id] = $gateway->getFrontendData();
+            }
+        }
+        
+        return $data;
+    }
+}
+

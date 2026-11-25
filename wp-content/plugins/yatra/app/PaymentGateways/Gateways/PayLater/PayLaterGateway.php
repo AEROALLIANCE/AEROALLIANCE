@@ -1,0 +1,169 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\PaymentGateways\Gateways\PayLater;
+
+use Yatra\PaymentGateways\AbstractPaymentGateway;
+
+class PayLaterGateway extends AbstractPaymentGateway
+{
+    protected string $id = 'pay_later';
+    protected string $title = 'Book Now, Pay Later';
+    protected string $description = 'Reserve now and pay before the trip';
+    protected string $icon = 'pay-later.svg';
+    protected bool $isOffline = true;
+    protected array $supports = ['pay_later', 'reservation'];
+
+    /**
+     * Translatable display title. The raw `$title` property can't carry a
+     * `__()` call (PHP property defaults must be constant), so the customer-
+     * facing label is translated here. An admin-set custom title (via gateway
+     * config) still takes precedence in PaymentGatewayRegistry::getForCheckout().
+     */
+    public function getTitle(): string
+    {
+        return __('Book Now, Pay Later', 'yatra');
+    }
+
+    /**
+     * Translatable description shown under the gateway option at checkout.
+     */
+    public function getDescription(): string
+    {
+        return __('Reserve now and pay before the trip', 'yatra');
+    }
+
+    public function getConfigFields(): array
+    {
+        return [
+            [
+                'id' => 'payment_deadline_days',
+                'type' => 'number',
+                'label' => __('Payment Deadline (Days Before Trip)', 'yatra'),
+                'description' => __('Number of days before the trip when full payment is required', 'yatra'),
+                'placeholder' => '7',
+                'default' => '7',
+                'min' => 1,
+                'max' => 60,
+            ],
+            [
+                'id' => 'auto_cancel_days',
+                'type' => 'number',
+                'label' => __('Auto-Cancel After (Days)', 'yatra'),
+                'description' => __('Automatically cancel unpaid bookings after this many days (0 to disable)', 'yatra'),
+                'placeholder' => '3',
+                'default' => '3',
+                'min' => 0,
+                'max' => 30,
+            ],
+            [
+                'id' => 'require_deposit',
+                'type' => 'checkbox',
+                'label' => __('Require Small Deposit', 'yatra'),
+                'description' => __('Collect a small deposit to confirm the booking', 'yatra'),
+                'default' => false,
+            ],
+            [
+                'id' => 'deposit_amount',
+                'type' => 'number',
+                'label' => __('Deposit Amount (%)', 'yatra'),
+                'description' => __('Percentage of total amount required as deposit', 'yatra'),
+                'placeholder' => '10',
+                'default' => '10',
+                'min' => 1,
+                'max' => 50,
+                'condition' => 'require_deposit',
+            ],
+            [
+                'id' => 'reminder_days',
+                'type' => 'text',
+                'label' => __('Payment Reminder Days', 'yatra'),
+                'description' => __('Send payment reminders X days before deadline (comma-separated, e.g., 7,3,1)', 'yatra'),
+                'placeholder' => '7,3,1',
+                'default' => '7,3,1',
+            ],
+        ];
+    }
+
+    public function processPayment(array $paymentData): array
+    {
+        $bookingId = $paymentData['booking_id'] ?? 0;
+        $tripDate = $paymentData['trip_date'] ?? '';
+        $amount = (float) ($paymentData['amount'] ?? 0);
+        
+        $deadlineDays = (int) ($this->config['payment_deadline_days'] ?? 7);
+        $requireDeposit = !empty($this->config['require_deposit']);
+        $depositPercentage = (int) ($this->config['deposit_amount'] ?? 10);
+
+        // Calculate payment deadline
+        $paymentDeadline = null;
+        if (!empty($tripDate)) {
+            $tripDateTime = strtotime($tripDate);
+            $paymentDeadline = date('Y-m-d', strtotime("-{$deadlineDays} days", $tripDateTime));
+        }
+
+        $depositAmount = 0;
+        if ($requireDeposit) {
+            $depositAmount = ($amount * $depositPercentage) / 100;
+        }
+
+        return [
+            'success' => true,
+            'payment_method' => 'pay_later',
+            'status' => $requireDeposit ? 'deposit_required' : 'reserved',
+            'booking_id' => $bookingId,
+            'total_amount' => $amount,
+            'deposit_required' => $requireDeposit,
+            'deposit_amount' => $depositAmount,
+            'remaining_amount' => $amount - $depositAmount,
+            'payment_deadline' => $paymentDeadline,
+            'deadline_days' => $deadlineDays,
+            'message' => $requireDeposit
+                ? sprintf(
+                    /* translators: 1: formatted deposit amount, 2: number of days before the trip. */
+                    __('A deposit of %1$s is required to confirm your booking. Full payment is due %2$d days before your trip.', 'yatra'),
+                    yatra_format_price((float) $depositAmount, null, false),
+                    $deadlineDays
+                )
+                : sprintf(
+                    /* translators: 1: formatted total amount, 2: number of days before the trip. */
+                    __('Your booking is reserved! Full payment of %1$s is due %2$d days before your trip.', 'yatra'),
+                    yatra_format_price((float) $amount, null, false),
+                    $deadlineDays
+                ),
+        ];
+    }
+
+    public function verifyPayment(string $transactionId): array
+    {
+        // Pay Later takes no money at checkout — the balance is settled offline
+        // later. There is nothing to verify online, so this MUST NOT report
+        // success: callers such as confirm_payment() / handle_callback() treat a
+        // successful verify as a captured payment and would otherwise mark the
+        // booking paid + completed before any money has arrived.
+        return [
+            'success' => false,
+            'status' => 'reserved',
+            'error' => __('Pay Later bookings are settled offline; there is no online payment to verify.', 'yatra'),
+        ];
+    }
+
+    /**
+     * Get auto-cancel days setting
+     */
+    public function getAutoCancelDays(): int
+    {
+        return (int) ($this->config['auto_cancel_days'] ?? 3);
+    }
+
+    /**
+     * Get reminder days as array
+     */
+    public function getReminderDays(): array
+    {
+        $reminderStr = $this->config['reminder_days'] ?? '7,3,1';
+        return array_map('intval', array_filter(explode(',', $reminderStr)));
+    }
+}
+

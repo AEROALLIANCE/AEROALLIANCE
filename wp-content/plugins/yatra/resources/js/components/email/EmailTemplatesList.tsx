@@ -1,0 +1,1427 @@
+/**
+ * Unified email templates table: Pro + Email Automation uses REST data;
+ * otherwise the same layout with settings-backed core rows and locked Pro-only rows.
+ */
+
+import React, { useState, useMemo, useCallback } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { __, sprintf } from "../../lib/i18n";
+import { useToast } from "../ui/toast";
+import { Card, CardContent } from "../ui/card";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { Select } from "../ui/select";
+import { ConfirmationDialog } from "../ui/confirmation-dialog";
+import { Switch } from "../ui/switch";
+import { Table as SharedTable, BulkActionToolbar, Pagination } from "../shared";
+import {
+  Mail,
+  Edit,
+  Search,
+  FileText,
+  CreditCard,
+  MessageSquare,
+  Bell,
+  Megaphone,
+  Plus,
+  Trash2,
+  Zap,
+  Copy,
+  Lock,
+  Eye,
+} from "lucide-react";
+import { isProPluginActive, isModuleActive } from "../../lib/plugin-utils";
+import {
+  buildLocalTemplateRows,
+  EMAIL_TEMPLATES_CATALOG,
+  getCatalogEntryByTemplateKey,
+  type UnifiedEmailTemplate,
+} from "../../lib/email-templates-catalog";
+import type { EmailSettingsValues } from "../settings/email-settings-types";
+import type { EmailFieldChangeHandler } from "../settings/email-settings-types";
+import {
+  deleteEmailTemplate,
+  duplicateEmailTemplate,
+  fetchEmailTemplates,
+  previewEmailTemplate,
+  setEmailTemplateActive,
+} from "../../api/email-automation-api";
+import { previewCoreEmailTemplate } from "../../api/settings-api";
+import { EmailPreviewModal } from "./EmailPreviewModal";
+import { EmailOverrideCreateModal } from "./EmailOverrideCreateModal";
+import { SearchableSelect } from "../ui/searchable-select";
+import {
+  reorderEmailTemplateOverrides,
+  resolveEmailTemplatesForTrip,
+} from "../../api/email-automation-api";
+import { useTripTargets } from "../../hooks/useTripTargets";
+import {
+  describeEmailTargets,
+  paymentMethodOptions,
+} from "../../lib/email-override-targets";
+import { ArrowDown, ArrowUp, Compass, Globe } from "lucide-react";
+
+const EMAIL_TEMPLATE_VISIBLE_COLUMNS_DEFAULT: Record<string, boolean> = {
+  name: true,
+  event: true,
+  subject: true,
+  body_preview: true,
+  description: true,
+  category: true,
+  recipient_type: true,
+  is_active: true,
+};
+
+function plainTextEmailPreview(html: string, maxLen = 100): string {
+  if (!html) return "";
+  const plain = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (plain.length <= maxLen) return plain;
+  return `${plain.slice(0, maxLen)}…`;
+}
+
+export type EmailTemplatesListProps = {
+  automationModuleActive: boolean;
+  settingsBridge?: {
+    values: EmailSettingsValues;
+    onFieldChange: EmailFieldChangeHandler;
+  };
+};
+
+/** Module required by catalog but not active — template stays visible; content is view-only in free UI. */
+function isModuleGatedLocked(template: UnifiedEmailTemplate): boolean {
+  const entry = getCatalogEntryByTemplateKey(template.template_key);
+  if (!entry?.requiresModule) {
+    return false;
+  }
+  return !isProPluginActive() || !isModuleActive(entry.requiresModule);
+}
+
+const getEffectiveRecipientType = (
+  template: UnifiedEmailTemplate,
+): "customer" | "admin" => {
+  const catalog = getCatalogEntryByTemplateKey(template.template_key);
+  if (catalog?.recipient_type) {
+    return catalog.recipient_type;
+  }
+  const fromApi = template.recipient_type;
+  if (fromApi === "admin" || fromApi === "customer") {
+    return fromApi;
+  }
+  const toEmail = template.to_email || "";
+  if (toEmail.includes("{{admin_email}}")) {
+    return "admin";
+  }
+  if (
+    toEmail.includes("{customer_email}") ||
+    toEmail.includes("{{customer_email}}")
+  ) {
+    return "customer";
+  }
+  return "customer";
+};
+
+const categoryIcons: Record<string, React.ElementType> = {
+  booking: FileText,
+  payment: CreditCard,
+  enquiry: MessageSquare,
+  reminder: Bell,
+  marketing: Megaphone,
+};
+
+const isApiTemplate = (t: UnifiedEmailTemplate): boolean => {
+  if (t.is_locked) {
+    return false;
+  }
+  if (typeof t.id === "number") {
+    return true;
+  }
+  return typeof t.id === "string" && /^[0-9]+$/.test(String(t.id).trim());
+};
+
+/** Pro DB templates use numeric id; the API may return id as a string (e.g. "42"). */
+function toNumericTemplateId(id: string | number | undefined): number | null {
+  if (id === undefined) {
+    return null;
+  }
+  if (typeof id === "number" && Number.isFinite(id)) {
+    return id;
+  }
+  if (typeof id === "string" && /^[0-9]+$/.test(id.trim())) {
+    return Number(id);
+  }
+  return null;
+}
+
+export const EmailTemplatesList: React.FC<EmailTemplatesListProps> = ({
+  automationModuleActive,
+  settingsBridge,
+}) => {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [recipientFilter, setRecipientFilter] = useState("all");
+  const [eventFilter, setEventFilter] = useState("all");
+  // Default to the "Active" view so the list shows only in-use templates and
+  // disabled/unused system templates stay decluttered out of sight. The "All"
+  // and "Inactive" tabs remain one click away to review or re-enable them.
+  const [statusFilter, setStatusFilter] = useState("active");
+  const [showColumnsDropdown, setShowColumnsDropdown] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<(string | number)[]>([]);
+  const [bulkAction, setBulkAction] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 20;
+
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewPayload, setPreviewPayload] = useState<{
+    subject: string;
+    body: string;
+  } | null>(null);
+
+  const [visibleColumns, setVisibleColumns] = useState(() => {
+    const saved = localStorage.getItem("yatra-email-templates-columns");
+    const parsed = saved ? JSON.parse(saved) : {};
+    return { ...EMAIL_TEMPLATE_VISIBLE_COLUMNS_DEFAULT, ...parsed };
+  });
+
+  const toggleColumn = (columnKey: string) => {
+    const newVisibleColumns = {
+      ...visibleColumns,
+      [columnKey]: !visibleColumns[columnKey],
+    };
+    setVisibleColumns(newVisibleColumns);
+    localStorage.setItem(
+      "yatra-email-templates-columns",
+      JSON.stringify(newVisibleColumns),
+    );
+  };
+
+  // Trip-specific overrides (Pro Email Automation ≥ the build that sets this
+  // flag). Without it the tab is exactly the pre-override list.
+  const overridesSupported =
+    automationModuleActive &&
+    !!(window as any).yatraAdmin?.emailTemplateOverridesEnabled;
+  const [section, setSection] = useState<"global" | "override">("global");
+  const [parentFilter, setParentFilter] = useState("");
+  const [asTrip, setAsTrip] = useState<number | null>(null);
+  const [overrideModal, setOverrideModal] = useState<{
+    open: boolean;
+    parent: UnifiedEmailTemplate | null;
+  }>({ open: false, parent: null });
+  const { options: tripTargetOptions } = useTripTargets(overridesSupported);
+  const tripOptions = useMemo(
+    () =>
+      tripTargetOptions
+        .filter((o) => String(o.value).startsWith("trip:"))
+        .map((o) => ({
+          id: Number(String(o.value).slice(5)),
+          label: o.label.replace(/^[^:]+: /, ""),
+        })),
+    [tripTargetOptions],
+  );
+  const { data: resolution } = useQuery({
+    queryKey: ["email-templates-resolve", asTrip],
+    queryFn: () => resolveEmailTemplatesForTrip(asTrip as number),
+    enabled: overridesSupported && !!asTrip,
+  });
+
+  const { data: templatesData, isLoading: apiLoading } = useQuery({
+    queryKey: ["email-templates"],
+    queryFn: () => fetchEmailTemplates(),
+    enabled: automationModuleActive,
+  });
+
+  const apiTemplates: UnifiedEmailTemplate[] = useMemo(() => {
+    const raw = Array.isArray(templatesData) ? templatesData : [];
+    return (raw as UnifiedEmailTemplate[]).map((t) => ({
+      ...t,
+      is_locked: false,
+    }));
+  }, [templatesData]);
+
+  const localTemplates = useMemo(() => {
+    if (automationModuleActive || !settingsBridge) return [];
+    return buildLocalTemplateRows(settingsBridge.values, {
+      isProPluginActive: isProPluginActive(),
+      isModuleActive,
+    });
+  }, [automationModuleActive, settingsBridge]);
+
+  const allTemplates = automationModuleActive ? apiTemplates : localTemplates;
+  const overrideTemplates = useMemo(
+    () => (overridesSupported ? allTemplates.filter((t) => !!t.overrides) : []),
+    [allTemplates, overridesSupported],
+  );
+  const globalTemplates = useMemo(
+    () =>
+      overridesSupported
+        ? allTemplates.filter((t) => !t.overrides)
+        : allTemplates,
+    [allTemplates, overridesSupported],
+  );
+  // The list the filters / table operate on: one section at a time.
+  const templates =
+    overridesSupported && section === "override"
+      ? overrideTemplates
+      : globalTemplates;
+  const globalByKey = useMemo(() => {
+    const m = new Map<string, UnifiedEmailTemplate>();
+    globalTemplates.forEach((t) => m.set(t.template_key, t));
+    return m;
+  }, [globalTemplates]);
+  const overridesByParent = useMemo(() => {
+    const m = new Map<string, UnifiedEmailTemplate[]>();
+    overrideTemplates.forEach((t) => {
+      const k = t.overrides || "";
+      m.set(k, [...(m.get(k) || []), t]);
+    });
+    m.forEach((arr) =>
+      arr.sort(
+        (a, b) =>
+          (a.priority || 0) - (b.priority || 0) || Number(a.id) - Number(b.id),
+      ),
+    );
+    return m;
+  }, [overrideTemplates]);
+
+  const isLoading = automationModuleActive ? apiLoading : false;
+
+  const reorderMutation = useMutation({
+    mutationFn: ({ parentKey, ids }: { parentKey: string; ids: number[] }) =>
+      reorderEmailTemplateOverrides(parentKey, ids),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      queryClient.invalidateQueries({ queryKey: ["email-templates-resolve"] });
+    },
+    onError: (error: any) => {
+      showToast(
+        error?.message || __("Failed to reorder overrides", "yatra"),
+        "error",
+      );
+    },
+  });
+  const moveOverride = (t: UnifiedEmailTemplate, delta: number) => {
+    const siblings = overridesByParent.get(t.overrides || "") || [];
+    const ids = siblings.map((x) => Number(x.id));
+    const i = ids.indexOf(Number(t.id));
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    reorderMutation.mutate({ parentKey: t.overrides || "", ids });
+  };
+  /** "View as a trip": which row is sent for the chosen trip. */
+  const sentForTrip = (t: UnifiedEmailTemplate): "hit" | "dim" | null => {
+    if (!asTrip || !resolution) return null;
+    if (t.overrides) {
+      return resolution.resolved[t.overrides]?.id === Number(t.id)
+        ? "hit"
+        : "dim";
+    }
+    if (!resolution.overridable.includes(t.template_key)) return null; // not booking-bound: unaffected
+    return resolution.resolved[t.template_key] ? "dim" : "hit";
+  };
+
+  const toggleMutation = useMutation({
+    mutationFn: async ({
+      id,
+      is_active,
+    }: {
+      id: number;
+      is_active: boolean;
+    }) => {
+      return await setEmailTemplateActive(id, is_active);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      showToast(__("Template updated"), "success");
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (id: number) => {
+      return await deleteEmailTemplate(id);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      showToast(__("Template deleted"), "success");
+    },
+    onError: (error: any) => {
+      showToast(error?.message || __("Failed to delete template"), "error");
+    },
+  });
+
+  const duplicateMutation = useMutation({
+    mutationFn: async (id: number) => {
+      return await duplicateEmailTemplate(id);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      showToast(__("Template duplicated successfully"), "success");
+    },
+    onError: (error: any) => {
+      showToast(error?.message || __("Failed to duplicate template"), "error");
+    },
+  });
+
+  const proPreviewMutation = useMutation({
+    mutationFn: (templateId: number) => previewEmailTemplate(templateId),
+    onSuccess: (data) => {
+      setPreviewPayload(data);
+      setPreviewOpen(true);
+    },
+    onError: () => {
+      showToast(__("Failed to load preview", "yatra"), "error");
+    },
+  });
+
+  const corePreviewMutation = useMutation({
+    mutationFn: (t: UnifiedEmailTemplate) =>
+      previewCoreEmailTemplate({
+        template_key: t.template_key,
+        subject: t.subject || "",
+        body: t.body || "",
+      }),
+    onSuccess: (data) => {
+      setPreviewPayload(data);
+      setPreviewOpen(true);
+    },
+    onError: () => {
+      showToast(__("Failed to load preview", "yatra"), "error");
+    },
+  });
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: async (ids: (string | number)[]) => {
+      const customTemplateIds = ids
+        .map((id) => toNumericTemplateId(id))
+        .filter((id): id is number => id !== null)
+        .filter((id) => {
+          const template = templates.find(
+            (t) => toNumericTemplateId(t.id) === id,
+          );
+          return template && !template.is_system && isApiTemplate(template);
+        });
+
+      if (customTemplateIds.length === 0) {
+        throw new Error(
+          __(
+            "No custom templates selected. System templates cannot be deleted.",
+          ),
+        );
+      }
+
+      await Promise.all(customTemplateIds.map((id) => deleteEmailTemplate(id)));
+      return {
+        deleted: customTemplateIds.length,
+        skipped: ids.length - customTemplateIds.length,
+      };
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      setSelectedIds([]);
+      setBulkAction("");
+      if (data.skipped > 0) {
+        showToast(
+          __(
+            `Deleted ${data.deleted} template(s). ${data.skipped} system template(s) were skipped.`,
+          ),
+          "success",
+        );
+      } else {
+        showToast(__(`Deleted ${data.deleted} template(s)`), "success");
+      }
+    },
+    onError: (error: any) => {
+      showToast(error?.message || __("Failed to delete templates"), "error");
+    },
+  });
+
+  const categories: string[] = useMemo(
+    () => [...new Set(templates.map((t) => t.category))] as string[],
+    [templates],
+  );
+
+  const events = useMemo(() => {
+    if (automationModuleActive) {
+      return (window as any).yatraAdmin?.emailEvents || [];
+    }
+    return [...new Set(EMAIL_TEMPLATES_CATALOG.map((e) => e.event_key))].map(
+      (key) => ({ key, name: key }),
+    );
+  }, [automationModuleActive]);
+
+  const filteredTemplates = useMemo(() => {
+    return templates.filter((t) => {
+      const q = searchTerm.toLowerCase();
+      const bodyPlain = plainTextEmailPreview(t.body || "", 500).toLowerCase();
+      const matchesSearch =
+        !searchTerm ||
+        t.name.toLowerCase().includes(q) ||
+        (t.description || "").toLowerCase().includes(q) ||
+        (t.subject || "").toLowerCase().includes(q) ||
+        bodyPlain.includes(q);
+      const matchesCategory =
+        categoryFilter === "all" || t.category === categoryFilter;
+      const matchesRecipient =
+        recipientFilter === "all" ||
+        getEffectiveRecipientType(t) === recipientFilter;
+      const matchesEvent =
+        eventFilter === "all" ||
+        (t.effective_event_key || t.event_key) === eventFilter;
+      const matchesParent =
+        !parentFilter || section !== "override" || t.overrides === parentFilter;
+      const matchesStatus =
+        statusFilter === "all" ||
+        (statusFilter === "active" && t.is_active) ||
+        (statusFilter === "inactive" && !t.is_active);
+      return (
+        matchesSearch &&
+        matchesCategory &&
+        matchesRecipient &&
+        matchesEvent &&
+        matchesStatus &&
+        matchesParent
+      );
+    });
+  }, [
+    templates,
+    searchTerm,
+    categoryFilter,
+    recipientFilter,
+    eventFilter,
+    statusFilter,
+    parentFilter,
+    section,
+  ]);
+
+  const totalFilteredItems = filteredTemplates.length;
+  const totalPages = Math.ceil(totalFilteredItems / itemsPerPage);
+  const paginatedTemplates = useMemo(() => {
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    return filteredTemplates.slice(startIndex, startIndex + itemsPerPage);
+  }, [filteredTemplates, currentPage, itemsPerPage]);
+
+  useMemo(() => {
+    setCurrentPage(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTerm, categoryFilter, recipientFilter, eventFilter, statusFilter]);
+
+  const handleLockedNavigate = useCallback(() => {
+    if (isProPluginActive()) {
+      window.location.href = "admin.php?page=yatra&subpage=modules";
+    } else {
+      window.open(
+        "https://wpyatra.com/pricing?module=email-automation",
+        "_blank",
+      );
+    }
+  }, []);
+
+  const handleEdit = (template: UnifiedEmailTemplate) => {
+    if (!template.is_locked) {
+      const proId = toNumericTemplateId(template.id);
+      if (automationModuleActive && proId !== null) {
+        window.location.href = `admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&id=${proId}`;
+        return;
+      }
+      window.location.href = `admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&core_template=${encodeURIComponent(template.template_key)}`;
+      return;
+    }
+    if (isModuleGatedLocked(template)) {
+      window.location.href = `admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&core_template=${encodeURIComponent(template.template_key)}`;
+      return;
+    }
+    handleLockedNavigate();
+  };
+
+  const handlePreview = (template: UnifiedEmailTemplate) => {
+    if (template.is_locked && !isModuleGatedLocked(template)) {
+      return;
+    }
+    const numericId = toNumericTemplateId(template.id);
+
+    if (automationModuleActive && numericId !== null) {
+      proPreviewMutation.mutate(numericId);
+    } else {
+      corePreviewMutation.mutate(template);
+    }
+  };
+
+  const [deleteDialog, setDeleteDialog] = useState<{
+    isOpen: boolean;
+    template: UnifiedEmailTemplate | null;
+  }>({ isOpen: false, template: null });
+
+  const handleDelete = useCallback((template: UnifiedEmailTemplate) => {
+    setDeleteDialog({ isOpen: true, template });
+  }, []);
+
+  const confirmDelete = useCallback(() => {
+    const t = deleteDialog.template;
+    if (!t) {
+      setDeleteDialog({ isOpen: false, template: null });
+      return;
+    }
+    const id = toNumericTemplateId(t.id);
+    if (id !== null) {
+      deleteMutation.mutate(id);
+    }
+    setDeleteDialog({ isOpen: false, template: null });
+  }, [deleteDialog.template, deleteMutation]);
+
+  const cancelDelete = useCallback(() => {
+    setDeleteDialog({ isOpen: false, template: null });
+  }, []);
+
+  const handleDuplicate = (template: UnifiedEmailTemplate) => {
+    const id = toNumericTemplateId(template.id);
+    if (id !== null) {
+      duplicateMutation.mutate(id);
+    }
+  };
+
+  const handleCreate = () => {
+    window.location.href =
+      "admin.php?page=yatra&subpage=email-automation&tab=template&action=create";
+  };
+
+  const handleBulkAction = () => {
+    // Report the input that is actually missing. The Apply button is disabled
+    // whenever nothing is selected, so this can only be reached with a non-empty
+    // selection — the combined message blamed the selection and left operators
+    // re-selecting rows that were already ticked.
+    if (selectedIds.length === 0) {
+      showToast(__("Please select at least one template.", "yatra"), "error");
+      return;
+    }
+
+    if (!bulkAction) {
+      showToast(__("Please choose an action to apply.", "yatra"), "error");
+      return;
+    }
+    if (bulkAction === "delete") {
+      bulkDeleteMutation.mutate(selectedIds);
+    }
+  };
+
+  const handleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedIds(filteredTemplates.map((t) => t.id));
+    } else {
+      setSelectedIds([]);
+    }
+  };
+
+  const handleSelectOne = (id: string | number, checked: boolean) => {
+    if (checked) {
+      setSelectedIds([...selectedIds, id]);
+    } else {
+      setSelectedIds(selectedIds.filter((i) => i !== id));
+    }
+  };
+
+  const formatEventKey = (eventKey: string) => eventKey || "-";
+
+  const emitSettingsCheckbox = (
+    flagKey: keyof EmailSettingsValues,
+    checked: boolean,
+  ) => {
+    if (!settingsBridge) return;
+    settingsBridge.onFieldChange({
+      target: {
+        name: flagKey,
+        type: "checkbox",
+        checked,
+      },
+    } as React.ChangeEvent<HTMLInputElement>);
+  };
+
+  const columns = [
+    {
+      key: "name",
+      label: __("Template"),
+      visible: visibleColumns.name,
+      render: (template: UnifiedEmailTemplate) => {
+        const CategoryIcon = categoryIcons[template.category] || Mail;
+        return (
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center flex-shrink-0">
+              <CategoryIcon className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+            </div>
+            <div>
+              {template.is_locked ? (
+                <button
+                  type="button"
+                  onClick={() => handleEdit(template)}
+                  className="text-left font-medium text-gray-600 dark:text-gray-300 hover:text-amber-700 dark:hover:text-amber-400"
+                >
+                  {template.name}
+                  <Lock className="inline-block w-3.5 h-3.5 ml-1.5 -mt-0.5 opacity-70" />
+                  <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">
+                    {isModuleGatedLocked(template)
+                      ? __("View only", "yatra")
+                      : __("Pro", "yatra")}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleEdit(template)}
+                  className="font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline text-left"
+                >
+                  {template.name}
+                </button>
+              )}
+              {/* An older name for a template that is still in use handles the
+                  same event, so editing this one changes nothing until the other
+                  is switched off. Without saying so, the two are indistinguishable
+                  in this list. */}
+              {template.in_use === false && template.superseded_by && (
+                  <span
+                    className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200"
+                    title={sprintf(
+                      /* translators: %s: the template that handles this event instead. */
+                      __(
+                        "Not sent — \u201c%s\u201d handles this event. Switch that one off to use this wording instead.",
+                        "yatra",
+                      ),
+                      globalByKey.get(template.superseded_by)?.name ||
+                        template.superseded_by,
+                    )}
+                  >
+                    {__("Not in use", "yatra")}
+                  </span>
+                )}
+              {template.overrides ? (
+                <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400">
+                  {__("Override", "yatra")}
+                </span>
+              ) : template.is_system ? (
+                <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400">
+                  {overridesSupported ? __("Global", "yatra") : __("System")}
+                </span>
+              ) : (
+                <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                  {__("Custom")}
+                </span>
+              )}
+              {(() => {
+                const mark = sentForTrip(template);
+                const tripName =
+                  tripOptions.find((t) => t.id === asTrip)?.label || "";
+                if (mark === "hit") {
+                  return (
+                    <span
+                      className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300"
+                      data-testid="sent-for-trip"
+                    >
+                      {sprintf(__("sent for %s", "yatra"), tripName)}
+                      {template.overrides &&
+                      resolution?.resolved[template.overrides]?.reason
+                        ? ` · ${resolution.resolved[template.overrides]?.reason}`
+                        : ""}
+                    </span>
+                  );
+                }
+                if (mark === "dim" && !template.overrides) {
+                  const ov = resolution?.resolved[template.template_key];
+                  return (
+                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                      {sprintf(
+                        __("overridden for %1$s → %2$s", "yatra"),
+                        tripName,
+                        ov?.name || "",
+                      )}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+              {template.overrides && !template.is_active && (
+                <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                  {__("off — its trips get the global template", "yatra")}
+                </span>
+              )}
+              {template.overrides &&
+                template.is_active &&
+                !String(template.body || "").trim() && (
+                  <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                    {__(
+                      "no body yet — its trips get the global template",
+                      "yatra",
+                    )}
+                  </span>
+                )}
+            </div>
+          </div>
+        );
+      },
+    },
+    ...(overridesSupported && section === "override"
+      ? [
+          {
+            key: "overrides_of",
+            label: __("Overrides", "yatra"),
+            visible: true,
+            render: (template: UnifiedEmailTemplate) => {
+              const parent = globalByKey.get(template.overrides || "");
+              const siblings =
+                overridesByParent.get(template.overrides || "") || [];
+              const pos = siblings.findIndex((x) => x.id === template.id) + 1;
+              return (
+                <div>
+                  <button
+                    type="button"
+                    className="text-blue-600 dark:text-blue-400 hover:underline font-medium text-left"
+                    onClick={() => parent && handleEdit(parent)}
+                  >
+                    {parent?.name || template.overrides}
+                  </button>
+                  {siblings.length > 1 && (
+                    <div className="text-xs text-gray-400">
+                      {sprintf(
+                        __("priority %1$d of %2$d", "yatra"),
+                        pos,
+                        siblings.length,
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            },
+          },
+          {
+            key: "applies_to",
+            label: __("Applies to", "yatra"),
+            visible: true,
+            render: (template: UnifiedEmailTemplate) => (
+              <span className="text-sm text-purple-700 dark:text-purple-300">
+                {describeEmailTargets(template.targets, tripTargetOptions) || "—"}
+              </span>
+            ),
+          },
+        ]
+      : []),
+    ...(overridesSupported && section === "global"
+      ? [
+          {
+            key: "overrides_count",
+            label: __("Overrides", "yatra"),
+            visible: true,
+            render: (template: UnifiedEmailTemplate) => {
+              const n = (overridesByParent.get(template.template_key) || [])
+                .length;
+              if (!n) {
+                return (
+                  <span className="text-xs text-gray-400">
+                    {template.overridable ? __("none", "yatra") : "—"}
+                  </span>
+                );
+              }
+              return (
+                <button
+                  type="button"
+                  className="text-sm text-purple-700 dark:text-purple-300 hover:underline inline-flex items-center gap-1"
+                  onClick={() => {
+                    setSection("override");
+                    setParentFilter(template.template_key);
+                  }}
+                  data-testid="overrides-count"
+                >
+                  <Compass className="w-3.5 h-3.5" />
+                  {n === 1
+                    ? __("1 override →", "yatra")
+                    : sprintf(__("%d overrides →", "yatra"), n)}
+                </button>
+              );
+            },
+          },
+        ]
+      : []),
+    {
+      key: "event",
+      label: __("Event"),
+      visible: visibleColumns.event,
+      render: (template: UnifiedEmailTemplate) => {
+        const eventKey = template.effective_event_key || template.event_key;
+        const eventInfo = events.find((e: any) => e.key === eventKey);
+        return (
+          <span
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400 cursor-help"
+            title={eventInfo?.description || ""}
+          >
+            <Zap className="w-3 h-3" />
+            {formatEventKey(eventKey)}
+          </span>
+        );
+      },
+    },
+    {
+      key: "subject",
+      label: __("Subject"),
+      visible: visibleColumns.subject,
+      render: (template: UnifiedEmailTemplate) => (
+        <span
+          className="text-sm text-gray-800 dark:text-gray-200 font-mono line-clamp-2 max-w-xs"
+          title={template.subject || ""}
+        >
+          {(template.subject || "").trim() || "—"}
+        </span>
+      ),
+    },
+    {
+      key: "body_preview",
+      label: __("Body"),
+      // Hidden in the Override section: those rows are about targeting, so the
+      // Template / Overrides / Applies to columns get the room instead.
+      visible:
+        visibleColumns.body_preview &&
+        !(overridesSupported && section === "override"),
+      render: (template: UnifiedEmailTemplate) => {
+        const preview = plainTextEmailPreview(template.body || "");
+        return (
+          <span
+            className="text-sm text-gray-600 dark:text-gray-400 line-clamp-2 max-w-md"
+            title={preview}
+          >
+            {preview || "—"}
+          </span>
+        );
+      },
+    },
+    {
+      key: "description",
+      label: __("Description"),
+      // Hidden in the Override section: those rows are about targeting, so the
+      // Template / Overrides / Applies to columns get the room instead.
+      visible:
+        visibleColumns.description &&
+        !(overridesSupported && section === "override"),
+      render: (template: UnifiedEmailTemplate) => (
+        <span className="text-sm text-gray-600 dark:text-gray-400 line-clamp-1">
+          {template.description || "-"}
+        </span>
+      ),
+    },
+    {
+      key: "category",
+      label: __("Category"),
+      // Hidden in the Override section: those rows are about targeting, so the
+      // Template / Overrides / Applies to columns get the room instead.
+      visible:
+        visibleColumns.category &&
+        !(overridesSupported && section === "override"),
+      render: (template: UnifiedEmailTemplate) => {
+        const CategoryIcon = categoryIcons[template.category] || Mail;
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+            <CategoryIcon className="w-3 h-3" />
+            {template.category.charAt(0).toUpperCase() +
+              template.category.slice(1)}
+          </span>
+        );
+      },
+    },
+    {
+      key: "recipient_type",
+      label: __("Recipient"),
+      // Hidden in the Override section: those rows are about targeting, so the
+      // Template / Overrides / Applies to columns get the room instead.
+      visible:
+        visibleColumns.recipient_type &&
+        !(overridesSupported && section === "override"),
+      render: (template: UnifiedEmailTemplate) => {
+        const effectiveRecipient = getEffectiveRecipientType(template);
+        const toEmail = template.to_email || "";
+        return (
+          <div className="flex flex-col gap-1">
+            <span
+              className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium w-fit ${
+                effectiveRecipient === "admin"
+                  ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
+                  : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
+              }`}
+            >
+              {effectiveRecipient === "admin" ? __("Admin") : __("Customer")}
+            </span>
+            {toEmail && (
+              <span
+                className="text-xs text-gray-500 dark:text-gray-400 truncate max-w-[150px]"
+                title={toEmail}
+              >
+                {toEmail}
+              </span>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: "is_active",
+      label: __("Status"),
+      visible: visibleColumns.is_active,
+      render: (template: UnifiedEmailTemplate) => (
+        <Switch
+          checked={template.is_active}
+          disabled={
+            (template.is_locked && !isModuleGatedLocked(template)) ||
+            toggleMutation.isPending
+          }
+          onCheckedChange={(checked) => {
+            if (template.is_locked && !isModuleGatedLocked(template)) return;
+            const proId = toNumericTemplateId(template.id);
+            if (automationModuleActive && proId !== null) {
+              toggleMutation.mutate({ id: proId, is_active: checked });
+              return;
+            }
+            const entry = EMAIL_TEMPLATES_CATALOG.find(
+              (e) => e.template_key === template.template_key,
+            );
+            if (entry?.settingsFlag) {
+              emitSettingsCheckbox(entry.settingsFlag, checked);
+            }
+          }}
+        />
+      ),
+    },
+  ];
+
+  const actions = [
+    ...(overridesSupported
+      ? [
+          {
+            key: "add_override",
+            label: __("Add override…", "yatra"),
+            icon: <Compass className="w-4 h-4" />,
+            onClick: (template: UnifiedEmailTemplate) =>
+              setOverrideModal({ open: true, parent: template }),
+            condition: (template: UnifiedEmailTemplate) =>
+              !template.overrides &&
+              !!template.overridable &&
+              isApiTemplate(template),
+          },
+          {
+            key: "override_up",
+            label: __("Higher priority", "yatra"),
+            icon: <ArrowUp className="w-4 h-4" />,
+            onClick: (template: UnifiedEmailTemplate) =>
+              moveOverride(template, -1),
+            condition: (template: UnifiedEmailTemplate) =>
+              !!template.overrides &&
+              (overridesByParent.get(template.overrides) || []).length > 1,
+          },
+          {
+            key: "override_down",
+            label: __("Lower priority", "yatra"),
+            icon: <ArrowDown className="w-4 h-4" />,
+            onClick: (template: UnifiedEmailTemplate) =>
+              moveOverride(template, 1),
+            condition: (template: UnifiedEmailTemplate) =>
+              !!template.overrides &&
+              (overridesByParent.get(template.overrides) || []).length > 1,
+          },
+        ]
+      : []),
+    {
+      key: "preview",
+      label: __("Preview", "yatra"),
+      icon: <Eye className="w-4 h-4" />,
+      onClick: handlePreview,
+      condition: (template: UnifiedEmailTemplate) =>
+        !template.is_locked || isModuleGatedLocked(template),
+    },
+    {
+      key: "edit",
+      label: __("Edit"),
+      icon: <Edit className="w-4 h-4" />,
+      onClick: handleEdit,
+    },
+    {
+      key: "duplicate",
+      label: __("Duplicate"),
+      icon: <Copy className="w-4 h-4" />,
+      onClick: handleDuplicate,
+      condition: (template: UnifiedEmailTemplate) =>
+        automationModuleActive &&
+        isApiTemplate(template) &&
+        !template.is_system,
+    },
+    {
+      key: "delete",
+      label: __("Delete"),
+      icon: <Trash2 className="w-4 h-4" />,
+      onClick: handleDelete,
+      condition: (template: UnifiedEmailTemplate) =>
+        automationModuleActive &&
+        isApiTemplate(template) &&
+        !template.is_system,
+      variant: "destructive" as const,
+    },
+  ];
+
+  const columnOptions = [
+    { key: "name", label: __("Template"), visible: visibleColumns.name },
+    { key: "event", label: __("Event"), visible: visibleColumns.event },
+    { key: "subject", label: __("Subject"), visible: visibleColumns.subject },
+    {
+      key: "body_preview",
+      label: __("Body"),
+      visible: visibleColumns.body_preview,
+    },
+    {
+      key: "description",
+      label: __("Description"),
+      visible: visibleColumns.description,
+    },
+    {
+      key: "category",
+      label: __("Category"),
+      visible: visibleColumns.category,
+    },
+    {
+      key: "recipient_type",
+      label: __("Recipient"),
+      visible: visibleColumns.recipient_type,
+    },
+    {
+      key: "is_active",
+      label: __("Status"),
+      visible: visibleColumns.is_active,
+    },
+  ];
+
+  return (
+    <div className="space-y-4">
+      {!automationModuleActive && (
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          {__(
+            "Templates backed by site settings can be edited here. Rows for Yatra Pro Email Automation or optional modules stay visible with their on/off state; open a View only row to inspect content, or enable Pro or the module to edit HTML and unlock automation.",
+            "yatra",
+          )}
+        </p>
+      )}
+
+      {overridesSupported && (
+        <div className="space-y-2" data-testid="template-sections">
+          <div className="inline-flex rounded-lg border border-gray-300 dark:border-gray-600 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => {
+                setSection("global");
+                setParentFilter("");
+              }}
+              aria-pressed={section === "global"}
+              className={`inline-flex items-center gap-2 px-4 h-10 text-sm font-medium ${section === "global" ? "bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" : "bg-white text-gray-600 dark:bg-gray-800 dark:text-gray-300"}`}
+              data-testid="section-global"
+            >
+              <Globe className="w-4 h-4" />
+              {__("Global templates", "yatra")}
+              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+                {globalTemplates.length}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSection("override")}
+              aria-pressed={section === "override"}
+              className={`inline-flex items-center gap-2 px-4 h-10 text-sm font-medium border-l border-gray-300 dark:border-gray-600 ${section === "override" ? "bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300" : "bg-white text-gray-600 dark:bg-gray-800 dark:text-gray-300"}`}
+              data-testid="section-override"
+            >
+              <Compass className="w-4 h-4" />
+              {__("Override templates", "yatra")}
+              <span className="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
+                {overrideTemplates.length}
+              </span>
+            </button>
+          </div>
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            {section === "global"
+              ? __(
+                  "One template per event, sent to every trip unless an override applies. Editing a global template never changes its overrides.",
+                  "yatra",
+                )
+              : __(
+                  "Trip-specific versions of a global template. Same event and merge tags as the template they override; used only for bookings on the trips they name. Everything else keeps the global template.",
+                  "yatra",
+                )}
+          </p>
+        </div>
+      )}
+
+      {automationModuleActive && (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          {overridesSupported ? (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="text-gray-500">
+                {__("View as a trip:", "yatra")}
+              </span>
+              <div className="w-72" data-testid="view-as-trip">
+                <SearchableSelect
+                  value={asTrip ? String(asTrip) : ""}
+                  onChange={(value) => setAsTrip(value ? Number(value) : null)}
+                  options={tripOptions.map((t) => ({
+                    value: String(t.id),
+                    label: t.label,
+                  }))}
+                  placeholder={__("— none (show everything) —", "yatra")}
+                  searchPlaceholder={__("Search trips…", "yatra")}
+                />
+              </div>
+              <span className="text-xs text-gray-400">
+                {asTrip
+                  ? paymentMethodOptions()
+                    ? __(
+                        "Highlighted rows are what this trip's customers receive. An override limited to payment methods isn't shown here; it replaces these for bookings paid that way.",
+                        "yatra",
+                      )
+                    : __(
+                        "Highlighted rows are exactly what this trip's customers receive.",
+                        "yatra",
+                      )
+                  : __(
+                      "Pick a trip to highlight exactly what that trip's customers receive.",
+                      "yatra",
+                    )}
+              </span>
+            </div>
+          ) : (
+            <span />
+          )}
+          <div className="flex items-center gap-2">
+            {overridesSupported && section === "override" ? (
+              <Button
+                onClick={() => setOverrideModal({ open: true, parent: null })}
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+                data-testid="add-override"
+              >
+                <Plus className="w-4 h-4 mr-2" />
+                {__("Add override", "yatra")}
+              </Button>
+            ) : (
+              <Button
+                onClick={handleCreate}
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+              >
+                <Plus className="w-4 h-4 mr-2" />
+                {__("Create Template")}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <Card>
+        <CardContent className="p-4">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
+            <div className="lg:col-span-6">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                <Input
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder={__("Search templates...")}
+                  className="pl-10 w-full"
+                />
+              </div>
+            </div>
+            <div className="lg:col-span-2">
+              {overridesSupported && section === "override" ? (
+                <Select
+                  value={parentFilter}
+                  onChange={(e) => setParentFilter(e.target.value)}
+                  className="w-full"
+                  data-testid="parent-filter"
+                >
+                  <option value="">{__("Overrides of: any", "yatra")}</option>
+                  {globalTemplates
+                    .filter(
+                      (g) =>
+                        (overridesByParent.get(g.template_key) || []).length >
+                        0,
+                    )
+                    .map((g) => (
+                      <option key={g.template_key} value={g.template_key}>
+                        {sprintf(__("Overrides of: %s", "yatra"), g.name)}
+                      </option>
+                    ))}
+                </Select>
+              ) : (
+                <Select
+                  value={categoryFilter}
+                  onChange={(e) => setCategoryFilter(e.target.value)}
+                  className="w-full"
+                >
+                  <option value="all">{__("All Categories")}</option>
+                  {categories.map((cat: string) => (
+                    <option key={cat} value={cat}>
+                      {cat.charAt(0).toUpperCase() + cat.slice(1)}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </div>
+            <div className="lg:col-span-2">
+              <Select
+                value={recipientFilter}
+                onChange={(e) => setRecipientFilter(e.target.value)}
+                className="w-full"
+              >
+                <option value="all">{__("All Recipients")}</option>
+                <option value="customer">{__("Customer")}</option>
+                <option value="admin">{__("Admin")}</option>
+              </Select>
+            </div>
+            <div className="lg:col-span-2">
+              <Select
+                value={eventFilter}
+                onChange={(e) => setEventFilter(e.target.value)}
+                className="w-full"
+              >
+                <option value="all">{__("All Events")}</option>
+                {events.map((event: any) => (
+                  <option key={event.key} value={event.key}>
+                    {event.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <BulkActionToolbar
+        selectedIds={selectedIds}
+        bulkAction={bulkAction}
+        setBulkAction={setBulkAction}
+        onApply={handleBulkAction}
+        onClearSelection={() => setSelectedIds([])}
+        statusFilter={statusFilter}
+        setStatusFilter={setStatusFilter}
+        statusOptions={[
+          { key: "all", label: __("All"), count: templates.length },
+          {
+            key: "active",
+            label: __("Active"),
+            count: templates.filter((t) => t.is_active).length,
+          },
+          {
+            key: "inactive",
+            label: __("Inactive"),
+            count: templates.filter((t) => !t.is_active).length,
+          },
+        ]}
+        showColumnsDropdown={showColumnsDropdown}
+        setShowColumnsDropdown={setShowColumnsDropdown}
+        columnOptions={columnOptions}
+        onToggleColumn={toggleColumn}
+        bulkMutationPending={bulkDeleteMutation.isPending}
+        totalItems={filteredTemplates.length}
+        bulkActionOptions={
+          automationModuleActive
+            ? [{ value: "delete", label: __("Delete") }]
+            : []
+        }
+      />
+
+      <Card>
+        <CardContent className="p-0">
+          <SharedTable
+            data={paginatedTemplates}
+            columns={columns}
+            actions={actions}
+            isLoading={isLoading}
+            emptyText={
+              overridesSupported && section === "override"
+                ? __("No overrides yet", "yatra")
+                : __("No templates found")
+            }
+            emptyDescription={
+              overridesSupported && section === "override"
+                ? __(
+                    "Every trip gets the global templates. Use “Add override” here or “Add override…” on a global template.",
+                    "yatra",
+                  )
+                : __("Create your first email template to get started.")
+            }
+            onCreateClick={
+              automationModuleActive
+                ? overridesSupported && section === "override"
+                  ? () => setOverrideModal({ open: true, parent: null })
+                  : handleCreate
+                : undefined
+            }
+            getItemId={(template: UnifiedEmailTemplate) => template.id}
+            capability="yatra_manage_emails"
+            skeletonRows={5}
+            selectedItemIds={selectedIds}
+            onSelectItem={handleSelectOne}
+            onSelectAll={handleSelectAll}
+            isAllSelected={
+              selectedIds.length > 0 &&
+              selectedIds.length === paginatedTemplates.length &&
+              paginatedTemplates.length > 0
+            }
+          />
+        </CardContent>
+      </Card>
+
+      {totalFilteredItems > itemsPerPage && (
+        <div className="mt-4">
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            totalItems={totalFilteredItems}
+            itemsPerPage={itemsPerPage}
+            onPageChange={setCurrentPage}
+            itemName={__("templates")}
+          />
+        </div>
+      )}
+
+      {overridesSupported && (
+        <EmailOverrideCreateModal
+          isOpen={overrideModal.open}
+          onClose={() => setOverrideModal({ open: false, parent: null })}
+          globals={globalTemplates.filter((g) => !!g.overridable)}
+          parent={overrideModal.parent}
+        />
+      )}
+
+      <EmailPreviewModal
+        open={previewOpen && Boolean(previewPayload)}
+        onClose={() => {
+          setPreviewOpen(false);
+          setPreviewPayload(null);
+        }}
+        subject={previewPayload?.subject ?? ""}
+        body={previewPayload?.body ?? ""}
+      />
+
+      <ConfirmationDialog
+        isOpen={deleteDialog.isOpen}
+        onClose={cancelDelete}
+        onConfirm={confirmDelete}
+        title={__("Delete Template")}
+        message={
+          deleteDialog.template
+            ? __(
+                'Are you sure you want to delete "{name}"? This action cannot be undone.',
+              ).replace("{name}", deleteDialog.template.name)
+            : ""
+        }
+        confirmText={__("Delete")}
+        cancelText={__("Cancel")}
+        variant="danger"
+        isLoading={deleteMutation.isPending}
+      />
+    </div>
+  );
+};
+
+export default EmailTemplatesList;

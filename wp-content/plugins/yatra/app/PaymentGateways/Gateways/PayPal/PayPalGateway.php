@@ -1,0 +1,1055 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\PaymentGateways\Gateways\PayPal;
+
+use Yatra\Database\Tables\BookingsTable;
+use Yatra\Database\Tables\BookingPaymentsTable;
+use Yatra\PaymentGateways\AbstractPaymentGateway;
+use Yatra\PaymentGateways\GatewayUserMessages;
+
+class PayPalGateway extends AbstractPaymentGateway
+{
+    protected string $id = 'paypal';
+    protected string $title = 'PayPal';
+    protected string $description = 'Accept PayPal and credit card payments';
+    protected string $icon = 'paypal.svg';
+    protected string $sandboxUrl = 'https://developer.paypal.com/tools/sandbox/';
+    protected array $supports = ['paypal', 'credit_card', 'refunds', 'recurring', 'tokenization'];
+
+    /**
+     * Translatable display title. The raw `$title` property can't carry a
+     * `__()` call (PHP property defaults must be constant), so the customer-
+     * facing label is translated here. An admin-set custom title (via gateway
+     * config) still takes precedence in PaymentGatewayRegistry::getForCheckout().
+     */
+    public function getTitle(): string
+    {
+        return __('PayPal', 'yatra');
+    }
+
+    /**
+     * Translatable description shown under the gateway option at checkout.
+     */
+    public function getDescription(): string
+    {
+        return __('Accept PayPal and credit card payments', 'yatra');
+    }
+
+    public function getConfigFields(): array
+    {
+        return [
+            [
+                'id' => 'mode',
+                'type' => 'select',
+                'label' => __('Integration Mode', 'yatra'),
+                'description' => __('Choose how to connect PayPal', 'yatra'),
+                'default' => 'simple',
+                'options' => [
+                    'simple' => __('Simple (Email Only) - Quick setup, basic payments', 'yatra'),
+                    'advanced' => __('Advanced (API) - Refunds, saved cards, scheduled payments', 'yatra'),
+                ],
+                'help_text' => __('Simple mode: Just enter your PayPal email. Advanced mode: Enables refunds, saved payment methods, and scheduled payments.', 'yatra'),
+            ],
+            [
+                'id' => 'email',
+                'type' => 'email',
+                'label' => __('PayPal Email', 'yatra'),
+                'description' => __('Your PayPal account email address', 'yatra'),
+                'placeholder' => 'your-email@example.com',
+                'default' => '',
+                'help_text' => __('Enter the email address associated with your PayPal Business or Premier account.', 'yatra'),
+                'help_url_live' => 'https://www.paypal.com/businesswallet/settings',
+                'show_when' => ['mode' => 'simple'],
+            ],
+            [
+                'id' => 'client_id',
+                'type' => 'text',
+                'label' => __('Client ID', 'yatra'),
+                'description' => __('Your PayPal application client ID', 'yatra'),
+                'placeholder' => 'AeA1QIZXiflr1...',
+                'default' => '',
+                'help_url_test' => 'https://developer.paypal.com/tools/sandbox/',
+                'help_url_live' => 'https://developer.paypal.com/dashboard/applications/live',
+                'help_text' => __('Create an app in PayPal Developer Dashboard to get Client ID', 'yatra'),
+                'show_when' => ['mode' => 'advanced'],
+            ],
+            [
+                'id' => 'client_secret',
+                'type' => 'password',
+                'label' => __('Client Secret', 'yatra'),
+                'description' => __('Your PayPal application client secret', 'yatra'),
+                'placeholder' => 'EC...',
+                'default' => '',
+                'help_url_test' => 'https://developer.paypal.com/tools/sandbox/',
+                'help_url_live' => 'https://developer.paypal.com/dashboard/applications/live',
+                'help_text' => __('Get Client Secret from the same PayPal app you created', 'yatra'),
+                'show_when' => ['mode' => 'advanced'],
+            ],
+            [
+                'id' => 'webhook_url',
+                'type' => 'text',
+                'readonly' => true,
+                'label' => __('Webhook URL', 'yatra'),
+                'description' => __('Add this URL as a webhook in your PayPal app', 'yatra'),
+                'default' => rest_url('yatra/v1/payment/webhook/paypal'),
+                'help_text' => __('In your PayPal app, add this as a webhook and subscribe to the "Payment capture completed" event. This is a reliable backup that confirms bookings even if the customer closes the browser after paying.', 'yatra'),
+                'show_when' => ['mode' => 'advanced'],
+            ],
+            [
+                'id' => 'webhook_id',
+                'type' => 'text',
+                'label' => __('Webhook ID', 'yatra'),
+                'description' => __('Webhook ID from your PayPal app', 'yatra'),
+                'placeholder' => 'WH-...',
+                'default' => '',
+                'help_text' => __('Paste the Webhook ID of the webhook you created above. This enables signed verification of incoming PayPal webhooks.', 'yatra'),
+                'show_when' => ['mode' => 'advanced'],
+            ],
+        ];
+    }
+
+    /**
+     * Check if using simple (email-only) mode
+     */
+    private function isSimpleMode(): bool
+    {
+        return ($this->config['mode'] ?? 'simple') === 'simple';
+    }
+
+    public function isProperlyConfigured(): bool
+    {
+        if ($this->isSimpleMode()) {
+            return !empty(trim((string) ($this->config['email'] ?? '')));
+        }
+
+        return !empty(trim((string) ($this->config['client_id'] ?? '')))
+            && !empty(trim((string) ($this->config['client_secret'] ?? '')));
+    }
+
+    private function getBaseUrl(): string
+    {
+        return \Yatra\Services\SettingsService::isPaymentTestMode()
+            ? 'https://api-m.sandbox.paypal.com' 
+            : 'https://api-m.paypal.com';
+    }
+
+    private function getAccessToken(): ?string
+    {
+        $response = $this->makeRequest($this->getBaseUrl() . '/v1/oauth2/token', [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Basic ' . base64_encode(($this->config['client_id'] ?? '') . ':' . ($this->config['client_secret'] ?? '')),
+                'Content-Type' => 'application/x-www-form-urlencoded',
+            ],
+            'body' => 'grant_type=client_credentials',
+        ]);
+
+        return $response['body']['access_token'] ?? null;
+    }
+
+    private function getHeaders(): array
+    {
+        $accessToken = $this->getAccessToken();
+        return [
+            'Authorization' => 'Bearer ' . $accessToken,
+            'Content-Type' => 'application/json',
+        ];
+    }
+
+    public function processPayment(array $paymentData): array
+    {
+        // Log payment attempt for debugging
+        $this->log('Processing PayPal payment', [
+            'mode' => $this->isSimpleMode() ? 'simple' : 'advanced',
+            'amount' => $paymentData['amount'] ?? 0,
+            'currency' => $paymentData['currency'] ?? 'USD',
+            'booking_id' => $paymentData['booking_id'] ?? 0,
+            'test_mode' => \Yatra\Services\SettingsService::isPaymentTestMode(),
+        ]);
+
+        // Use simple or advanced mode based on configuration
+        if ($this->isSimpleMode()) {
+            return $this->processSimplePayment($paymentData);
+        }
+
+        return $this->processAdvancedPayment($paymentData);
+    }
+
+    /**
+     * Process payment using Simple mode (PayPal Standard - email only)
+     * Redirects to PayPal hosted checkout page
+     */
+    private function processSimplePayment(array $paymentData): array
+    {
+        $email = $this->config['email'] ?? '';
+        if (empty($email)) {
+            return ['success' => false, 'error' => GatewayUserMessages::gatewayNotConfigured($this)];
+        }
+
+        $amount = number_format((float) ($paymentData['amount'] ?? 0), 2, '.', '');
+        $currency = $paymentData['currency'] ?? 'USD';
+        $bookingId = $paymentData['booking_id'] ?? 0;
+        $reference = $paymentData['reference'] ?? $bookingId;
+        $description = $paymentData['description'] ?? sprintf(
+            /* translators: %s: booking reference. */
+            __('Booking #%s', 'yatra'),
+            $reference
+        );
+        $returnUrl = $paymentData['return_url'] ?? yatra_get_booking_confirmation_url((string) $reference);
+        // Cancel returns must land on the booking-confirmation page (a route that always
+        // resolves). The legacy `home_url('/book/?...')` 404s whenever the booking base is
+        // customised or a custom booking page is used — see RouteMatcher::matchBookingRoute().
+        $cancelUrl = $paymentData['cancel_url'] ?? add_query_arg('payment', 'cancelled', yatra_get_booking_confirmation_url((string) $reference));
+
+        // PayPal Standard base URL
+        $isTestMode = \Yatra\Services\SettingsService::isPaymentTestMode();
+        $paypalUrl = $isTestMode 
+            ? 'https://www.sandbox.paypal.com/cgi-bin/webscr'
+            : 'https://www.paypal.com/cgi-bin/webscr';
+
+        // Build PayPal Standard payment URL
+        $params = [
+            'cmd' => '_xclick',
+            'business' => $email,
+            'item_name' => $description,
+            'item_number' => $reference,
+            'amount' => $amount,
+            'currency_code' => $currency,
+            'return' => add_query_arg(['paypal' => 'success', 'booking_id' => $bookingId], $returnUrl),
+            'cancel_return' => $cancelUrl,
+            'notify_url' => rest_url('yatra/v1/payment/webhook/paypal'),
+            'custom' => wp_json_encode(['booking_id' => $bookingId, 'reference' => $reference]),
+            'no_shipping' => '1',
+            'no_note' => '1',
+            'rm' => '2', // POST data back to return URL
+        ];
+
+        $redirectUrl = $paypalUrl . '?' . http_build_query($params);
+
+        $this->log('PayPal Simple mode redirect URL created', [
+            'booking_id' => $bookingId,
+            'amount' => $amount,
+            'test_mode' => $isTestMode,
+        ]);
+
+        return [
+            'success' => true,
+            'redirect_url' => $redirectUrl,
+            'transaction_id' => 'pending_' . $bookingId, // Will be updated via IPN
+            'mode' => 'simple',
+        ];
+    }
+
+    /**
+     * Process payment using Advanced mode (PayPal REST API)
+     * Creates order via API and redirects to approval URL
+     */
+    private function processAdvancedPayment(array $paymentData): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            $this->log('PayPal authentication failed', ['client_id' => substr($this->config['client_id'] ?? '', 0, 10) . '...']);
+            return ['success' => false, 'error' => __('Failed to authenticate with PayPal. Please check your API credentials.', 'yatra')];
+        }
+
+        $amount = number_format((float) ($paymentData['amount'] ?? 0), 2, '.', '');
+        $currency = $paymentData['currency'] ?? 'USD';
+        $bookingId = $paymentData['booking_id'] ?? 0;
+        $referenceForReturn = (string) ($paymentData['reference'] ?? $bookingId);
+        $returnUrl = $paymentData['return_url'] ?? yatra_get_booking_confirmation_url($referenceForReturn);
+        // Cancel returns must land on the booking-confirmation page (always resolvable);
+        // the legacy `home_url('/book/?...')` 404s under a custom booking base/page.
+        $cancelUrl = $paymentData['cancel_url'] ?? add_query_arg('payment', 'cancelled', yatra_get_booking_confirmation_url($referenceForReturn));
+        $savePayment = !empty($paymentData['save_payment']);
+
+        $orderData = [
+            'intent' => 'CAPTURE',
+            'purchase_units' => [[
+                'custom_id' => (string) $bookingId,
+                'description' => $paymentData['description'] ?? sprintf(
+                    /* translators: %s: booking reference. */
+                    __('Booking #%s', 'yatra'),
+                    $bookingId
+                ),
+                'amount' => [
+                    'currency_code' => $currency,
+                    'value' => $amount,
+                ],
+            ]],
+            'application_context' => [
+                'return_url' => add_query_arg(['paypal' => 'success', 'booking_id' => $bookingId], $returnUrl),
+                'cancel_url' => $cancelUrl,
+                'user_action' => 'PAY_NOW',
+                'brand_name' => get_bloginfo('name'),
+            ],
+        ];
+
+        // Enable vault for saving payment method
+        if ($savePayment) {
+            $orderData['payment_source'] = [
+                'paypal' => [
+                    'experience_context' => [
+                        'payment_method_preference' => 'IMMEDIATE_PAYMENT_REQUIRED',
+                        'return_url' => add_query_arg(['paypal' => 'success', 'booking_id' => $bookingId], $returnUrl),
+                        'cancel_url' => $cancelUrl,
+                    ],
+                    'attributes' => [
+                        'vault' => [
+                            'store_in_vault' => 'ON_SUCCESS',
+                            'usage_type' => 'MERCHANT',
+                        ],
+                    ],
+                ],
+            ];
+        }
+
+        $response = $this->makeRequest($this->getBaseUrl() . '/v2/checkout/orders', [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Content-Type' => 'application/json',
+            ],
+            'body' => wp_json_encode($orderData),
+        ]);
+
+        if (!$response['success'] || empty($response['body']['id'])) {
+            $errorMessage = $response['body']['message'] ?? $response['body']['error_description'] ?? __('Failed to create PayPal order', 'yatra');
+            $this->log('PayPal order creation failed', [
+                'response' => $response,
+                'error' => $errorMessage,
+            ]);
+            return ['success' => false, 'error' => $errorMessage];
+        }
+
+        // Get approval URL
+        $approvalUrl = null;
+        foreach ($response['body']['links'] ?? [] as $link) {
+            if ($link['rel'] === 'approve') {
+                $approvalUrl = $link['href'];
+                break;
+            }
+        }
+
+        if (empty($approvalUrl)) {
+            $this->log('PayPal order created but no approval URL found', ['order_id' => $response['body']['id']]);
+            return ['success' => false, 'error' => __('PayPal order created but redirect URL not found', 'yatra')];
+        }
+
+        $this->log('PayPal order created successfully', [
+            'order_id' => $response['body']['id'],
+            'approval_url' => $approvalUrl,
+        ]);
+
+        return [
+            'success' => true,
+            'order_id' => $response['body']['id'],
+            'transaction_id' => $response['body']['id'],
+            'redirect_url' => $approvalUrl,
+            'approval_url' => $approvalUrl,
+            'client_id' => $this->config['client_id'] ?? '',
+            'sandbox' => \Yatra\Services\SettingsService::isPaymentTestMode(),
+            'mode' => 'advanced',
+        ];
+    }
+
+    /**
+     * Create PayPal customer (for vault)
+     */
+    public function createCustomer(array $customerData): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return ['success' => false, 'error' => __('Failed to authenticate with PayPal', 'yatra')];
+        }
+
+        // PayPal uses vault tokens associated with merchant, not traditional customers
+        // Generate a unique customer reference
+        $customerId = 'yatra_' . md5($customerData['email'] . time());
+
+        return [
+            'success' => true,
+            'customer_id' => $customerId,
+        ];
+    }
+
+    /**
+     * Save payment token after successful vaulted payment
+     */
+    public function savePaymentMethod(string $customerId, array $paymentMethodData): array
+    {
+        // PayPal vault token is returned after successful order capture
+        $vaultId = $paymentMethodData['vault_id'] ?? '';
+        
+        if (empty($vaultId)) {
+            return [
+                'success' => false,
+                'error' => __('Vault ID is required', 'yatra'),
+            ];
+        }
+
+        return [
+            'success' => true,
+            'payment_method_id' => $vaultId,
+            'type' => 'paypal',
+            'card_brand' => 'paypal',
+            'card_last4' => substr($paymentMethodData['email'] ?? '', -4),
+        ];
+    }
+
+    /**
+     * Charge saved PayPal payment token
+     */
+    public function chargePaymentMethod(string $customerId, string $paymentMethodId, array $paymentData): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return ['success' => false, 'error' => __('Failed to authenticate with PayPal', 'yatra')];
+        }
+
+        $amount = number_format((float) ($paymentData['amount'] ?? 0), 2, '.', '');
+        $currency = $paymentData['currency'] ?? 'USD';
+        $bookingId = $paymentData['booking_id'] ?? 0;
+
+        // Create order using vaulted payment source
+        $orderData = [
+            'intent' => 'CAPTURE',
+            'purchase_units' => [[
+                'custom_id' => (string) $bookingId,
+                'description' => $paymentData['description'] ?? 'Scheduled Payment',
+                'amount' => [
+                    'currency_code' => $currency,
+                    'value' => $amount,
+                ],
+            ]],
+            'payment_source' => [
+                'paypal' => [
+                    'vault_id' => $paymentMethodId,
+                ],
+            ],
+        ];
+
+        $response = $this->makeRequest($this->getBaseUrl() . '/v2/checkout/orders', [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Content-Type' => 'application/json',
+                'PayPal-Request-Id' => uniqid('yatra_', true),
+            ],
+            'body' => wp_json_encode($orderData),
+        ]);
+
+        if (!$response['success'] || empty($response['body']['id'])) {
+            return [
+                'success' => false,
+                'error' => $response['body']['message'] ?? __('Failed to create PayPal order', 'yatra'),
+            ];
+        }
+
+        $orderId = $response['body']['id'];
+
+        // Auto-capture for vaulted payments
+        if ($response['body']['status'] === 'COMPLETED') {
+            $captureId = $response['body']['purchase_units'][0]['payments']['captures'][0]['id'] ?? null;
+            return [
+                'success' => true,
+                'transaction_id' => $captureId ?? $orderId,
+                'order_id' => $orderId,
+                'amount' => (float) $amount,
+                'currency' => $currency,
+                'status' => 'completed',
+            ];
+        }
+
+        // If not auto-captured, capture now
+        $captureResponse = $this->makeRequest($this->getBaseUrl() . "/v2/checkout/orders/{$orderId}/capture", [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Content-Type' => 'application/json',
+            ],
+        ]);
+
+        if ($captureResponse['body']['status'] === 'COMPLETED') {
+            $captureId = $captureResponse['body']['purchase_units'][0]['payments']['captures'][0]['id'] ?? null;
+            return [
+                'success' => true,
+                'transaction_id' => $captureId ?? $orderId,
+                'order_id' => $orderId,
+                'amount' => (float) $amount,
+                'currency' => $currency,
+                'status' => 'completed',
+            ];
+        }
+
+        return [
+            'success' => false,
+            'error' => __('Payment capture failed', 'yatra'),
+        ];
+    }
+
+    /**
+     * Get saved payment methods
+     */
+    public function getPaymentMethods(string $customerId): array
+    {
+        // PayPal vault tokens need to be stored locally
+        // as PayPal doesn't provide a list endpoint for merchant-stored tokens
+        return [];
+    }
+
+    /**
+     * Delete saved payment method
+     */
+    public function deletePaymentMethod(string $paymentMethodId): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return ['success' => false, 'error' => __('Failed to authenticate with PayPal', 'yatra')];
+        }
+
+        $response = $this->makeRequest($this->getBaseUrl() . "/v3/vault/payment-tokens/{$paymentMethodId}", [
+            'method' => 'DELETE',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+            ],
+        ]);
+
+        return [
+            'success' => $response['code'] === 204 || $response['success'],
+        ];
+    }
+
+    public function verifyPayment(string $transactionId): array
+    {
+        return $this->verifyOrder($transactionId, 0);
+    }
+
+    /**
+     * verifyPayment() for a known booking: an order created for another
+     * booking is refused before it is captured.
+     */
+    public function verifyPaymentForBooking(string $transactionId, int $bookingId): array
+    {
+        return $this->verifyOrder($transactionId, max(1, $bookingId));
+    }
+
+    /**
+     * Look up a PayPal order, capture it if it is approved, and report what
+     * was actually paid: the booking it was created for (`custom_id`, set by
+     * this site when it created the order), the captured amount and currency.
+     *
+     * With $expectedBookingId, an order created for another booking is refused
+     * BEFORE it is captured. Any order of this PayPal app could otherwise be
+     * replayed against any booking — for example a cheap booking's payment used
+     * to settle an expensive one.
+     */
+    private function verifyOrder(string $orderId, int $expectedBookingId): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return ['success' => false, 'error' => 'Authentication failed'];
+        }
+
+        if ($orderId === '' || !preg_match('/^[A-Za-z0-9-]+$/', $orderId)) {
+            return ['success' => false, 'error' => 'Invalid order id'];
+        }
+
+        // First try to get order details
+        $orderResponse = $this->makeRequest($this->getBaseUrl() . "/v2/checkout/orders/{$orderId}", [
+            'method' => 'GET',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+            ],
+        ]);
+
+        $order = is_array($orderResponse['body'] ?? null) ? $orderResponse['body'] : [];
+        $orderBookingId = (int) ($order['purchase_units'][0]['custom_id'] ?? 0);
+
+        if ($expectedBookingId > 0 && $orderBookingId !== $expectedBookingId) {
+            $this->log('PayPal order does not belong to this booking — ignored', [
+                'order_id' => $orderId,
+                'expected_booking_id' => $expectedBookingId,
+                'order_booking_id' => $orderBookingId,
+            ]);
+
+            return ['success' => false, 'status' => 'BOOKING_MISMATCH', 'error' => 'Order does not belong to this booking'];
+        }
+
+        $status = (string) ($order['status'] ?? '');
+
+        // If already completed, return success
+        if ($status === 'COMPLETED') {
+            return $this->orderResult($order, $order, $orderBookingId, true);
+        }
+
+        // If approved, capture the order
+        if ($status === 'APPROVED') {
+            $response = $this->makeRequest($this->getBaseUrl() . "/v2/checkout/orders/{$orderId}/capture", [
+                'method' => 'POST',
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $accessToken,
+                    'Content-Type' => 'application/json',
+                ],
+            ]);
+
+            $captured = is_array($response['body'] ?? null) ? $response['body'] : [];
+
+            return $this->orderResult($captured, $order, $orderBookingId, ($captured['status'] ?? '') === 'COMPLETED');
+        }
+
+        return [
+            'success' => false,
+            'status' => $status !== '' ? $status : 'UNKNOWN',
+        ];
+    }
+
+    /**
+     * The verify result for a (captured) order: what was paid, in what
+     * currency, for which booking. The amount comes from the capture itself.
+     */
+    private function orderResult(array $body, array $order, int $orderBookingId, bool $success): array
+    {
+        $capture = $body['purchase_units'][0]['payments']['captures'][0] ?? [];
+
+        $vaultId = null;
+        $paymentSource = $body['payment_source']['paypal'] ?? [];
+        if (!empty($paymentSource['attributes']['vault']['id'])) {
+            $vaultId = $paymentSource['attributes']['vault']['id'];
+        }
+
+        $result = [
+            'success' => $success,
+            'status' => (string) ($body['status'] ?? ''),
+            'capture_id' => $capture['id'] ?? null,
+            'vault_id' => $vaultId,
+            'booking_id' => $orderBookingId,
+        ];
+
+        $amount = $capture['amount'] ?? ($order['purchase_units'][0]['amount'] ?? null);
+        if (is_array($amount) && isset($amount['value'])) {
+            $result['amount'] = (float) $amount['value'];
+            $result['currency'] = strtoupper((string) ($amount['currency_code'] ?? ''));
+        }
+
+        return $result;
+    }
+
+    public function processRefund(string $transactionId, float $amount): array
+    {
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return ['success' => false, 'error' => 'Authentication failed'];
+        }
+
+        $response = $this->makeRequest($this->getBaseUrl() . "/v2/payments/captures/{$transactionId}/refund", [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Content-Type' => 'application/json',
+            ],
+            'body' => wp_json_encode([
+                'amount' => [
+                    'value' => number_format($amount, 2, '.', ''),
+                    'currency_code' => 'USD',
+                ],
+            ]),
+        ]);
+
+        return [
+            'success' => $response['success'],
+            'refund_id' => $response['body']['id'] ?? null,
+        ];
+    }
+
+    /**
+     * Handle PayPal webhook (supports both IPN for Simple mode and REST webhooks for Advanced mode)
+     */
+    public function handleWebhook(array $data): array
+    {
+        $body = $data['raw_body'] ?? '';
+        $postData = $data['post_data'] ?? [];
+        
+        // Check if this is an IPN notification (Simple mode)
+        if (!empty($postData['txn_type']) || !empty($postData['payment_status'])) {
+            return $this->handleIPN($postData);
+        }
+        
+        // Otherwise handle as REST API webhook (Advanced mode)
+        $event = json_decode($body, true);
+        $eventType = $event['event_type'] ?? '';
+
+        switch ($eventType) {
+            case 'PAYMENT.CAPTURE.COMPLETED':
+                $resource = $event['resource'] ?? [];
+
+                // Only confirm from a webhook whose signature we can verify against
+                // the configured Webhook ID. Unverified events are ignored for
+                // confirmation (the return-capture path is authoritative); the
+                // informational action still fires for any custom listeners.
+                if ($this->verifyWebhookSignature($data['headers'] ?? [], $body, $event)) {
+                    $bookingId = (int) ($resource['custom_id'] ?? 0);
+                    $transactionId = (string) ($resource['id'] ?? '');
+                    if ($bookingId > 0 && $transactionId !== '') {
+                        $bookingRepository = new \Yatra\Repositories\BookingRepository();
+                        $booking = $bookingRepository->find($bookingId);
+                        if ($booking) {
+                            $this->completePayment($booking, $bookingRepository, $transactionId, [
+                                'amount' => (float) ($resource['amount']['value'] ?? 0),
+                                'currency' => (string) ($resource['amount']['currency_code'] ?? 'USD'),
+                            ]);
+                        }
+                    }
+                } else {
+                    $this->log('PayPal webhook not verified — confirmation skipped (set Webhook ID to enable)', [
+                        'event_type' => $eventType,
+                    ]);
+                }
+
+                do_action('yatra_paypal_payment_completed', $resource);
+                break;
+
+            case 'PAYMENT.CAPTURE.REFUNDED':
+                do_action('yatra_paypal_payment_refunded', $event['resource'] ?? []);
+                break;
+
+            case 'VAULT.PAYMENT-TOKEN.CREATED':
+                do_action('yatra_paypal_token_created', $event['resource'] ?? []);
+                break;
+        }
+
+        return ['success' => true, 'event_type' => $eventType];
+    }
+
+    /**
+     * Verify an Advanced-mode REST webhook against the configured Webhook ID
+     * using PayPal's verify-webhook-signature API. Returns false when no
+     * Webhook ID is configured, so unverified events are never trusted.
+     */
+    private function verifyWebhookSignature(array $headers, string $rawBody, array $event): bool
+    {
+        $webhookId = trim((string) ($this->config['webhook_id'] ?? ''));
+        if ($webhookId === '') {
+            return false;
+        }
+
+        $accessToken = $this->getAccessToken();
+        if (!$accessToken) {
+            return false;
+        }
+
+        $header = static function (string $name) use ($headers): string {
+            // WP REST normalises header keys to lowercase, with dashes or underscores.
+            foreach ([$name, str_replace('-', '_', $name)] as $key) {
+                if (isset($headers[$key])) {
+                    return (string) (is_array($headers[$key]) ? ($headers[$key][0] ?? '') : $headers[$key]);
+                }
+            }
+            return '';
+        };
+
+        $payload = [
+            'auth_algo' => $header('paypal-auth-algo'),
+            'cert_url' => $header('paypal-cert-url'),
+            'transmission_id' => $header('paypal-transmission-id'),
+            'transmission_sig' => $header('paypal-transmission-sig'),
+            'transmission_time' => $header('paypal-transmission-time'),
+            'webhook_id' => $webhookId,
+            'webhook_event' => $event,
+        ];
+
+        if ($payload['transmission_id'] === '' || $payload['transmission_sig'] === '') {
+            return false;
+        }
+
+        $response = $this->makeRequest($this->getBaseUrl() . '/v1/notifications/verify-webhook-signature', [
+            'method' => 'POST',
+            'headers' => [
+                'Authorization' => 'Bearer ' . $accessToken,
+                'Content-Type' => 'application/json',
+            ],
+            'body' => wp_json_encode($payload),
+        ]);
+
+        return ($response['body']['verification_status'] ?? '') === 'SUCCESS';
+    }
+    
+    /**
+     * Handle PayPal IPN (Instant Payment Notification) for Simple mode
+     */
+    private function handleIPN(array $ipnData): array
+    {
+        $this->log('PayPal IPN received', $ipnData);
+        
+        // Verify IPN with PayPal
+        $isTestMode = \Yatra\Services\SettingsService::isPaymentTestMode();
+        $verifyUrl = $isTestMode 
+            ? 'https://ipnpb.sandbox.paypal.com/cgi-bin/webscr'
+            : 'https://ipnpb.paypal.com/cgi-bin/webscr';
+        
+        $verifyData = array_merge(['cmd' => '_notify-validate'], $ipnData);
+        
+        $response = wp_remote_post($verifyUrl, [
+            'body' => $verifyData,
+            'timeout' => 60,
+            'httpversion' => '1.1',
+        ]);
+        
+        if (is_wp_error($response)) {
+            $this->log('IPN verification failed', ['error' => $response->get_error_message()]);
+            return ['success' => false, 'error' => 'IPN verification failed'];
+        }
+        
+        $responseBody = wp_remote_retrieve_body($response);
+        
+        if ($responseBody !== 'VERIFIED') {
+            $this->log('IPN not verified', ['response' => $responseBody]);
+            return ['success' => false, 'error' => 'IPN not verified'];
+        }
+        
+        // VERIFIED only proves PayPal sent this message — not that the money
+        // went to this site. Anyone can pay their own PayPal account and point
+        // that payment's IPN here with another booking's id in `custom`.
+        if (!$this->ipnPaidToThisAccount($ipnData)) {
+            $this->log('IPN ignored: payment was not made to the configured PayPal account', [
+                'receiver_email' => $ipnData['receiver_email'] ?? '',
+                'business' => $ipnData['business'] ?? '',
+                'txn_id' => $ipnData['txn_id'] ?? '',
+            ]);
+            return ['success' => false, 'error' => 'IPN receiver mismatch'];
+        }
+
+        // Process the payment
+        $paymentStatus = $ipnData['payment_status'] ?? '';
+        $customData = json_decode($ipnData['custom'] ?? '{}', true);
+        $bookingId = $customData['booking_id'] ?? 0;
+        $transactionId = $ipnData['txn_id'] ?? '';
+        $amount = (float) ($ipnData['mc_gross'] ?? 0);
+        $currency = strtoupper((string) ($ipnData['mc_currency'] ?? ''));
+        
+        if ($paymentStatus === 'Completed' && $bookingId > 0) {
+            // Record the payment + confirm the booking. completePayment is
+            // idempotent (and fires `yatra_payment_completed` itself), so a
+            // re-sent IPN won't double-record.
+            $bookingRepository = new \Yatra\Repositories\BookingRepository();
+            $booking = $bookingRepository->find((int) $bookingId);
+            if ($booking) {
+                $this->completePayment($booking, $bookingRepository, $transactionId, [
+                    'amount' => $amount,
+                    'currency' => $currency,
+                ]);
+            }
+
+            $this->log('PayPal IPN payment completed', [
+                'booking_id' => $bookingId,
+                'transaction_id' => $transactionId,
+                'amount' => $amount,
+            ]);
+
+            return ['success' => true, 'status' => 'completed', 'booking_id' => $bookingId];
+        }
+        
+        return ['success' => true, 'status' => $paymentStatus];
+    }
+    
+    /**
+     * Was this IPN's payment made to the PayPal account configured here?
+     *
+     * PayPal names the receiving account in `receiver_email` (its primary
+     * email), `business` (the value the checkout form sent, possibly a
+     * secondary email) and `receiver_id` (the merchant ID). The configured
+     * "PayPal email" may be any of these, so any one matching is enough.
+     */
+    private function ipnPaidToThisAccount(array $ipnData): bool
+    {
+        $configured = strtolower(trim((string) ($this->config['email'] ?? '')));
+        if ($configured === '') {
+            return false;
+        }
+
+        foreach (['receiver_email', 'business', 'receiver_id'] as $field) {
+            $value = strtolower(trim((string) ($ipnData[$field] ?? '')));
+            if ($value !== '' && hash_equals($configured, $value)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if this gateway should handle the return request
+     */
+    public function shouldHandleReturn(array $params): bool
+    {
+        return isset($params['paypal']) && $params['paypal'] === 'success';
+    }
+    
+    /**
+     * Handle payment return from PayPal (when user is redirected back after payment)
+     * Works for both Simple and Advanced modes
+     */
+    public function handlePaymentReturn($booking, $bookingRepository): void
+    {
+        global $wpdb;
+        
+        // Check if payment already processed
+        if ($booking->payment_status === 'paid') {
+            return;
+        }
+        
+        $bookingId = (int) $booking->id;
+        $isAdvancedMode = !$this->isSimpleMode();
+        
+        $this->log('Handling PayPal return', [
+            'booking_id' => $bookingId,
+            'mode' => $isAdvancedMode ? 'advanced' : 'simple',
+        ]);
+        
+        if ($isAdvancedMode) {
+            // Advanced mode: Get token from URL and capture the order
+            $token = sanitize_text_field($_GET['token'] ?? '');
+            
+            if (!empty($token)) {
+                // The token comes from the URL: only accept an order this site
+                // created for THIS booking, and credit what was really captured.
+                $result = $this->verifyOrder($token, $bookingId);
+                
+                if ($result['success'] && $result['status'] === 'COMPLETED' && isset($result['amount'])) {
+                    $this->completePayment($booking, $bookingRepository, (string) ($result['capture_id'] ?? $token), [
+                        'amount' => (float) $result['amount'],
+                        'currency' => (string) ($result['currency'] ?? ''),
+                    ]);
+                }
+            }
+        } else {
+            // Simple mode: Payment verification happens via IPN
+            // For now, mark as pending verification - IPN will update it
+            // But we can show success to user since PayPal redirected them back
+            $this->log('Simple mode return - awaiting IPN verification', ['booking_id' => $bookingId]);
+        }
+    }
+    
+    /**
+     * Complete the payment and update booking status
+     */
+    private function completePayment($booking, $bookingRepository, string $transactionId, array $paymentData = []): void
+    {
+        global $wpdb;
+
+        // Already settled in full — never apply another charge to it.
+        if (($booking->payment_status ?? '') === 'paid') {
+            return;
+        }
+
+        $bookingId = (int) $booking->id;
+        $payments_table = BookingPaymentsTable::getTableName();
+
+        // Idempotency: bail if this gateway transaction is already recorded for
+        // this booking. Prevents duplicate rows when the confirmation-page return
+        // and the webhook both fire for the same capture. Mirrors StripeGateway.
+        if ($transactionId !== '') {
+            $alreadyRecorded = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT id FROM {$payments_table} WHERE booking_id = %d AND transaction_id = %s LIMIT 1",
+                    $bookingId,
+                    $transactionId
+                )
+            );
+            if ($alreadyRecorded) {
+                return;
+            }
+        }
+
+        // Credit only what PayPal reports was paid, in the booking's currency.
+        // (Defaulting to the amount due marked a deposit as full payment, and a
+        // payment in another currency was counted as if it were this one.)
+        $amount = isset($paymentData['amount']) ? (float) $paymentData['amount'] : 0.0;
+        $currency = strtoupper(trim((string) ($paymentData['currency'] ?? '')));
+        $bookingCurrency = strtoupper(trim((string) ($booking->currency ?? '')));
+        if ($bookingCurrency === '') {
+            $bookingCurrency = strtoupper(trim((string) \Yatra\Services\SettingsService::getCurrency()));
+        }
+        if ($amount <= 0 || $currency === '' || ($bookingCurrency !== '' && $currency !== $bookingCurrency)) {
+            $this->log('PayPal payment not applied: missing amount or wrong currency', [
+                'booking_id' => $bookingId,
+                'transaction_id' => $transactionId,
+                'amount' => $amount,
+                'currency' => $currency,
+                'booking_currency' => $bookingCurrency,
+            ]);
+            return;
+        }
+        $previousBookingStatus = (string) ($booking->status ?? 'pending');
+
+        // Accumulate paid amount so deposit/partial flows don't get force-marked fully paid.
+        $totalAmount = (float) ($booking->total_amount ?? 0);
+        $newAmountPaid = (float) ($booking->amount_paid ?? 0) + $amount;
+        $newAmountDue = max(0.0, $totalAmount - $newAmountPaid);
+        $paymentStatus = $newAmountDue <= 0.01 ? 'paid' : 'partial';
+
+        // Only auto-confirm when "Auto-Confirm Bookings" is on; otherwise the
+        // booking stays pending for the operator to confirm manually, regardless
+        // of a successful (full or partial) payment.
+        $shouldConfirm = \yatra_should_confirm_booking_on_payment($newAmountDue <= 0.01, $bookingId);
+
+        // Update booking payment status
+        $bookings_table = BookingsTable::getTableName();
+        $bookingUpdate = [
+            'payment_status' => $paymentStatus,
+            'amount_paid' => $newAmountPaid,
+            'amount_due' => $newAmountDue,
+        ];
+        $bookingUpdateFormat = ['%s', '%f', '%f'];
+        if ($shouldConfirm) {
+            $bookingUpdate['status'] = 'confirmed';
+            $bookingUpdate['confirmed_at'] = current_time('mysql');
+            $bookingUpdateFormat[] = '%s';
+            $bookingUpdateFormat[] = '%s';
+        }
+        $wpdb->update(
+            $bookings_table,
+            $bookingUpdate,
+            ['id' => $bookingId],
+            $bookingUpdateFormat,
+            ['%d']
+        );
+
+        // Record the payment (note: column is `gateway`, not `payment_gateway`).
+        $wpdb->insert(
+            $payments_table,
+            [
+                'booking_id' => $bookingId,
+                'amount' => $amount,
+                'currency' => $currency,
+                'gateway' => 'paypal',
+                'transaction_id' => $transactionId,
+                'status' => 'completed',
+                'created_at' => current_time('mysql'),
+            ],
+            ['%d', '%f', '%s', '%s', '%s', '%s', '%s']
+        );
+
+        $this->log('PayPal payment completed', [
+            'booking_id' => $bookingId,
+            'transaction_id' => $transactionId,
+            'amount' => $amount,
+            'payment_status' => $paymentStatus,
+        ]);
+
+        if ($shouldConfirm) {
+            \yatra_trigger_booking_confirmed($bookingId, $previousBookingStatus, true);
+        }
+
+        // Fire action for other plugins/services
+        do_action('yatra_payment_completed', [
+            'booking_id' => $bookingId,
+            'transaction_id' => $transactionId,
+            'amount' => $amount,
+            'currency' => $currency,
+            'gateway' => 'paypal',
+        ]);
+    }
+}
+

@@ -1,0 +1,1054 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Services;
+
+/**
+ * Installer Service
+ * 
+ * Handles plugin installation and default settings setup
+ * Ensures proper default configuration on fresh installation
+ */
+class InstallerService
+{
+    /**
+     * Run installation tasks
+     * 
+     * @return void
+     */
+    public static function install(): void
+    {
+        // Create all database tables (one-time action)
+        self::createDatabaseTables();
+        
+        // Set all default options for fresh installation
+        self::setDefaultOptions();
+    }
+    
+    /**
+     * Create all database tables (centralized table creation)
+     * 
+     * @return void
+     */
+    public static function createDatabaseTables(): void
+    {
+        if (class_exists('\Yatra\Core\Database')) {
+            \Yatra\Core\Database::createTables();
+        }
+
+    }
+    
+    /**
+     * Set all default options for fresh installation
+     * Only Book Now Pay Later should be enabled by default
+     * Uses SettingsService keys to ensure consistency
+     * 
+     * @return void
+     */
+    private static function setDefaultOptions(): void
+    {
+        // Whether this is a brand-new install vs. a reactivation/upgrade.
+        // Captured before version/date are stamped below so it reflects the
+        // pre-activation state.
+        $isFreshInstall = self::isFreshInstallation();
+
+        // Seed a default only when the option is absent. add_option() is a
+        // no-op when the option already exists (existence is keyed on the
+        // option NAME, so values legitimately stored as false/0/'' are still
+        // preserved). This makes activation idempotent: a deactivate ->
+        // reactivate, or a plugin update, can never overwrite an operator's
+        // saved settings, while a fresh install (and any newly-introduced
+        // default on upgrade) is still seeded.
+        $seed = static function (string $name, $value): void {
+            add_option($name, $value);
+        };
+
+        // Payment Gateway Settings - Only enable Pay Later by default
+        // These match SettingsService defaults exactly
+        $seed('yatra_payment_gateways', ['pay_later']);
+        $seed('yatra_payment_methods', []);
+        $seed('yatra_payment_test_mode', true);
+        $seed('yatra_auto_confirm_pay_later', true);
+        $seed('yatra_partial_payment', false);
+        // Set gateway configs with proper structure - only enable pay_later by default.
+        // Deliberately no 'title'/'description' here. Each gateway class owns
+        // its own label and exposes it through a translatable getTitle() /
+        // getDescription(); seeding an English literal into the stored config
+        // made the checkout treat it as the operator's own wording, which shut
+        // the translated getter out and left the payment section of the booking
+        // form in English on translated sites. An absent label is an expected
+        // state — the gateways that were never seeded (Mollie, Paystack) have
+        // always worked this way.
+        $gateway_configs = [
+            'pay_later' => [
+                'enabled' => true,
+            ],
+            // Explicitly disable all other gateways
+            'stripe' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+                'webhook_secret' => '',
+            ],
+            'paypal' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+            ],
+            'razorpay' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+            ],
+            'square' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+            ],
+            'authorize_net' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+            ],
+            'bank_transfer' => [
+                'enabled' => false,
+                'api_key' => '',
+                'api_secret' => '',
+            ]
+        ];
+        $seed('yatra_gateway_configs', $gateway_configs);
+        $seed('yatra_gateway_order', []);
+        
+        // Currency Settings - Match SettingsService defaults
+        $seed('yatra_currency', 'USD');
+        $seed('yatra_currency_position', 'before');
+        $seed('yatra_thousand_separator', ',');
+        $seed('yatra_decimal_separator', '.');
+        $seed('yatra_decimal_places', 2);
+        
+        // Flexible Payment Settings - Match SettingsService defaults
+        $seed('yatra_enable_deposit', false);
+        $seed('yatra_deposit_type', 'percentage');
+        $seed('yatra_deposit_amount', 20);
+        $seed('yatra_deposit_required', false);
+        $seed('yatra_deposit_percentage', 20);
+        $seed('yatra_partial_payment_percentage', 30);
+        
+        $seed('yatra_allow_save_payment_methods', false);
+        
+        // Trip Settings - Match SettingsService defaults
+        $seed('yatra_trip_base', 'trip');
+        $seed('yatra_trips_per_page', 12);
+        $seed('yatra_enable_wishlist', false);
+        $seed('yatra_enable_comparison', false);
+        $seed('yatra_show_sold_out', true);
+        
+        // Customer Settings - Match SettingsService defaults
+        $seed('yatra_enable_customer_accounts', true);
+        $seed('yatra_enable_customer_registration', true);
+        
+        // Booking Settings - Match SettingsService defaults
+        $seed('yatra_booking_base', 'book');
+        $seed('yatra_use_booking_page', false);
+        $seed('yatra_booking_page_id', 0);
+        $seed('yatra_enable_guest_booking', true);
+        $seed('yatra_booking_confirmation', true);
+        $seed('yatra_auto_confirm_bookings', false);
+        $seed('yatra_require_login', false);
+        $seed('yatra_allow_guest_checkout', true);
+        // cancellation_policy / cancellation_days / refund_policy
+        // intentionally not seeded — these are removed settings (see
+        // SettingsController::$default_settings comment). Existing
+        // sites that already have orphan values stored will keep
+        // them in wp_options; new sites won't acquire them.
+        $seed('yatra_booking_expiry_hours', 24);
+        $seed('yatra_booking_reminder_days', 3);
+        $seed('yatra_allow_waitlist', true);
+        
+        // Email identity: canonical keys (REST / EmailService) + legacy keys for older code paths
+        $wpAdminEmail = (string) get_option('admin_email', '');
+        $blogName = (string) get_bloginfo('name');
+        $seed('yatra_from_email', $wpAdminEmail);
+        $seed('yatra_from_name', $blogName);
+        $seed('yatra_admin_email', $wpAdminEmail);
+        $seed('yatra_email_from_name', $blogName);
+        $seed('yatra_email_from_address', $wpAdminEmail);
+        $seed('yatra_enable_admin_notifications', true);
+        $seed('yatra_enable_customer_notifications', true);
+
+        // Default transactional template HTML + subjects (Email → Templates / settings API)
+        foreach (EmailTemplateDefaults::settingsOptionDefaults() as $optionKey => $value) {
+            $seed('yatra_' . $optionKey, $value);
+        }
+        $seed('yatra_email_template_booking', true);
+        $seed('yatra_email_template_confirmation', true);
+        $seed('yatra_email_template_cancellation', true);
+        $seed('yatra_email_template_reminder', true);
+        $seed('yatra_email_template_admin_new_booking', true);
+        $seed('yatra_email_template_admin_payment', true);
+        $seed('yatra_email_template_admin_cancellation', true);
+        $seed('yatra_email_template_trip_consent', true);
+        $seed('yatra_email_template_customer_verification', true);
+        $seed('yatra_email_template_guest_verification', true);
+        $seed('yatra_email_template_booking_completed', true);
+        $seed('yatra_email_template_booking_expired_customer', true);
+        $seed('yatra_email_template_admin_booking_expired', true);
+        $seed('yatra_email_template_scheduled_payment_reminder', true);
+        $seed('yatra_email_template_scheduled_payment_succeeded', true);
+        $seed('yatra_email_template_scheduled_payment_failed', true);
+        $seed('yatra_email_template_admin_scheduled_payment_failed', true);
+        $seed('yatra_email_template_enquiry_received', true);
+        $seed('yatra_email_template_enquiry_admin', true);
+        $seed('yatra_email_template_enquiry_response', true);
+        // Off on a fresh install — see SettingsService::$defaults for why.
+        $seed('yatra_email_template_review_request', false);
+        $seed('yatra_email_template_abandoned_booking_recovery_first', true);
+        $seed('yatra_email_template_abandoned_booking_recovery_second', true);
+        $seed('yatra_email_template_abandoned_booking_recovery_final', true);
+
+        // Clear pre-existing legacy Stripe/PayPal settings, but only on a
+        // brand-new install. On a reactivation these may hold the operator's
+        // configured gateway data, so deleting them would be destructive.
+        if ($isFreshInstall) {
+            delete_option('yatra_stripe_settings');
+            delete_option('yatra_paypal_settings');
+        }
+        
+        // Installation tracking: stamp the date once (seed); keep the
+        // version current so upgrade routines can detect version changes.
+        $seed('yatra_installation_date', current_time('mysql'));
+        update_option('yatra_version', defined('YATRA_VERSION') ? YATRA_VERSION : '3.0.3');
+        
+
+    }
+    
+    /**
+     * Get all required database tables using Table classes
+     * 
+     * @return array
+     */
+    public static function getRequiredTables(): array
+    {
+        // Must match \Yatra\Core\Database::createTables() — used for activation, migrations, and targeted checks.
+        $table_classes = [
+            \Yatra\Database\Tables\TripsTable::class,
+            \Yatra\Database\Tables\BookingsTable::class,
+            \Yatra\Database\Tables\BookingPaymentsTable::class,
+            \Yatra\Database\Tables\PaymentNotesTable::class,
+            \Yatra\Database\Tables\CustomersTable::class,
+            \Yatra\Database\Tables\BookingTravellersTable::class,
+            \Yatra\Database\Tables\BookingTravellerMetaTable::class,
+            \Yatra\Database\Tables\BookingDeparturesTable::class,
+            \Yatra\Database\Tables\ReviewsTable::class,
+            \Yatra\Database\Tables\DiscountsTable::class,
+            \Yatra\Database\Tables\EnquiriesTable::class,
+            \Yatra\Database\Tables\TripAvailabilityDatesTable::class,
+            \Yatra\Database\Tables\TripAvailabilityRulesTable::class,
+            \Yatra\Database\Tables\TripRevisionsTable::class,
+            \Yatra\Database\Tables\DeparturesTable::class,
+            \Yatra\Database\Tables\TripItineraryDaysTable::class,
+            \Yatra\Database\Tables\TripItineraryDayEntryTable::class,
+            \Yatra\Database\Tables\ClassificationsTable::class,
+            \Yatra\Database\Tables\TripClassificationsTable::class,
+            \Yatra\Database\Tables\TripContentTable::class,
+        ];
+
+        $table_names = [];
+        foreach ($table_classes as $table_class) {
+            if (class_exists($table_class)) {
+                $table_names[] = $table_class::getTableName();
+            }
+        }
+
+        return $table_names;
+    }
+
+    /**
+     * Whether a prefixed table exists. Uses esc_like() because SQL LIKE treats "_" as a wildcard.
+     */
+    public static function databaseTableExists(string $fullTableName): bool
+    {
+        global $wpdb;
+        if ($fullTableName === '') {
+            return false;
+        }
+        $pattern = $wpdb->esc_like($fullTableName);
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $pattern));
+
+        return $found === $fullTableName;
+    }
+    
+    /**
+     * Check if this is a fresh installation
+     * 
+     * @return bool
+     */
+    public static function isFreshInstallation(): bool
+    {
+        // Check if Yatra version exists in database
+        $installed_version = get_option('yatra_version');
+        
+        // If no version is set, it's a fresh installation
+        if ($installed_version === false) {
+            return true;
+        }
+        
+        // Check installation date
+        $installation_date = get_option('yatra_installation_date');
+        if ($installation_date === false) {
+            return true;
+        }
+        
+        // Additional check: if core tables don't exist, it's fresh
+        $required_tables = self::getRequiredTables();
+        if (!empty($required_tables)) {
+            $trips_table = $required_tables[0]; // Use first table (already has prefix)
+            if (!self::databaseTableExists($trips_table)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    /**
+     * One-time: coupon migration incorrectly stored status "active"; 3.x uses "publish" (admin + checkout).
+     */
+    public static function maybeNormalizeMigratedCouponDiscountStatuses(): void
+    {
+        if (get_option('yatra_discount_active_status_normalized_v1')) {
+            return;
+        }
+
+        if (!class_exists('Yatra\\Database\\Tables\\DiscountsTable')) {
+            return;
+        }
+
+        $table = \Yatra\Database\Tables\DiscountsTable::getTableName();
+        if (!self::databaseTableExists($table)) {
+            return;
+        }
+
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper
+        $wpdb->query("UPDATE `{$table}` SET `status` = 'publish' WHERE `status` = 'active'");
+
+        update_option('yatra_discount_active_status_normalized_v1', '1', false);
+    }
+
+    /**
+     * One-time normalization of recurring availability rules created against the
+     * legacy schema (only `recurrence_type`, `capacity_value`, `interval`, etc.
+     * were written) so the new admin React UI — which reads `rule_type`,
+     * `seats_total`, `interval_days`, `interval_start_date` — can render and
+     * edit them without showing phantom "1 on All / Active" badges or empty
+     * "Every " patterns.
+     *
+     * What this fixes:
+     *  - Sample-data and pre-3.x rows landed with `rule_type` defaulted to
+     *    'weekly' regardless of the actual `recurrence_type`, and with
+     *    `seats_total` left NULL (the new capacity column). Daily and monthly
+     *    rules therefore appeared as broken weekly rows in the new UI.
+     *  - The /counts endpoint correctly reported 1 active rule, but the list
+     *    table couldn't render it cleanly, leading users to read the API
+     *    response as "ghost data".
+     *
+     * Invariants:
+     *  - Idempotent — every UPDATE filters rows whose new columns are still
+     *    unset, so re-running is a no-op once the data is healed.
+     *  - Read-only on rows already authored by the new UI (`rule_type` already
+     *    matches the recurrence intent), so user edits are never overwritten.
+     *  - No-ops cleanly when the rules table doesn't exist yet (fresh install
+     *    before {@see \Yatra\Core\Database::createTables()} has run).
+     */
+    public static function maybeNormalizeAvailabilityRulesLegacyData(): void
+    {
+        if (get_option('yatra_availability_rules_legacy_normalized_v1')) {
+            return;
+        }
+
+        if (!class_exists('Yatra\\Database\\Tables\\TripAvailabilityRulesTable')) {
+            return;
+        }
+
+        $table = \Yatra\Database\Tables\TripAvailabilityRulesTable::getTableName();
+        if (!self::databaseTableExists($table)) {
+            return;
+        }
+
+        global $wpdb;
+
+        // 1. Daily-recurrence rows whose `rule_type` defaulted to 'weekly':
+        //    map to the new "interval" rule type and copy the legacy `interval`
+        //    + `start_date` into the new columns the React form binds to.
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper
+        $wpdb->query("UPDATE `{$table}`
+            SET `rule_type` = 'interval',
+                `interval_days` = COALESCE(`interval_days`, NULLIF(`interval`, 0), 1),
+                `interval_start_date` = COALESCE(`interval_start_date`, `start_date`)
+            WHERE `recurrence_type` = 'daily'
+              AND (`rule_type` IS NULL OR `rule_type` = '' OR `rule_type` = 'weekly')");
+
+        // 2. Monthly-recurrence rows whose `rule_type` defaulted to 'weekly':
+        //    relabel to 'monthly'. The new UI uses (week_of_month, day_of_week)
+        //    rather than `day_of_month`, so we leave those NULL for the user
+        //    to set in the form rather than guess from the legacy day_of_month.
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper
+        $wpdb->query("UPDATE `{$table}`
+            SET `rule_type` = 'monthly'
+            WHERE `recurrence_type` = 'monthly'
+              AND (`rule_type` IS NULL OR `rule_type` = '' OR `rule_type` = 'weekly')");
+
+        // 3. Weekly-recurrence rows: ensure `rule_type` is set explicitly
+        //    (most already match the default; this catches any NULL/empty).
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper
+        $wpdb->query("UPDATE `{$table}`
+            SET `rule_type` = 'weekly'
+            WHERE `recurrence_type` = 'weekly'
+              AND (`rule_type` IS NULL OR `rule_type` = '')");
+
+        // 4. seats_total backfill from `capacity_value` for fixed-capacity rows
+        //    so CapacityService and the React table both surface the right
+        //    seat cap without falling through hydrate-time fallbacks.
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper
+        $wpdb->query("UPDATE `{$table}`
+            SET `seats_total` = `capacity_value`
+            WHERE `seats_total` IS NULL
+              AND `capacity_value` IS NOT NULL
+              AND `capacity_value` > 0
+              AND (`capacity_type` IS NULL OR `capacity_type` = 'fixed')");
+
+        update_option('yatra_availability_rules_legacy_normalized_v1', '1', false);
+    }
+
+    /**
+     * Ensure `wp_yatra_bookings.status` accepts `pending_verification`.
+     *
+     * The 3.0.5 guest email-verification feature introduced a new holding
+     * status (`pending_verification`) but the production ENUM only listed
+     * the legacy values. Until the column is widened, MySQL non-strict
+     * mode silently coerces the value to `''` on insert — which makes
+     * every booking placed with verification enabled appear broken:
+     *
+     *   1. The admin booking list renders an empty status badge (the
+     *      React status map has no entry for `''` so the row falls into
+     *      the default branch with an empty label).
+     *   2. `BookingService::createBooking` sees the in-memory
+     *      `$data['status'] === 'pending_verification'` and defers
+     *      firing `yatra_booking_created`, so the customer never gets
+     *      the booking-confirmation email.
+     *   3. `verify_email` reads the persisted status (now `''`),
+     *      decides the booking is "already verified", skips the deferred
+     *      fan-out — so neither the status flip nor the booking email
+     *      ever fires.
+     *
+     * Doing the widening here (runIdempotentMaintenance — every admin
+     * pageview) instead of a pure version-gated upgrade step means it
+     * heals installs whose stored yatra_version was already bumped to
+     * 3.0.5 by an earlier failed upgrade attempt. Cheap: one
+     * INFORMATION_SCHEMA query gated by a one-shot option flag, ALTER
+     * runs at most once per install.
+     *
+     * Also backfills any rows whose status was silently coerced to `''`
+     * by the pre-widening insert path: those bookings *should* have
+     * landed in `pending_verification`, so we restore them there. The
+     * original verify-email magic link still works because the HMAC
+     * token is bound to booking_id + email, not status.
+     */
+    public static function maybeAddPendingVerificationBookingStatus(): void
+    {
+        if (get_option('yatra_booking_status_pending_verification_v1')) {
+            return;
+        }
+
+        if (!class_exists('Yatra\\Database\\Tables\\BookingsTable')) {
+            return;
+        }
+
+        $table = \Yatra\Database\Tables\BookingsTable::getTableName();
+        if (!self::databaseTableExists($table)) {
+            return;
+        }
+
+        global $wpdb;
+
+        $columnInfo = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                DB_NAME,
+                $table,
+                'status'
+            )
+        );
+
+        $columnType = is_object($columnInfo) ? (string) ($columnInfo->COLUMN_TYPE ?? '') : '';
+        $needsAlter = $columnType !== '' && strpos($columnType, 'pending_verification') === false;
+
+        if ($needsAlter) {
+            // Match the original column shape exactly minus the new enum
+            // value — nullable, default 'pending', no NOT NULL.
+            // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name escaped, enum literal is static.
+            $wpdb->query(
+                'ALTER TABLE `' . esc_sql($table) . "` "
+                . "MODIFY COLUMN `status` "
+                . "enum('pending','pending_verification','confirmed','processing','completed','cancelled','refunded','failed','on_hold','waitlist') "
+                . "DEFAULT 'pending'"
+            );
+        }
+
+        // Backfill: bookings whose insert hit the old ENUM during a
+        // verification flow ended up with status='' (silent coerce).
+        // Now that the enum accepts pending_verification, restore them.
+        // Filtered to a narrow signal (status='' AND payment_status='pending')
+        // so we don't accidentally re-stamp unrelated edge cases.
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name from schema helper, literal values only.
+        $wpdb->query(
+            "UPDATE `{$table}` SET `status` = 'pending_verification' "
+            . "WHERE `status` = '' AND `payment_status` = 'pending'"
+        );
+
+        update_option('yatra_booking_status_pending_verification_v1', '1', false);
+    }
+
+    /**
+     * Add the `duration_hours` column to the trips table for hour-based
+     * (single-day) tours. Purely additive and nullable — existing trips get
+     * NULL and behave exactly as before (day-based via `duration_days`). Only
+     * tours that later set a positive `duration_hours` change behaviour.
+     *
+     * Idempotent: guarded by a one-shot option AND an INFORMATION_SCHEMA check,
+     * so it runs its ALTER at most once and is a no-op when the column already
+     * exists (fresh installs get it from TripsTable::getSchema()).
+     */
+    public static function maybeAddTripDurationHoursColumn(): void
+    {
+        if (get_option('yatra_trip_duration_hours_v1')) {
+            return;
+        }
+
+        if (!class_exists('Yatra\\Database\\Tables\\TripsTable')) {
+            return;
+        }
+
+        $table = \Yatra\Database\Tables\TripsTable::getTableName();
+        if (!self::databaseTableExists($table)) {
+            return;
+        }
+
+        global $wpdb;
+
+        $columnExists = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                DB_NAME,
+                $table,
+                'duration_hours'
+            )
+        );
+
+        if (!$columnExists) {
+            // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name escaped, static column definition.
+            $wpdb->query(
+                'ALTER TABLE `' . esc_sql($table) . '` '
+                . "ADD COLUMN `duration_hours` smallint(5) UNSIGNED DEFAULT NULL "
+                . "COMMENT 'Duration in hours for hour-based single-day tours, NULL means day-based' "
+                . 'AFTER `duration_nights`'
+            );
+
+            // Re-check so we only mark this done when the column really exists.
+            // If the ALTER failed (e.g. a restrictive host), leave the one-shot
+            // flag unset so it retries on the next admin load rather than
+            // disabling the feature permanently.
+            $columnExists = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                     WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                    DB_NAME,
+                    $table,
+                    'duration_hours'
+                )
+            );
+        }
+
+        if ($columnExists) {
+            update_option('yatra_trip_duration_hours_v1', '1', false);
+        }
+    }
+
+    /**
+     * Create the payment-note history table on sites that already exist.
+     *
+     * Database::createTables() only runs on activation and on a version change,
+     * so a new table added without a version bump would never appear on an
+     * existing install and the note history would silently do nothing. Gated by
+     * its own option, and re-checked cheaply: dbDelta is only called when the
+     * table really is absent.
+     */
+    public static function maybeCreatePaymentNotesTable(): void
+    {
+        if (get_option('yatra_payment_notes_table_v1')) {
+            return;
+        }
+
+        $table = \Yatra\Database\Tables\PaymentNotesTable::getTableName();
+
+        if (self::databaseTableExists($table)) {
+            update_option('yatra_payment_notes_table_v1', '1');
+
+            return;
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta(\Yatra\Database\Tables\PaymentNotesTable::getSchema());
+
+        if (self::databaseTableExists($table)) {
+            update_option('yatra_payment_notes_table_v1', '1');
+
+            return;
+        }
+
+        // Leave the flag unset so the next admin pageview tries again rather
+        // than leaving the feature permanently broken on this site.
+        \Yatra\Utils\Logger::warning('Could not create the payment notes table', [
+            'table' => $table,
+        ]);
+    }
+
+    /**
+     * One-time: put the stored money columns back in step with the payment
+     * ledger on every booking that has a refund.
+     *
+     * Recording a refund used to flip the refunded payment to status 'refunded'
+     * as well as writing the negative refund row, so the same money came off
+     * the total twice: a 1000 payment with a 150 refund stored amount_paid as
+     * -150 instead of 850, amount_due as more than the trip costs, and reset
+     * payment_status to 'pending'. {@see \Yatra\Repositories\PaymentRepository::getBookingPaymentTotals()}
+     * now reads both shapes correctly; this rewrites the figures that were
+     * already stored wrong.
+     *
+     * Only bookings that actually have refund rows are touched, so a site that
+     * has never refunded anything is left completely alone.
+     */
+    public static function maybeRepairRefundedBookingTotals(): void
+    {
+        if (get_option('yatra_refund_totals_repair_v1')) {
+            return;
+        }
+
+        global $wpdb;
+
+        $bookingsTable = $wpdb->prefix . 'yatra_bookings';
+        $paymentsTable = $wpdb->prefix . 'yatra_booking_payments';
+
+        if (!self::databaseTableExists($bookingsTable) || !self::databaseTableExists($paymentsTable)) {
+            return;
+        }
+
+        // Resumable and bounded: a site with a long refund history must not do
+        // the whole table in one admin pageview, and a single unreadable
+        // booking must not be able to block the rest for good.
+        $batchSize = 200;
+        $cursor = (int) get_option('yatra_refund_totals_repair_cursor', 0);
+
+        $bookingIds = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT booking_id
+               FROM {$paymentsTable}
+              WHERE payment_type = 'refund'
+                AND status IN ('completed', 'paid')
+                AND booking_id > %d
+              ORDER BY booking_id ASC
+              LIMIT %d",
+            $cursor,
+            $batchSize
+        ));
+
+        if ($wpdb->last_error !== '') {
+            \Yatra\Utils\Logger::warning('Refund totals repair could not list bookings', ['error' => $wpdb->last_error]);
+
+            return;
+        }
+
+        if (empty($bookingIds)) {
+            delete_option('yatra_refund_totals_repair_cursor');
+            update_option('yatra_refund_totals_repair_v1', '1');
+
+            return;
+        }
+
+        // Every booking's figures are copied to a backup table before they
+        // change (created only on a site that has refunds to repair). No backup table, no repair (retried later, with a pause).
+        $backupTable = $wpdb->prefix . 'yatra_refund_totals_repair_backup_v1';
+        if (!self::ensureRepairBackupTable($backupTable,
+            "booking_id bigint(20) UNSIGNED NOT NULL, amount_paid decimal(12,2) DEFAULT NULL, amount_due decimal(12,2) DEFAULT NULL, payment_status varchar(32) DEFAULT NULL, backed_up_at datetime NOT NULL, PRIMARY KEY (booking_id)",
+            'yatra_refund_totals_repair_retry_at')) {
+            return;
+        }
+
+        $paymentRepository = new \Yatra\Repositories\PaymentRepository();
+        $bookingRepository = new \Yatra\Repositories\BookingRepository();
+        $repaired = 0;
+
+        foreach ($bookingIds as $bookingId) {
+            $bookingId = (int) $bookingId;
+            if ($bookingId <= 0) {
+                continue;
+            }
+
+            // Back up this booking's figures first (INSERT IGNORE keeps the very
+            // first copy). If the copy fails, stop the batch without moving
+            // the cursor: nothing is changed without a backup, and the same
+            // booking is tried again on a later pageview.
+            $copied = $wpdb->query($wpdb->prepare(
+                "INSERT IGNORE INTO {$backupTable} (booking_id, amount_paid, amount_due, payment_status, backed_up_at)
+                 SELECT id, amount_paid, amount_due, payment_status, %s FROM {$bookingsTable} WHERE id = %d",
+                current_time('mysql'),
+                $bookingId
+            ));
+            if ($copied === false) {
+                \Yatra\Utils\Logger::warning('Refund totals repair paused: backup copy failed', [
+                    'booking_id' => $bookingId,
+                    'error' => $wpdb->last_error,
+                ]);
+                update_option('yatra_refund_totals_repair_retry_at', time() + HOUR_IN_SECONDS, false);
+
+                return;
+            }
+
+            try {
+                $totals = $paymentRepository->getBookingPaymentTotals($bookingId);
+                $bookingRepository->updateAmountPaid($bookingId, max(0.0, $totals['net']));
+
+                $wasReversed = $totals['refunded'] > 0 || ($totals['reversed'] ?? 0) > 0;
+
+                if ($wasReversed && $totals['net'] <= 0.009) {
+                    $bookingRepository->update($bookingId, ['payment_status' => 'refunded']);
+                }
+
+                $repaired++;
+            } catch (\Throwable $e) {
+                // Skip it and keep going. Stopping here would leave the cursor
+                // where it is and re-run this same batch on every admin
+                // pageview, for ever, without ever getting past the bad row.
+                \Yatra\Utils\Logger::warning('Refund totals repair skipped a booking', [
+                    'booking_id' => $bookingId,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            // Advance past this booking whether or not it could be repaired.
+            update_option('yatra_refund_totals_repair_cursor', $bookingId);
+        }
+
+        \Yatra\Utils\Logger::info('Refund totals repair batch done', [
+            'bookings' => $repaired,
+            'through_booking_id' => (int) end($bookingIds),
+        ]);
+
+        // A short batch means that was the last of them.
+        if (count($bookingIds) < $batchSize) {
+            delete_option('yatra_refund_totals_repair_cursor');
+            update_option('yatra_refund_totals_repair_v1', '1');
+        }
+    }
+
+    /**
+     * Make sure a repair's backup table exists. Returns false (and pauses that
+     * repair for an hour, so a host that refuses is not retried on every admin
+     * pageview) when it cannot be created.
+     */
+    private static function ensureRepairBackupTable(string $table, string $columns, string $retryOption): bool
+    {
+        global $wpdb;
+
+        $retryAt = (int) get_option($retryOption, 0);
+        if ($retryAt > time()) {
+            return false;
+        }
+        if (self::databaseTableExists($table)) {
+            return true;
+        }
+
+        $wpdb->query("CREATE TABLE IF NOT EXISTS {$table} ({$columns}) " . $wpdb->get_charset_collate());
+        if (self::databaseTableExists($table)) {
+            delete_option($retryOption);
+
+            return true;
+        }
+
+        \Yatra\Utils\Logger::warning('Repair backup table could not be created; repair paused', [
+            'table' => $table,
+            'error' => $wpdb->last_error,
+        ]);
+        update_option($retryOption, time() + HOUR_IN_SECONDS, false);
+
+        return false;
+    }
+
+    /**
+     * One-time: rebuild the booking statistics stored on customer rows.
+     *
+     * Those columns used to be incremented by hand on every
+     * CustomerRepository::findOrCreate() call. A single checkout calls it twice
+     * — once in BookingSessionController and once inside
+     * BookingService::createBooking() — so total_bookings came out at twice the
+     * real number, a customer added by hand started life with one phantom
+     * booking, and nothing ever subtracted when a booking was cancelled or
+     * deleted. New bookings now keep these columns derived
+     * ({@see \Yatra\Hooks\CustomerStatsHooks}); this repairs the figures that
+     * were already stored wrong.
+     *
+     * Set-based — one UPDATE for the whole table, no row loop — and gated by its
+     * own option so it costs a single preloaded option read afterwards.
+     */
+    public static function maybeRepairCustomerBookingStats(): void
+    {
+        if (get_option('yatra_customer_stats_repair_v1')) {
+            return;
+        }
+
+        global $wpdb;
+
+        $customersTable = $wpdb->prefix . 'yatra_customers';
+        $bookingsTable = $wpdb->prefix . 'yatra_bookings';
+
+        // A site mid-migration may not have both tables yet; try again next load.
+        if (!self::databaseTableExists($customersTable) || !self::databaseTableExists($bookingsTable)) {
+            return;
+        }
+
+        // Copy the current figures aside first, so the rebuild can be audited
+        // and undone. If the copy cannot be made, the rebuild does not run
+        // (and is retried on a later admin pageview).
+        // Explicit table + INSERT ... SELECT rather than CREATE TABLE ... AS
+        // SELECT, which hosts enforcing GTID consistency or primary keys
+        // (common on managed MySQL) reject.
+        $backupTable = $wpdb->prefix . 'yatra_customers_stats_backup_v1';
+        if (!self::ensureRepairBackupTable($backupTable,
+            "id bigint(20) UNSIGNED NOT NULL, total_bookings int(11) UNSIGNED DEFAULT NULL, total_spent decimal(12,2) DEFAULT NULL, total_travelers int(11) UNSIGNED DEFAULT NULL, backed_up_at datetime NOT NULL, PRIMARY KEY (id)",
+            'yatra_customer_stats_repair_retry_at')) {
+            return;
+        }
+        $copied = $wpdb->query($wpdb->prepare(
+            "INSERT IGNORE INTO {$backupTable} (id, total_bookings, total_spent, total_travelers, backed_up_at)
+             SELECT id, total_bookings, total_spent, total_travelers, %s FROM {$customersTable}",
+            current_time('mysql')
+        ));
+        if ($copied === false) {
+            \Yatra\Utils\Logger::warning('Customer booking-stats repair postponed: backup copy failed', ['error' => $wpdb->last_error]);
+            update_option('yatra_customer_stats_repair_retry_at', time() + HOUR_IN_SECONDS, false);
+
+            return;
+        }
+
+        // Mirrors CustomerRepository::recalculateStats(): every booking counts
+        // towards total_bookings, while money and seats ignore the bookings that
+        // never represented either.
+        $result = $wpdb->query(
+            "UPDATE {$customersTable} c
+             LEFT JOIN (
+                SELECT customer_id,
+                       COUNT(*) AS cnt,
+                       COALESCE(SUM(CASE WHEN status NOT IN ('cancelled', 'refunded', 'failed') THEN total_amount ELSE 0 END), 0) AS spent,
+                       COALESCE(SUM(CASE WHEN status NOT IN ('cancelled', 'refunded', 'failed') THEN travelers_count ELSE 0 END), 0) AS travelers
+                  FROM {$bookingsTable}
+                 WHERE customer_id > 0
+                 GROUP BY customer_id
+             ) b ON b.customer_id = c.id
+                SET c.total_bookings  = COALESCE(b.cnt, 0),
+                    c.total_spent     = COALESCE(b.spent, 0),
+                    c.total_travelers = COALESCE(b.travelers, 0)"
+        );
+
+        if ($result === false) {
+            // Leave the flag unset so it is retried rather than leaving the
+            // figures wrong for good — after an hour, like a failed backup, so
+            // the full-table copy above is not repeated on every pageview.
+            \Yatra\Utils\Logger::warning('Customer booking-stats repair failed', ['error' => $wpdb->last_error]);
+            update_option('yatra_customer_stats_repair_retry_at', time() + HOUR_IN_SECONDS, false);
+
+            return;
+        }
+
+        update_option('yatra_customer_stats_repair_v1', '1');
+    }
+
+    /**
+     * Fill canonical + legacy email identity options when empty (upgrades, partial installs, or empty strings in DB).
+     * Idempotent; safe to run on each admin load via maybeBackfillEmailTemplateDefaults().
+     */
+    public static function maybeBackfillEmailDeliveryIdentity(): void
+    {
+        $wpAdmin = trim((string) get_option('admin_email', ''));
+        $wpName = trim((string) get_bloginfo('name'));
+
+        $isUnsetOrEmpty = static function ($v): bool {
+            return $v === false || $v === null || $v === '' || (is_string($v) && trim($v) === '');
+        };
+
+        if ($wpAdmin !== '') {
+            foreach (['yatra_admin_email', 'yatra_from_email', 'yatra_email_from_address'] as $opt) {
+                if ($isUnsetOrEmpty(get_option($opt, false))) {
+                    update_option($opt, $wpAdmin);
+                }
+            }
+        }
+        if ($wpName !== '') {
+            foreach (['yatra_from_name', 'yatra_email_from_name'] as $opt) {
+                if ($isUnsetOrEmpty(get_option($opt, false))) {
+                    update_option($opt, $wpName);
+                }
+            }
+        }
+    }
+
+    /**
+     * One-time: persist default HTML subjects/bodies when options exist but are empty (pre-template-defaults installs).
+     */
+    public static function maybeBackfillEmailTemplateDefaults(): void
+    {
+        self::maybeBackfillEmailDeliveryIdentity();
+
+        // Default-on for new option on existing sites (add_option no-ops if already present).
+        add_option('yatra_email_template_admin_new_booking', 1);
+        add_option('yatra_email_template_admin_payment', 1);
+        add_option('yatra_email_template_admin_cancellation', 1);
+
+        self::maybeBackfillCustomerEmailVerificationTemplate();
+        self::maybeBackfillExtendedTransactionalEmailOptionsV2();
+
+        if (!get_option('yatra_email_identity_synced_v1')) {
+            $from = get_option('yatra_from_email', '');
+            if (($from === false || $from === '') && ($legacy = get_option('yatra_email_from_address', '')) && is_string($legacy) && $legacy !== '') {
+                update_option('yatra_from_email', $legacy);
+            }
+            $fname = get_option('yatra_from_name', '');
+            if (($fname === false || $fname === '') && ($legacy = get_option('yatra_email_from_name', '')) && is_string($legacy) && $legacy !== '') {
+                update_option('yatra_from_name', $legacy);
+            }
+            update_option('yatra_email_identity_synced_v1', '1');
+        }
+
+        if (get_option('yatra_email_tpl_defaults_backfill_1')) {
+            return;
+        }
+
+        foreach (EmailTemplateDefaults::settingsOptionDefaults() as $key => $defaultValue) {
+            $name = 'yatra_' . $key;
+            $current = get_option($name, false);
+            $isEmpty = $current === false || $current === '' || (is_string($current) && trim($current) === '');
+            if ($isEmpty) {
+                update_option($name, $defaultValue);
+            }
+        }
+
+        update_option('yatra_email_tpl_defaults_backfill_1', '1');
+    }
+
+    /**
+     * One-time: customer email verification template (Email → Templates) for existing installs.
+     */
+    private static function maybeBackfillCustomerEmailVerificationTemplate(): void
+    {
+        if (get_option('yatra_email_customer_verification_tpl_v1')) {
+            return;
+        }
+
+        add_option('yatra_email_template_customer_verification', true);
+        add_option('yatra_email_template_guest_verification', true);
+
+        $defaults = EmailTemplateDefaults::settingsOptionDefaults();
+        foreach (['email_tpl_customer_verification_subject', 'email_tpl_customer_verification_body'] as $key) {
+            if (!isset($defaults[$key])) {
+                continue;
+            }
+            $name = 'yatra_' . $key;
+            $current = get_option($name, false);
+            $isEmpty = $current === false || $current === '' || (is_string($current) && trim($current) === '');
+            if ($isEmpty) {
+                update_option($name, $defaults[$key]);
+            }
+        }
+
+        update_option('yatra_email_customer_verification_tpl_v1', '1');
+    }
+
+    /**
+     * One-time: enable flags + default HTML for extended transactional templates (completed, expiry, scheduled, enquiry, review, abandoned).
+     * Only writes options that are still empty so existing customized HTML in the database is preserved on plugin update.
+     */
+    private static function maybeBackfillExtendedTransactionalEmailOptionsV2(): void
+    {
+        if (get_option('yatra_email_tpl_extended_v2')) {
+            return;
+        }
+
+        $boolFlags = [
+            'email_template_booking_completed',
+            'email_template_booking_expired_customer',
+            'email_template_admin_booking_expired',
+            'email_template_scheduled_payment_reminder',
+            'email_template_scheduled_payment_succeeded',
+            'email_template_scheduled_payment_failed',
+            'email_template_admin_scheduled_payment_failed',
+            'email_template_enquiry_received',
+            'email_template_enquiry_admin',
+            'email_template_enquiry_response',
+            'email_template_review_request',
+            'email_template_abandoned_booking_recovery_first',
+            'email_template_abandoned_booking_recovery_second',
+            'email_template_abandoned_booking_recovery_final',
+        ];
+        foreach ($boolFlags as $flag) {
+            add_option('yatra_' . $flag, true);
+        }
+
+        $extendedContentKeys = [
+            'email_tpl_booking_completed_subject',
+            'email_tpl_booking_completed_body',
+            'email_tpl_booking_expired_customer_subject',
+            'email_tpl_booking_expired_customer_body',
+            'email_tpl_admin_booking_expired_subject',
+            'email_tpl_admin_booking_expired_body',
+            'email_tpl_scheduled_payment_reminder_subject',
+            'email_tpl_scheduled_payment_reminder_body',
+            'email_tpl_scheduled_payment_succeeded_subject',
+            'email_tpl_scheduled_payment_succeeded_body',
+            'email_tpl_scheduled_payment_failed_subject',
+            'email_tpl_scheduled_payment_failed_body',
+            'email_tpl_admin_scheduled_payment_failed_subject',
+            'email_tpl_admin_scheduled_payment_failed_body',
+            'email_tpl_enquiry_admin_subject',
+            'email_tpl_enquiry_admin_body',
+            'email_tpl_enquiry_received_subject',
+            'email_tpl_enquiry_received_body',
+            'email_tpl_enquiry_response_subject',
+            'email_tpl_enquiry_response_body',
+            'email_tpl_review_request_subject',
+            'email_tpl_review_request_body',
+            'email_tpl_abandoned_booking_recovery_first_subject',
+            'email_tpl_abandoned_booking_recovery_first_body',
+            'email_tpl_abandoned_booking_recovery_second_subject',
+            'email_tpl_abandoned_booking_recovery_second_body',
+            'email_tpl_abandoned_booking_recovery_final_subject',
+            'email_tpl_abandoned_booking_recovery_final_body',
+        ];
+
+        $defaults = EmailTemplateDefaults::settingsOptionDefaults();
+        foreach ($extendedContentKeys as $key) {
+            if (!isset($defaults[$key])) {
+                continue;
+            }
+            $name = 'yatra_' . $key;
+            $current = get_option($name, false);
+            $isEmpty = $current === false || $current === '' || (is_string($current) && trim($current) === '');
+            if ($isEmpty) {
+                update_option($name, $defaults[$key]);
+            }
+        }
+
+        update_option('yatra_email_tpl_extended_v2', '1');
+    }
+}

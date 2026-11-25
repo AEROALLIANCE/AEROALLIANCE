@@ -1,0 +1,731 @@
+/**
+ * Single Trip Page JavaScript
+ *
+ * Handles frontend interactions for the single trip page including:
+ * - Group discount calculations
+ * - Traveler count management
+ * - Pricing updates
+ * - Flatpickr initialization
+ *
+ * @package Yatra
+ */
+
+// Translation helpers — idempotent shim matching booking.js / trip.js so
+// `__()` resolves through wp.i18n when wp-i18n is enqueued, otherwise it
+// falls back to the source string.
+// Parse a numeric min/max attribute while preserving a legitimate 0.
+// `parseInt(el.getAttribute('max')) || 99` treated max="0" — what a sold-out
+// departure renders — as "unset" and fell back to the placeholder ceiling, so
+// the guest selector stayed usable and ignored the departure's real capacity.
+// Only an absent or non-numeric value may fall back. Installed once and shared
+// by every frontend script, so load order does not matter.
+if (typeof window.yatraNumOr !== 'function') {
+    window.yatraNumOr = function (raw, fallback) {
+        var parsed = parseInt(raw, 10);
+        return isNaN(parsed) ? fallback : parsed;
+    };
+}
+
+(function () {
+    var i18n = (window.wp && window.wp.i18n) ? window.wp.i18n : null;
+    if (i18n && typeof i18n.__ === 'function') {
+        window.__ = function (text, domain) { return i18n.__(text, domain || 'yatra'); };
+        window._n = function (s, p, n, domain) { return i18n._n(s, p, n, domain || 'yatra'); };
+        window._x = function (text, ctx, domain) { return i18n._x(text, ctx, domain || 'yatra'); };
+        // Always bind WordPress's own sprintf (it substitutes %d/%s/%1$s).
+        // Do NOT defer to a pre-existing window.sprintf: a theme or other
+        // plugin can define an incompatible global that leaves placeholders
+        // unsubstituted (the cause of literal "%d"/"%s" in the UI).
+        if (typeof i18n.sprintf === 'function') {
+            window.sprintf = function () { return i18n.sprintf.apply(i18n, arguments); };
+        } else if (typeof window.sprintf !== 'function') {
+            window.sprintf = function (fmt) { return fmt; };
+        }
+    } else {
+        // wp.i18n not present — install passthroughs only if nothing usable
+        // exists yet (don't clobber a real binding installed earlier).
+        if (typeof window.__ !== 'function') window.__ = function (text) { return text; };
+        if (typeof window._n !== 'function') window._n = function (s, p, n) { return n === 1 ? s : p; };
+        if (typeof window._x !== 'function') window._x = function (text) { return text; };
+        if (typeof window.sprintf !== 'function') window.sprintf = function (fmt) { return fmt; };
+    }
+})();
+
+document.addEventListener('DOMContentLoaded', function() {
+    function yatraGetFlatpickrLocale() {
+        var l = window.yatraTripData && window.yatraTripData.flatpickrLocale;
+        if (!l || typeof l !== 'object') {
+            return { firstDayOfWeek: 1 };
+        }
+        var out = Object.assign({}, l);
+        if (typeof out.firstDayOfWeek !== 'number' || isNaN(out.firstDayOfWeek)) {
+            out.firstDayOfWeek = 1;
+        }
+        return out;
+    }
+
+    /**
+     * Convert a PHP date() format string to its Flatpickr equivalent.
+     *
+     * The two format spec tables overlap heavily — d/j/D/l/m/n/M/F/Y/y
+     * mean the same thing in both — but a few PHP tokens map to a
+     * different Flatpickr token (e.g. PHP `s` = seconds → Flatpickr
+     * `S`; PHP `a`/`A` AM-PM → Flatpickr `K`). Anything outside the
+     * map (literal punctuation, slashes, spaces) is passed through.
+     *
+     * Used to populate flatpickr's `altFormat`. We keep `dateFormat`
+     * itself locked to `Y-m-d` so the value submitted to the backend
+     * stays stable regardless of the operator's display preference;
+     * only the user-visible input swaps to their configured format.
+     *
+     * Kept in lockstep with the helper of the same shape in trip.js
+     * and the inline mapping in single-trip-sidebar.js — three call
+     * sites because each file ships as its own enqueued bundle and
+     * sharing across them would require a separate dep file.
+     *
+     * @param {string} php  PHP date() format from Settings → General → Date format
+     * @returns {string}    Flatpickr-compatible format string
+     */
+    function yatraPhpDateFormatToFlatpickr(php) {
+        if (!php || typeof php !== 'string') return 'F j, Y';
+        var map = {
+            // Day
+            d: 'd', j: 'j', D: 'D', l: 'l',
+            // Month
+            m: 'm', n: 'n', M: 'M', F: 'F',
+            // Year
+            Y: 'Y', y: 'y',
+            // Time
+            H: 'H', G: 'H', h: 'h', g: 'h',
+            i: 'i', s: 'S', a: 'K', A: 'K'
+        };
+        var out = '';
+        var esc = false;
+        for (var i = 0; i < php.length; i++) {
+            var ch = php[i];
+            if (esc) { out += ch; esc = false; continue; }
+            if (ch === '\\') { esc = true; continue; }
+            out += map[ch] || ch;
+        }
+        return out || 'F j, Y';
+    }
+
+    /**
+     * Resolve the operator's configured display format and convert it
+     * for Flatpickr. Falls back to `F j, Y` (e.g. "Jan 5, 2026") when
+     * settings haven't shipped a value.
+     */
+    function yatraResolveAltFormat() {
+        var cfg = window.yatraTripData || {};
+        // Pre-converted value wins (set server-side in some bundles); a
+        // raw PHP string is converted on the fly.
+        if (cfg.flatpickrAltFormat || cfg.altDateFormat) {
+            return cfg.flatpickrAltFormat || cfg.altDateFormat;
+        }
+        var php = cfg.dateFormat || cfg.date_format || '';
+        return yatraPhpDateFormatToFlatpickr(php);
+    }
+
+    var fpLocale = yatraGetFlatpickrLocale();
+    var fpAltFormat = yatraResolveAltFormat();
+
+    // Initialize date pickers when DOM is ready.
+    //
+    // Priority order applied here MUST mirror the server-side
+    // AvailabilityResolutionService:
+    //   1. Specific Availability Dates (per-date rows)            ← highest
+    //   2. Recurring Rules (pattern-generated dates)
+    //   3. Trip default flexible window (available_from / available_to) ← lowest
+    //
+    // Server has already merged (1) and (2) into yatraTripData.availabilityDates.
+    // When the trip is in date-specific mode (or any availability-restricted
+    // mode the template might use) we lock the date picker to that merged list.
+    // Otherwise we fall back to the flexible window encoded in data-min-date /
+    // data-max-date.
+    const bookingDateInput = document.getElementById('travel_date');
+    if (bookingDateInput) {
+        const form = bookingDateInput.closest('.yatra-booking-form');
+        const bookingMode = form ? form.getAttribute('data-booking-mode') : 'regular';
+
+        // Accept any of the historic / current values that signal
+        // "restrict to specific availability dates". The PHP template now
+        // emits "date_specific"; older builds used "availability". Both
+        // must trigger the restricted picker so the priority chain holds.
+        const isDateSpecific = (
+            bookingMode === 'date_specific'
+            || bookingMode === 'availability'
+            || bookingMode === 'date-specific'
+        );
+
+        if (isDateSpecific) {
+            // Availability-based: only the dates resolved by the priority
+            // chain (specific dates first, then recurring rules) are pickable.
+            const availabilityDates = (window.yatraTripData && Array.isArray(window.yatraTripData.availabilityDates))
+                ? window.yatraTripData.availabilityDates
+                : [];
+
+            if (availabilityDates.length > 0) {
+                flatpickr(bookingDateInput, {
+                    // Backend value stays as Y-m-d (what the booking
+                    // form submits); only the user-visible input flips
+                    // to the operator's configured Date Format via
+                    // altInput/altFormat. Previously hardcoded which
+                    // ignored Settings → General → Date format.
+                    dateFormat: 'Y-m-d',
+                    altInput: true,
+                    altFormat: fpAltFormat,
+                    minDate: 'today',
+                    enable: availabilityDates,
+                    disableMobile: false,
+                    locale: fpLocale
+                });
+            } else {
+                // Edge case: template believes the trip is date-specific but
+                // the merged date list is empty (e.g. all rules expired).
+                // Disable the input rather than silently falling back to
+                // "any date", which would violate the configured priority.
+                bookingDateInput.setAttribute('disabled', 'disabled');
+                // Fallback placeholder when the template hasn't supplied
+                // `data-empty-text`. Wrapped in __() so the literal string
+                // can be translated; the data-attribute fallback is a
+                // server-rendered string that's already localised.
+                bookingDateInput.setAttribute(
+                    'placeholder',
+                    bookingDateInput.getAttribute('data-empty-text') || __('No departure dates available', 'yatra')
+                );
+            }
+        } else {
+            // Flexible booking: any future date inside the trip's available
+            // window (available_from / available_to are surfaced as
+            // data-min-date / data-max-date by the sidebar template).
+            const minDate = bookingDateInput.getAttribute('data-min-date') || 'today';
+            const maxDate = bookingDateInput.getAttribute('data-max-date');
+
+            // Flexible-date picker. Same altInput/altFormat pattern
+            // as the availability-restricted branch above — backend
+            // value stable, display matches operator preference.
+            const config = {
+                dateFormat: 'Y-m-d',
+                altInput: true,
+                altFormat: fpAltFormat,
+                minDate: minDate,
+                disableMobile: false,
+                locale: fpLocale
+            };
+
+            if (maxDate) {
+                config.maxDate = maxDate;
+            }
+
+            flatpickr(bookingDateInput, config);
+        }
+    }
+
+    // Enquiry modal date picker (always flexible). Same altFormat
+    // treatment so the enquiry form respects the operator's date
+    // format too — previously hardcoded to Y-m-d which jarred with
+    // any non-ISO display preference.
+    const enquiryDateInput = document.getElementById('enquiry-travel-date');
+    if (enquiryDateInput) {
+        flatpickr(enquiryDateInput, {
+            dateFormat: 'Y-m-d',
+            altInput: true,
+            altFormat: fpAltFormat,
+            minDate: 'today',
+            disableMobile: false,
+            locale: fpLocale
+        });
+    }
+});
+
+// Group Discount Calculation for Booking Widget
+document.addEventListener('DOMContentLoaded', function () {
+    const bookingForm = document.querySelector('.yatra-booking-form');
+    const totalAmountElement = document.getElementById('total-amount');
+    const travelerInputs = document.querySelectorAll('input[name*="travelers["], input[name="num_travelers"]');
+    const dateInput = document.getElementById('travel_date');
+    let currentGroupDiscounts = null;
+    let selectedAvailability = null;
+    
+    // Load group discounts for this trip
+    async function loadGroupDiscounts() {
+        try {
+            const response = await fetch(window.yatraTripData?.groupDiscountsUrl || '', {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    trip_ids: [window.yatraTripData?.tripId]
+                })
+            });
+            
+            if (response.ok) {
+                const data = await response.json();
+                if (data[window.yatraTripData?.tripId] && data[window.yatraTripData?.tripId].has_group_discounts) {
+                    currentGroupDiscounts = data[window.yatraTripData?.tripId].discounts;
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to load group discounts:', error);
+        }
+    }
+    
+    // Calculate total travelers
+    function calculateTotalTravelers() {
+        let total = 0;
+        
+        // Handle traveler-based pricing (multiple categories)
+        const travelerCategoryInputs = document.querySelectorAll('input[name*="travelers["]');
+        travelerCategoryInputs.forEach(input => {
+            total += parseInt(input.value) || 0;
+        });
+        
+        // Handle simple pricing (single traveler count)
+        const simpleTravelerInput = document.querySelector('input[name="num_travelers"]');
+        if (simpleTravelerInput) {
+            total = parseInt(simpleTravelerInput.value) || 0;
+        }
+        
+        return total;
+    }
+    
+    // Calculate group discount for current traveler count
+    function calculateGroupDiscount(totalTravelers, basePrice) {
+        if (!currentGroupDiscounts || totalTravelers < 2) {
+            return 0;
+        }
+        
+        // Find applicable discount for this group size
+        let applicableDiscount = null;
+        for (const discount of currentGroupDiscounts) {
+            const minSize = discount.min_group_size;
+            const maxSize = discount.max_group_size;
+            
+            if (totalTravelers >= minSize && (!maxSize || totalTravelers <= maxSize)) {
+                applicableDiscount = discount;
+                break;
+            }
+        }
+        
+        if (!applicableDiscount) {
+            return 0;
+        }
+        
+        let discountAmount = 0;
+        
+        if (applicableDiscount.discount_mode === 'category_based' && applicableDiscount.category_discounts) {
+            // Calculate category-based discount
+            const travelerCounts = getTravelerCountsByCategory();
+            
+            for (const [category, discountConfig] of Object.entries(applicableDiscount.category_discounts)) {
+                const count = travelerCounts[category] || 0;
+                if (count > 0) {
+                    // Calculate category-specific price
+                    const categoryMultiplier = getCategoryMultiplier(category);
+                    const categoryPrice = basePrice * categoryMultiplier;
+                    const categoryTotal = categoryPrice * count;
+                    
+                    if (discountConfig.type === 'percentage') {
+                        discountAmount += categoryTotal * (discountConfig.amount / 100);
+                    } else {
+                        // Fixed amount per person
+                        discountAmount += Math.min(discountConfig.amount * count, categoryTotal);
+                    }
+                }
+            }
+        } else {
+            // Total-based discount
+            if (applicableDiscount.discount_type === 'percentage') {
+                discountAmount = basePrice * totalTravelers * (applicableDiscount.discount_amount / 100);
+            } else {
+                discountAmount = Math.min(applicableDiscount.discount_amount, basePrice * totalTravelers);
+            }
+        }
+        
+        return discountAmount;
+    }
+
+    function getSidebarAvailabilities() {
+        const raw = window.yatraTripData && window.yatraTripData.sidebarAvailability;
+        return Array.isArray(raw) ? raw : [];
+    }
+    
+    // Update pricing when date changes
+    if (dateInput) {
+        dateInput.addEventListener('change', function() {
+            const selectedDate = this.value;
+            const availabilities = getSidebarAvailabilities();
+            if (availabilities.length > 0) {
+                selectedAvailability = availabilities.find(a => a.departure_date === selectedDate);
+
+                if (selectedAvailability && selectedAvailability.pricing_type === 'traveler_based' && selectedAvailability.price_types) {
+                    selectedAvailability.price_types.forEach((pt) => {
+                        const input = document.querySelector(`input[name="travelers[${pt.category_id}]"]`);
+                        if (input) {
+                            const price = pt.discounted_price || pt.original_price || 0;
+                            input.setAttribute('data-price', price);
+                        }
+                    });
+                }
+            } else {
+                selectedAvailability = null;
+            }
+
+            updatePricing();
+        });
+        
+        // Set today's date by default if available, otherwise use trip fallback pricing.
+        // Build LOCAL YYYY-MM-DD, not toISOString() (which is UTC and can land on
+        // the wrong calendar day — mis-matching the availability's departure_date
+        // and pre-selecting the wrong date near midnight).
+        const _now = new Date();
+        const today = _now.getFullYear() + '-'
+            + String(_now.getMonth() + 1).padStart(2, '0') + '-'
+            + String(_now.getDate()).padStart(2, '0');
+        if (!dateInput.value) {
+            const availabilities = getSidebarAvailabilities();
+            if (availabilities.length > 0) {
+                const todayAvailability = availabilities.find(a => a.departure_date === today);
+                if (todayAvailability) {
+                    dateInput.value = today;
+                    dateInput.dispatchEvent(new Event('change'));
+                } else {
+                    updatePricing();
+                }
+            }
+        }
+    }
+    
+    // Update pricing display
+    function updatePricing() {
+        const totalTravelers = calculateTotalTravelers();
+        let basePrice = window.yatraTripData?.basePrice || 0;
+        
+        // Calculate subtotal
+        let subtotal = 0;
+        
+        const categoryInputs = document.querySelectorAll('input[name*="travelers["]');
+        if (categoryInputs.length > 0) {
+            // Traveler-based pricing: read actual prices from data attributes (updated by date change)
+            categoryInputs.forEach(input => {
+                const count = parseInt(input.value) || 0;
+                const price = parseFloat(input.dataset.price) || 0;
+                const pricingMode = input.dataset.pricingMode || 'per_person';
+                const groupOverflow = input.dataset.groupOverflow || 'block';
+                const maxPax = parseInt(input.dataset.maxPax) || 0;
+
+                if (pricingMode === 'per_group') {
+                    // Per group: one flat price, or per block of maxPax people
+                    // when overflow is "per_block".
+                    if (count > 0) {
+                        subtotal += (groupOverflow === 'per_block' && maxPax > 0)
+                            ? price * Math.ceil(count / maxPax)
+                            : price;
+                    }
+                } else {
+                    // Per person: charge per traveler
+                    subtotal += price * count;
+                }
+            });
+        } else {
+            // Simple pricing - use selected availability price if available
+            if (selectedAvailability && selectedAvailability.price) {
+                basePrice = parseFloat(selectedAvailability.price);
+            }
+            subtotal = basePrice * totalTravelers;
+        }
+        
+        // Calculate group discount
+        const groupDiscount = calculateGroupDiscount(totalTravelers, basePrice);
+        const finalTotal = subtotal - groupDiscount;
+        
+        // Update display (total element has been removed from sidebar)
+        // The total price display is no longer shown in the sidebar
+        // This code is kept for reference but will not execute as totalAmountElement is null
+        if (totalAmountElement) {
+            totalAmountElement.textContent = (window.yatraTripData?.currencySymbol || '$') + finalTotal.toFixed(2);
+        }
+        
+        // Show/hide group discount indicator
+        updateGroupDiscountIndicator(totalTravelers, groupDiscount);
+    }
+    
+    // Update group discount indicator (total element has been removed)
+    function updateGroupDiscountIndicator(totalTravelers, discountAmount) {
+        let indicator = document.querySelector('.yatra-group-discount-indicator');
+        
+        if (discountAmount > 0) {
+            if (!indicator) {
+                indicator = document.createElement('div');
+                indicator.className = 'yatra-group-discount-indicator';
+                // Find a suitable parent to append the indicator
+                const bookingForm = document.querySelector('.yatra-booking-form');
+                if (bookingForm) {
+                    bookingForm.appendChild(indicator);
+                }
+            }
+            
+            indicator.innerHTML = `
+                <div class="yatra-group-discount-badge">
+                    <svg width="14" height="14" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+                    </svg>
+                    Group discount applied: -${typeof window.yatra_format_price_js === 'function' ? window.yatra_format_price_js(discountAmount) : (window.yatraTripData?.currencySymbol || '$') + discountAmount.toFixed(2)}
+                </div>
+            `;
+        } else if (indicator) {
+            indicator.remove();
+        }
+    }
+    
+    // Initialize
+    if (window.yatraTripData) {
+        loadGroupDiscounts().then(() => {
+            // Set up event listeners for traveler count changes
+            travelerInputs.forEach(input => {
+                input.addEventListener('change', updatePricing);
+                input.addEventListener('input', updatePricing);
+            });
+            
+            // Also listen for plus/minus button clicks
+            document.addEventListener('click', function(e) {
+                if (e.target.closest('.yatra-quantity-plus') || e.target.closest('.yatra-quantity-minus')) {
+                    // Delay to ensure input value is updated first
+                    setTimeout(updatePricing, 50);
+                }
+            });
+            
+            // Initial pricing update
+            updatePricing();
+        });
+        
+        // Handle group discount CTA buttons
+        document.addEventListener('click', function (e) {
+            if (e.target.classList.contains('yatra-group-discount-btn')) {
+                const groupSize = parseInt(e.target.dataset.groupSize);
+                if (groupSize) {
+                    // Set traveler count to trigger discount
+                    if (document.querySelector('input[name="num_travelers"]')) {
+                        // Simple pricing
+                        document.querySelector('input[name="num_travelers"]').value = groupSize;
+                    } else {
+                        // Traveler-based pricing - set adults to group size
+                        const adultInput = document.querySelector('input[name*="travelers[adults]"]');
+                        if (adultInput) {
+                            adultInput.value = groupSize;
+                            // Update display. The literal "Adult x %d"
+                            // is kept as the msgid so translators can
+                            // localise both the noun and the format
+                            // (some locales put the multiplier first).
+                            // Comment phrasing matches the other call
+                            // sites in trip.js so WP-CLI sees ONE
+                            // canonical translators-comment per msgid.
+                            const display = document.querySelector('.yatra-participants-display');
+                            if (display) {
+                                // translators: %d: number of adults
+                                display.textContent = __('Adult x %d', 'yatra').replace('%d', String(groupSize));
+                            }
+                        }
+                    }
+                    
+                    // Trigger pricing update
+                    updatePricing();
+                    
+                    // Scroll to booking widget
+                    document.getElementById('yatra-booking-widget').scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'center'
+                    });
+                }
+            }
+        });
+    }
+
+    /**
+     * Traveler Synchronization Across All Locations
+     * Syncs traveler inputs between sidebar, enquiry modal, and availability section
+     */
+    
+    // Handle +/- button clicks for traveler inputs
+    document.addEventListener('click', function(e) {
+        // Check if click is on a quantity button or its children (SVG, path, etc.)
+        const btn = e.target.closest('.yatra-quantity-btn, .yatra-quantity-plus, .yatra-quantity-minus');
+        if (!btn) return;
+        
+        // Prevent default button behavior
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const target = btn.getAttribute('data-target');
+        if (!target) return;
+        
+        // Try to find input by ID first (for simple inputs)
+        let input = document.getElementById(target);
+        
+        // If not found by ID, find by data-target in the same row (for category inputs)
+        if (!input) {
+            const row = btn.closest('.yatra-quantity-row');
+            if (row) {
+                input = row.querySelector('input[type="number"]');
+            }
+        }
+        
+        if (!input) return;
+        
+        const min = window.yatraNumOr(input.getAttribute('min'), 0);
+        const max = window.yatraNumOr(input.getAttribute('max'), 99);
+        let value = parseInt(input.value) || 0;
+        
+        // Update value based on button type
+        if (btn.classList.contains('yatra-quantity-plus')) {
+            value = Math.min(value + 1, max);
+        } else if (btn.classList.contains('yatra-quantity-minus')) {
+            value = Math.max(value - 1, min);
+        }
+        
+        // Update the input
+        input.value = value;
+        
+        // Update button states
+        const minusBtn = btn.classList.contains('yatra-quantity-minus') ? btn : btn.parentElement.querySelector('.yatra-quantity-minus');
+        const plusBtn = btn.classList.contains('yatra-quantity-plus') ? btn : btn.parentElement.querySelector('.yatra-quantity-plus');
+        
+        if (minusBtn) minusBtn.disabled = value <= min;
+        if (plusBtn) plusBtn.disabled = value >= max;
+        
+        // Trigger change event
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        
+        // Sync to other locations
+        syncTravelerInputs(input);
+    });
+    
+    // Handle direct input changes
+    document.addEventListener('change', function(e) {
+        const input = e.target;
+        
+        // Check if it's a traveler input
+        if (input.classList.contains('yatra-quantity-input') || 
+            input.classList.contains('yatra-quantity-input-simple') ||
+            input.id === 'num_travelers' ||
+            input.id === 'enquiry_adults' ||
+            input.name?.startsWith('travelers[') ||
+            input.id?.startsWith('traveler_')) {
+            
+            syncTravelerInputs(input);
+        }
+    });
+    
+    /**
+     * Sync traveler input value to all matching inputs across locations
+     */
+    function syncTravelerInputs(sourceInput) {
+        const sourceId = sourceInput.id;
+        const sourceName = sourceInput.name;
+        const sourceCategory = sourceInput.getAttribute('data-category');
+        const sourceValue = parseInt(sourceInput.value) || 0;
+        
+        // Determine if this is regular pricing or traveler-based pricing
+        if (sourceId === 'num_travelers' || sourceId === 'enquiry_adults' || sourceId?.startsWith('num-travelers-')) {
+            // Regular pricing - sync all num_travelers and enquiry_adults inputs
+            const regularInputs = document.querySelectorAll('#num_travelers, #enquiry_adults');
+            regularInputs.forEach(input => {
+                if (input !== sourceInput) {
+                    const max = window.yatraNumOr(input.getAttribute('max'), 99);
+                    input.value = Math.min(sourceValue, max);
+                }
+            });
+            
+            // Also sync to availability section inputs
+            const availabilityInputs = document.querySelectorAll('input[id^="num-travelers-"]');
+            availabilityInputs.forEach(input => {
+                if (input !== sourceInput) {
+                    const max = window.yatraNumOr(input.getAttribute('max'), 99);
+                    input.value = Math.min(sourceValue, max);
+                }
+            });
+            
+        } else if (sourceId?.startsWith('traveler_') || sourceName?.startsWith('travelers[') || sourceCategory) {
+            // Traveler-based pricing - extract category ID
+            let categoryId = '';
+            
+            if (sourceCategory) {
+                // From availability section (data-category attribute)
+                categoryId = sourceCategory;
+            } else if (sourceId?.startsWith('traveler_')) {
+                categoryId = sourceId.replace('traveler_', '');
+            } else if (sourceName?.includes('[')) {
+                const match = sourceName.match(/travelers\[(\d+)\]/);
+                if (match) categoryId = match[1];
+            }
+            
+            if (categoryId) {
+                // Sync all inputs for this category across all locations
+                const categoryInputs = document.querySelectorAll(
+                    `input[id="traveler_${categoryId}"], input[name="travelers[${categoryId}]"], input[data-category="${categoryId}"]`
+                );
+                
+                categoryInputs.forEach(input => {
+                    if (input !== sourceInput) {
+                        const max = window.yatraNumOr(input.getAttribute('max'), 99);
+                        input.value = Math.min(sourceValue, max);
+                        
+                        // Update button states for this input
+                        const row = input.closest('.yatra-quantity-row');
+                        if (row) {
+                            const min = window.yatraNumOr(input.getAttribute('min'), 0);
+                            const minusBtn = row.querySelector('.yatra-quantity-minus');
+                            const plusBtn = row.querySelector('.yatra-quantity-plus');
+                            if (minusBtn) minusBtn.disabled = input.value <= min;
+                            if (plusBtn) plusBtn.disabled = input.value >= max;
+                        }
+                    }
+                });
+                
+                // Update dropdown display text if exists
+                updateTravelerDisplayText();
+            }
+        }
+    }
+    
+    /**
+     * Update traveler dropdown display text
+     */
+    function updateTravelerDisplayText() {
+        const displays = document.querySelectorAll('.yatra-traveler-selector-display, .yatra-participants-display');
+        
+        displays.forEach(display => {
+            // Find all traveler inputs in the same container
+            const container = display.closest('.yatra-traveler-selector, .yatra-booking-field-select');
+            if (!container) return;
+            
+            const dropdown = container.querySelector('.yatra-traveler-selector-dropdown, .yatra-booking-quantity-selector');
+            if (!dropdown) return;
+            
+            const inputs = dropdown.querySelectorAll('input[type="number"]');
+            const parts = [];
+            let total = 0;
+            
+            inputs.forEach(input => {
+                const value = parseInt(input.value) || 0;
+                if (value > 0) {
+                    const label = input.getAttribute('data-category-label') || __('Traveler', 'yatra');
+                    parts.push(sprintf(
+                        /* translators: 1: traveler category label, 2: count. */
+                        __('%1$s x %2$d', 'yatra'),
+                        label,
+                        value
+                    ));
+                    total += value;
+                }
+            });
+            
+            if (parts.length > 0) {
+                display.textContent = parts.join(', ');
+            } else {
+                display.textContent = __('Select travelers', 'yatra');
+            }
+        });
+    }
+});

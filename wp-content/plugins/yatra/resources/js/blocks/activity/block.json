@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "yatra/activity",
+  "title": "Activity",
+  "category": "yatra",
+  "icon": "universal-access",
+  "description": "Display activity listings with customizable options",
+  "keywords": ["activity", "adventure", "yatra"],
+  "textdomain": "yatra",
+  "attributes": {
+    "order": {
+      "type": "string",
+      "default": "asc"
+    },
+    "columns": {
+      "type": "number",
+      "default": 3
+    },
+    "per_page": {
+      "type": "number",
+      "default": 10
+    },
+    "title": {
+      "type": "string",
+      "default": "Activity Listings"
+    },
+    "show_pagination": {
+      "type": "boolean",
+      "default": true
+    },
+    "activityIds": {
+      "type": "array",
+      "default": []
+    },
+    "hide_empty": {
+      "type": "boolean",
+      "default": false,
+      "description": "When on, activities with zero published trips are skipped. Off by default to preserve the historical 'show everything' behavior."
+    },
+    "show_trip_count": {
+      "type": "boolean",
+      "default": true
+    },
+    "show_description": {
+      "type": "boolean",
+      "default": true
+    },
+    "show_image": {
+      "type": "boolean",
+      "default": true
+    }
+  },
+  "supports": {
+    "html": false,
+    "inserter": true,
+    "align": ["wide", "full"]
+  },
+  "editorScript": "yatra-activity-block-editor"
+}

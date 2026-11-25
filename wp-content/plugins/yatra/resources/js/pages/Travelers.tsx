@@ -1,0 +1,654 @@
+/**
+ * Travelers Listing Page
+ * Display all travelers from bookings with dynamic columns from Form Builder
+ */
+
+import React, { useState, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  Users,
+  Search,
+  Eye,
+  Mail,
+  Phone,
+  Calendar,
+  MapPin,
+  Trash2,
+} from "lucide-react";
+import { __ } from "../lib/i18n";
+import { formatDate as formatDateUtil } from "../lib/dateFormat";
+import { apiService } from "../lib/api-client";
+import { usePermissions } from "../hooks/usePermissions";
+import { Input } from "../components/ui/input";
+import { Select } from "../components/ui/select";
+import { PageHeader } from "../components/common/PageHeader";
+import { Card, CardContent } from "../components/ui/card";
+import {
+  Pagination,
+  Table as SharedTable,
+  BulkActionToolbar,
+} from "../components/shared";
+import { Skeleton } from "../components/ui/skeleton";
+import { Badge } from "../components/ui/badge";
+import { useToast } from "../components/ui/toast";
+import { ConfirmationDialog } from "../components/ui/confirmation-dialog";
+import { getErrorContext } from "../lib/errors";
+import { getCountryName } from "../lib/countries";
+
+interface FormField {
+  id: string;
+  type: string;
+  label: string;
+  placeholder?: string;
+  required: boolean;
+  enabled: boolean;
+  order: number;
+  width?: string;
+  locked?: boolean;
+}
+
+interface FormConfig {
+  traveler_form?: {
+    title: string;
+    description: string;
+    enabled: boolean;
+    fields: FormField[];
+    /** Pro: per-trip versions of the form, each with its own field list. */
+    conditions?: { fields?: FormField[] }[];
+  };
+}
+
+interface Traveler {
+  id: string | number;
+  booking_id: number;
+  booking_reference: string;
+  trip_id: number;
+  trip_title: string;
+  travel_date: string;
+  traveler_index: number;
+  is_lead: boolean;
+  // Dynamic fields
+  [key: string]: any;
+}
+
+// Fields to exclude from dynamic columns (already shown in fixed columns)
+const EXCLUDED_DYNAMIC_FIELDS = [
+  "first_name",
+  "last_name",
+  "gender",
+  "nationality",
+  "phone",
+  "_traveller_id",
+  "_is_lead",
+  "_traveller_index",
+  "booking_id",
+  "booking_reference",
+  "trip_id",
+  "trip_title",
+  "travel_date",
+  "traveler_index",
+  "is_lead",
+  "id",
+];
+
+const Travelers: React.FC = () => {
+  const queryClient = useQueryClient();
+  const { can } = usePermissions();
+  const { showToast } = useToast();
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [travelerToDelete, setTravelerToDelete] = useState<Traveler | null>(
+    null,
+  );
+  const [searchTerm, setSearchTerm] = useState("");
+  const [tripFilter, setTripFilter] = useState("");
+  const [page, setPage] = useState(1);
+  const perPage = 20;
+  const [selectedIds, setSelectedIds] = useState<(string | number)[]>([]);
+  const [bulkAction, setBulkAction] = useState("");
+  const [showColumnsDropdown, setShowColumnsDropdown] = useState(false);
+  const [visibleColumns, setVisibleColumns] = useState(() => {
+    if (typeof window === "undefined") {
+      return {
+        traveler_info: true,
+        trip: true,
+        travel_date: true,
+        booking_reference: true,
+      };
+    }
+    const saved = window.localStorage.getItem(
+      "yatra-travelers-visible-columns",
+    );
+    return saved
+      ? JSON.parse(saved)
+      : {
+          traveler_info: true,
+          trip: true,
+          travel_date: true,
+          booking_reference: true,
+        };
+  });
+
+  // Fetch form configuration for dynamic columns. The global (unscoped)
+  // config, conditions included — this list spans every trip, so a column is
+  // shown for any traveler field ANY trip's form version can ask.
+  const { data: formConfigData } = useQuery({
+    queryKey: ["booking-form-config", "global"],
+    queryFn: async () => {
+      const result = await apiService.getBookingFormConfig();
+      return (
+        result?.data?.booking_form_config || result?.booking_form_config || null
+      );
+    },
+  });
+
+  // Store available trips from first page load
+  const [availableTrips, setAvailableTrips] = useState<
+    Array<{ id: number; title: string }>
+  >([]);
+
+  // Fetch travelers from API (includes trip info via JOIN, and available_trips in meta on first page)
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ["travelers", searchTerm, tripFilter, page],
+    queryFn: async () => {
+      // Check URL parameter for error simulation (for testing)
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get("simulate_error") === "true") {
+        throw new Error(
+          "Simulated API error for testing error UI functionality",
+        );
+      }
+
+      const paramsObj: Record<string, any> = {
+        page: page,
+        per_page: perPage,
+      };
+      if (searchTerm) paramsObj.search = searchTerm;
+      if (tripFilter) paramsObj.trip_id = tripFilter;
+
+      const response = await apiService.getTravelers(paramsObj);
+
+      // Store available trips from meta (returned on first page with no search filter)
+      if (response.meta?.available_trips?.length > 0) {
+        setAvailableTrips(response.meta.available_trips);
+      }
+
+      return response;
+    },
+    enabled: can("yatra_view_bookings"),
+  });
+
+  // Use available trips from state for filter dropdown
+  const tripsData = useMemo(() => ({ data: availableTrips }), [availableTrips]);
+
+  // Get dynamic columns from form config
+  const dynamicColumns = useMemo(() => {
+    const formConfig = formConfigData as FormConfig | null;
+    if (!formConfig?.traveler_form?.fields) {
+      return [];
+    }
+
+    // Global fields first (in their order), then any field that only exists
+    // in a per-trip version of the form (Pro conditions), de-duplicated by id.
+    const seen = new Set<string>();
+    const allFields: FormField[] = [];
+    const add = (fields?: FormField[]) =>
+      (fields || []).forEach((field) => {
+        if (!seen.has(field.id)) {
+          seen.add(field.id);
+          allFields.push(field);
+        }
+      });
+    add(
+      [...formConfig.traveler_form.fields].sort(
+        (a, b) => (a.order || 0) - (b.order || 0),
+      ),
+    );
+    (formConfig.traveler_form.conditions || []).forEach((c) => add(c.fields));
+
+    const enabledFields = allFields.filter(
+      (field) => field.enabled && !EXCLUDED_DYNAMIC_FIELDS.includes(field.id),
+    );
+
+    return enabledFields.map((field) => ({
+      id: field.id,
+      label: field.label,
+      type: field.type,
+    }));
+  }, [formConfigData]);
+
+  const travelers = data?.data || [];
+  const totalTravelers = data?.meta?.total || 0;
+  const totalPages = Math.ceil(totalTravelers / perPage);
+
+  // Enhanced error handling
+  const errorContext = getErrorContext(error);
+  const apiErrorMessage = (data as any)?.error || (data as any)?.message;
+  const derivedErrorDetails =
+    errorContext.details ||
+    (apiErrorMessage ? String(apiErrorMessage) : undefined) ||
+    (error ? String(error?.message || error) : undefined);
+  const isTravelersError = !!error || !!apiErrorMessage;
+
+  const handleViewBooking = (bookingId: number) => {
+    window.location.href = `${window.yatraAdmin?.siteUrl || ""}/wp-admin/admin.php?page=yatra&subpage=bookings&action=view&id=${bookingId}`;
+  };
+
+  // Use the shared formatter so traveler dates (Travel Date, Date of Birth)
+  // follow the global WP date-format setting — not the browser locale — and
+  // parse date-only values as local calendar days (no off-by-one).
+  const formatDate = (dateString: string) => {
+    if (!dateString) return "-";
+    return formatDateUtil(dateString);
+  };
+
+  // Bulk delete travelers
+  const bulkMutation = useMutation({
+    mutationFn: async ({
+      action,
+      ids,
+    }: {
+      action: string;
+      ids: (string | number)[];
+    }) => {
+      return await apiService.bulkTravelersAction(action, ids);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travelers"] });
+      setSelectedIds([]);
+      setBulkAction("");
+    },
+  });
+
+  const handleBulkApply = () => {
+    if (!bulkAction || selectedIds.length === 0) {
+      return;
+    }
+
+    bulkMutation.mutate({ action: bulkAction, ids: selectedIds });
+  };
+
+  // Handle single traveler delete
+  const handleDelete = (traveler: Traveler) => {
+    setTravelerToDelete(traveler);
+    setDeleteDialogOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!travelerToDelete) return;
+
+    try {
+      await bulkMutation.mutateAsync({
+        action: "delete",
+        ids: [travelerToDelete.id],
+      });
+      showToast(__("Traveler deleted successfully", "yatra"), "success");
+      setDeleteDialogOpen(false);
+      setTravelerToDelete(null);
+    } catch (error: any) {
+      showToast(
+        error?.message || __("Failed to delete traveler", "yatra"),
+        "error",
+      );
+    }
+  };
+
+  // Toggle column visibility
+  const toggleColumn = (columnKey: string) => {
+    const newVisibleColumns = {
+      ...visibleColumns,
+      [columnKey]: !visibleColumns[columnKey],
+    };
+    setVisibleColumns(newVisibleColumns);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        "yatra-travelers-visible-columns",
+        JSON.stringify(newVisibleColumns),
+      );
+    }
+  };
+
+  // Column options for the columns dropdown
+  const columnOptions = [
+    {
+      key: "traveler_info",
+      label: __("Traveler", "yatra"),
+      visible: visibleColumns.traveler_info,
+    },
+    { key: "trip", label: __("Trip", "yatra"), visible: visibleColumns.trip },
+    {
+      key: "travel_date",
+      label: __("Travel Date", "yatra"),
+      visible: visibleColumns.travel_date,
+    },
+    {
+      key: "booking_reference",
+      label: __("Booking", "yatra"),
+      visible: visibleColumns.booking_reference,
+    },
+  ];
+
+  // Actions for the 3-dot menu
+  const actions = [
+    {
+      key: "view",
+      label: __("View Booking", "yatra"),
+      icon: <Eye className="w-4 h-4" />,
+      onClick: (traveler: Traveler) => handleViewBooking(traveler.booking_id),
+    },
+    {
+      key: "delete",
+      label: __("Delete", "yatra"),
+      icon: <Trash2 className="w-4 h-4" />,
+      onClick: (traveler: Traveler) => handleDelete(traveler),
+      variant: "destructive" as const,
+      condition: () => can("yatra_delete_bookings"),
+    },
+  ];
+
+  // Format cell value based on field type
+  const formatCellValue = (value: any, fieldType: string): React.ReactNode => {
+    if (value === undefined || value === null || value === "") {
+      return <span className="text-gray-400">-</span>;
+    }
+
+    switch (fieldType) {
+      case "date":
+        return formatDate(value);
+      case "email":
+        return (
+          <div className="flex items-center gap-1 text-sm">
+            <Mail className="w-3 h-3 text-gray-400" />
+            <span className="truncate max-w-[150px]">{value}</span>
+          </div>
+        );
+      case "tel":
+        return (
+          <div className="flex items-center gap-1 text-sm">
+            <Phone className="w-3 h-3 text-gray-400" />
+            <span>{value}</span>
+          </div>
+        );
+      case "country":
+        return (
+          <div className="flex items-center gap-1 text-sm">
+            <MapPin className="w-3 h-3 text-gray-400" />
+            <span>{getCountryName(value)}</span>
+          </div>
+        );
+      default:
+        return <span className="text-sm">{String(value)}</span>;
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <PageHeader
+        title={__("Travelers", "yatra")}
+        description={__("View all travelers from bookings", "yatra")}
+      />
+
+      {/* Filters */}
+      <Card>
+        <CardContent className="p-4">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
+            {/* Search Field - Takes most space */}
+            <div className="lg:col-span-8">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+                <Input
+                  type="text"
+                  placeholder={__("Search by name, email, phone...", "yatra")}
+                  value={searchTerm}
+                  onChange={(e) => {
+                    setSearchTerm(e.target.value);
+                    setPage(1);
+                  }}
+                  className="pl-10 w-full"
+                />
+              </div>
+            </div>
+
+            {/* Trip Filter */}
+            <div className="lg:col-span-4">
+              <Select
+                value={tripFilter}
+                onChange={(e) => {
+                  setTripFilter(e.target.value);
+                  setPage(1);
+                }}
+                className="w-full"
+              >
+                <option value="all">{__("All Trips", "yatra")}</option>
+                {tripsData?.data?.map((trip: any) => (
+                  <option key={trip.id} value={trip.id}>
+                    {trip.title}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Stats */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Card>
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center">
+              <Users className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+            </div>
+            <div>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                {__("Total Travelers", "yatra")}
+              </p>
+              <p className="text-xl font-semibold text-gray-900 dark:text-white">
+                {isLoading ? <Skeleton className="h-6 w-16" /> : totalTravelers}
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Bulk actions toolbar */}
+      <BulkActionToolbar
+        selectedIds={selectedIds}
+        bulkAction={bulkAction}
+        setBulkAction={setBulkAction}
+        onApply={handleBulkApply}
+        onClearSelection={() => setSelectedIds([])}
+        statusFilter="all"
+        setStatusFilter={() => {}}
+        statusOptions={[
+          { key: "all", label: __("All", "yatra"), count: totalTravelers },
+        ]}
+        showColumnsDropdown={showColumnsDropdown}
+        setShowColumnsDropdown={setShowColumnsDropdown}
+        columnOptions={columnOptions}
+        onToggleColumn={toggleColumn}
+        bulkMutationPending={bulkMutation.isPending}
+        totalItems={travelers.length}
+        bulkActionOptions={[{ value: "delete", label: __("Delete", "yatra") }]}
+      />
+
+      {/* Travelers Table */}
+      <Card>
+        <CardContent className="p-0 overflow-x-auto">
+          <SharedTable
+            data={travelers}
+            isLoading={isLoading}
+            isError={isTravelersError}
+            errorText={__("Error loading travelers", "yatra")}
+            errorDescription={__(
+              "We couldn't connect to the travelers service. Please refresh or try again shortly.",
+              "yatra",
+            )}
+            errorDetails={derivedErrorDetails}
+            errorRequestInfo={errorContext.requestInfo}
+            onRetry={() => refetch()}
+            skeletonRows={5}
+            emptyText={
+              searchTerm || tripFilter
+                ? __("No travelers found matching your criteria", "yatra")
+                : __("No travelers found", "yatra")
+            }
+            emptyDescription={__(
+              "View and manage travelers collected from your bookings.",
+              "yatra",
+            )}
+            capability="yatra_view_bookings"
+            selectedItemIds={selectedIds}
+            onSelectItem={(id: string | number, checked: boolean) => {
+              if (checked) {
+                setSelectedIds((prev) =>
+                  prev.includes(id) ? prev : [...prev, id],
+                );
+              } else {
+                setSelectedIds((prev) =>
+                  prev.filter((existingId) => existingId !== id),
+                );
+              }
+            }}
+            onSelectAll={(checked: boolean) => {
+              if (checked) {
+                setSelectedIds(travelers.map((t: Traveler) => t.id));
+              } else {
+                setSelectedIds([]);
+              }
+            }}
+            isAllSelected={
+              travelers.length > 0 && selectedIds.length === travelers.length
+            }
+            getItemId={(traveler: Traveler) => traveler.id}
+            actions={actions}
+            columns={[
+              visibleColumns.traveler_info && {
+                key: "traveler_info",
+                label: __("Traveler", "yatra"),
+                render: (traveler: Traveler) => (
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center text-sm font-medium text-gray-600 dark:text-gray-300">
+                      {(traveler.first_name?.[0] || "?").toUpperCase()}
+                      {(traveler.last_name?.[0] || "").toUpperCase()}
+                    </div>
+                    <div>
+                      <div className="font-medium text-gray-900 dark:text-white flex items-center gap-2">
+                        {[traveler.first_name, traveler.last_name]
+                          .filter(Boolean)
+                          .join(" ") || "N/A"}
+                        {traveler.is_lead && (
+                          <Badge variant="info" className="text-xs">
+                            {__("Lead", "yatra")}
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 space-y-0.5">
+                        {traveler.phone && (
+                          <div className="flex items-center gap-1">
+                            <Phone className="w-3 h-3" />
+                            <span>{traveler.phone}</span>
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2">
+                          {traveler.gender && (
+                            <span className="capitalize">
+                              {traveler.gender}
+                            </span>
+                          )}
+                          {traveler.nationality && (
+                            <>
+                              {traveler.gender && <span>•</span>}
+                              <span>
+                                {getCountryName(traveler.nationality)}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ),
+              },
+              ...dynamicColumns.map((col) => ({
+                key: `dynamic_${col.id}`,
+                label: col.label,
+                render: (traveler: Traveler) =>
+                  formatCellValue(traveler[col.id], col.type),
+              })),
+              visibleColumns.trip && {
+                key: "trip",
+                label: __("Trip", "yatra"),
+                render: (traveler: Traveler) => (
+                  <div
+                    className="max-w-[200px] truncate"
+                    title={traveler.trip_title}
+                  >
+                    {traveler.trip_title || `Trip #${traveler.trip_id}`}
+                  </div>
+                ),
+              },
+              visibleColumns.travel_date && {
+                key: "travel_date",
+                label: __("Travel Date", "yatra"),
+                render: (traveler: Traveler) => (
+                  <div className="flex items-center gap-1 text-sm">
+                    <Calendar className="w-3 h-3 text-gray-400" />
+                    {formatDate(traveler.travel_date)}
+                  </div>
+                ),
+              },
+              visibleColumns.booking_reference && {
+                key: "booking_reference",
+                label: __("Booking", "yatra"),
+                render: (traveler: Traveler) => (
+                  <a
+                    href={`${window.yatraAdmin?.siteUrl || ""}/wp-admin/admin.php?page=yatra&subpage=bookings&action=view&id=${traveler.booking_id}`}
+                    className="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 font-mono text-sm"
+                  >
+                    {traveler.booking_reference}
+                  </a>
+                ),
+              },
+            ].filter(Boolean)}
+          />
+        </CardContent>
+      </Card>
+
+      {/* Pagination */}
+      {totalTravelers > 0 && (
+        <Pagination
+          currentPage={page}
+          totalPages={totalPages}
+          totalItems={totalTravelers}
+          itemsPerPage={perPage}
+          onPageChange={setPage}
+          itemName={__("travelers", "yatra")}
+        />
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmationDialog
+        isOpen={deleteDialogOpen}
+        onClose={() => {
+          setDeleteDialogOpen(false);
+          setTravelerToDelete(null);
+        }}
+        onConfirm={confirmDelete}
+        title={__("Delete Traveler", "yatra")}
+        message={
+          travelerToDelete
+            ? __(
+                `Are you sure you want to delete ${[travelerToDelete.first_name, travelerToDelete.last_name].filter(Boolean).join(" ")}? This action cannot be undone.`,
+                "yatra",
+              )
+            : __("Are you sure you want to delete this traveler?", "yatra")
+        }
+        confirmText={__("Delete", "yatra")}
+        cancelText={__("Cancel", "yatra")}
+        variant="danger"
+        isLoading={bulkMutation.isPending}
+      />
+    </div>
+  );
+};
+
+export default Travelers;

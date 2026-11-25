@@ -1,0 +1,82 @@
+
+---Downloaded files---
+The import files for: Inspiro Lite - Gutenberg Blocks were successfully downloaded!
+Initial max execution time = 120
+Files info:
+Site URL = http://localhost/aa
+Data file = C:\xampp\htdocs\aa/wp-content/uploads/2023/03/demo-content-import-file_2023-03-18__18-21-57.xml
+Widget file = C:\xampp\htdocs\aa/wp-content/uploads/2023/03/demo-widgets-import-file_2023-03-18__18-21-57.json
+Customizer file = C:\xampp\htdocs\aa/wp-content/uploads/2023/03/demo-customizer-import-file_2023-03-18__18-21-57.dat
+Redux files:
+not defined!
+
+------
+New AJAX call!
+
+
+------
+New AJAX call!
+
+
+------
+New AJAX call!
+
+
+------
+New AJAX call!
+
+
+------
+New AJAX call!
+
+
+------
+New AJAX call!
+
+
+---Importing widgets---
+Barra lateral : 
+
+Buscar - Search - Imported
+Texto - About us - Imported
+Social Icons by WPZOOM - Follow us - Imported
+
+Barra lateral del blog : 
+
+Buscar - Search - Imported
+Texto - About - Imported
+Categorías - No Title - Imported
+Social Icons by WPZOOM - Follow us - Imported
+Instagram Widget by WPZOOM (Legacy) - Instagram - Imported
+
+Pie de página 1 : 
+
+Texto - About us - Imported
+
+Pie de página 2 : 
+
+Texto - Our Address - Imported
+
+Pie de página 3 : 
+
+Social Icons by WPZOOM - Follow Us - Imported
+
+Pie de página 4 : 
+
+Instagram Widget by WPZOOM (Legacy) - Instagram - Imported
+
+Iconos sociales en la cabecera : 
+
+Social Icons by WPZOOM - Follow us - Imported
+
+Barra de Instagram a pie de página : 
+
+Instagram Widget by WPZOOM (Legacy) - Instagram - Imported
+
+
+
+---Importing customizer settings---
+Error: The customizer import file is not suitable for current theme. You can only import customizer settings for the same theme or a child theme.
+
+---ocdi/after_import---
+

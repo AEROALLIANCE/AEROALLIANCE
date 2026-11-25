@@ -1,0 +1,426 @@
+=== Yatra - Travel Booking & Tour Operator Software ===
+Contributors: MantraBrain
+Tags: tour-booking, travel-booking, tour-operator, travel, travel-agency
+Requires at least: 6.0
+Tested up to: 7.1
+Requires PHP: 7.4
+Stable tag: 3.1.3
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+WordPress travel booking plugin for tour operators. Trips, departures, payments, OTAs, AI. Free + [Pro](https://wpyatra.com/pricing/) from $99/yr.
+
+== Description ==
+
+**✈️ Yatra** is the **WordPress travel booking plugin** built for **tour operators, activity providers, travel agencies and adventure businesses** that need real trip inventory — not a generic shop. The free version is a full booking office: trips, availability, checkout, customer records, transactional emails and a customer account area. **[Yatra Pro](https://wpyatra.com/pricing/)** unlocks [premium payment gateways](https://wpyatra.com/pricing/) plus a suite of [20 Pro modules](https://wpyatra.com/features/) you switch on as your business grows — from [Channel Manager (Viator + GetYourGuide)](https://wpyatra.com/features/channel-manager/) to [AI Assistant](https://wpyatra.com/features/ai-assistant/), [White Label](https://wpyatra.com/features/white-label/) and [WhatsApp Notifications](https://wpyatra.com/features/whatsapp/).
+
+**Official site:** 🌐 [wpyatra.com](https://wpyatra.com/) · 📖 [docs.wpyatra.com](https://docs.wpyatra.com) · 💳 [Pricing](https://wpyatra.com/pricing/) · ✨ [All features](https://wpyatra.com/features/) · 🎯 [Live demo](https://demo.wpyatra.com/) · 💬 [Support forum](https://wordpress.org/support/plugin/yatra/)
+
+= 🎬 See Yatra in action =
+
+🎥 Watch **Yatra in 60 seconds** on YouTube — the complete tour booking system, from building a trip to getting paid. More tutorials on the **[MantraBrain YouTube channel](https://www.youtube.com/@MantraBrain)**.
+
+	[youtube https://www.youtube.com/watch?v=ZHeW7AmdHQk]
+
+= ✈️ Why tour operators pick Yatra =
+
+* 🗺️ **Travel-first data model** — Departures, capacity, traveler types and itineraries match how tours are actually sold, not how an e-commerce shop sells products.
+* 🧭 **One admin workspace** — Modern Yatra dashboard inside wp-admin; less tab-hopping than bolting travel onto a generic commerce stack.
+* ⚖️ **Honest Free vs [Pro](https://wpyatra.com/pricing/)** — Core booking, CRM-style records, reviews and PayPal / Pay Later are in the free plugin. Card gateways and advanced modules are in [Pro](https://wpyatra.com/pricing/) — no surprise paywalls on basics.
+* 🔒 **Your site, your data** — Bookings and customer data stay in your WordPress database; payments go through the gateways you configure. No proxy, no markup, no per-booking fee.
+* ⭐ **700+ active installs · ★ 4.6 / 5 on WordPress.org** — Active development since 2018, weekly updates.
+
+= 🎁 What you get in the free Yatra plugin =
+
+**Trips and catalog (free)**
+
+* [Trips & Itineraries](https://wpyatra.com/features/trips/) — unlimited trips with rich descriptions, gallery, difficulty, duration, meeting points, included / excluded lists, day-by-day itinerary builder, per-trip FAQs and custom attributes
+* [Departures & Availability](https://wpyatra.com/features/departures/) — scheduled departures, capacity, recurring availability rules
+* [Customer Accounts](https://wpyatra.com/features/customer-accounts/) — booking history, payments, profile, and document access (invoices, vouchers, itineraries)
+* [Reviews & Ratings](https://wpyatra.com/features/reviews/) — moderation and trip-level display
+* [Sales Reports](https://wpyatra.com/features/reports/) — admin reports for bookings, revenue, and trends
+* [Discounts & Coupons](https://wpyatra.com/features/discounts/) — sale and regular pricing, traveler-based pricing, coupon engine
+* [Enquiries Inbox](https://wpyatra.com/features/enquiries/) — capture pre-booking questions per trip
+* [PDF Documents](https://wpyatra.com/features/pdfs/) — generated invoices, vouchers, traveler itineraries
+* [Transactional Emails](https://wpyatra.com/features/transactional-emails/) — booking confirmation, payment receipt, cancellation, reminder
+
+**Free payment gateways**
+
+* [PayPal](https://wpyatra.com/features/paypal/) — cards, PayPal balance, Pay-in-4
+* [Pay Later](https://wpyatra.com/features/pay-later/) — book now, confirm or pay offline (ideal for bank transfer, cash on arrival, invoice workflows)
+
+**Front-end + extensibility**
+
+* Templates for trip listings, single trip, booking flow, checkout, and account
+* **4 Gutenberg blocks** + **8 shortcodes** to place trips, search, login and account on any page
+* Compatible with most well-coded block themes, classic themes and major page builders
+* PHP 7.4 or newer, structured codebase, hooks and filters, template overrides
+* REST-oriented flows for booking and account experiences
+
+= 💎 Yatra Pro — 20 modules across 3 tiers =
+
+**[Compare plans and buy Yatra Pro](https://wpyatra.com/pricing/)** — three plans (Starter · Growth · Scale), each available yearly or lifetime.
+
+**Starter — $99/yr (sale, regular $149)** · 1 site license · everything below included
+
+* [Dynamic Pricing](https://wpyatra.com/features/dynamic-pricing/) — seasonality, demand, early bird, last-minute, inventory rules
+* [Flexible Payments](https://wpyatra.com/features/flexible-payments/) — deposits and partial payments
+* [Scheduled Payments](https://wpyatra.com/features/scheduled-payments/) — instalment plans
+* [Advanced Discount](https://wpyatra.com/features/advanced-discount/) — group-style discounts alongside coupons
+* [Additional Services](https://wpyatra.com/features/additional-services/) — sell extras with the trip
+* [Email Automation](https://wpyatra.com/features/email-automation/) — multi-step sequences, audience filters, per-send delivery logs
+* [Abandoned Booking Recovery](https://wpyatra.com/features/abandoned-booking-recovery/) — recover incomplete bookings
+* [Mailchimp Integration](https://wpyatra.com/features/mailchimp/) — sync travelers + bookings to lists
+* [Facebook Pixel](https://wpyatra.com/features/facebook-pixel/) — server-side + browser events
+* [Google Analytics 4 Enhanced](https://wpyatra.com/features/google-analytics/) — booking funnel + revenue events
+* [Google Calendar sync](https://wpyatra.com/features/google-calendar/) — departures and bookings into Google Calendar
+* [Custom Landing Pages](https://wpyatra.com/features/custom-landing-pages/) — per-trip conversion-focused landing pages
+* [Dynamic Form Field](https://wpyatra.com/features/dynamic-form-field/) — drag-and-drop custom booking questions
+* [Trip Consent](https://wpyatra.com/features/trip-consent/) — digital waivers and signatures
+* **Premium payment gateways**: Stripe · Razorpay · Mollie · Paystack · Square · Authorize.Net · Bank Transfer
+
+**Growth — $149/yr (sale, regular $199)** · 1 site license · everything in Starter, plus
+
+* [AI Assistant](https://wpyatra.com/features/ai-assistant/) — generate itineraries, draft descriptions, suggest replies (bring your own OpenAI or Anthropic key)
+* [WhatsApp Notifications](https://wpyatra.com/features/whatsapp/) — booking confirmations, payment receipts and departure reminders over WhatsApp (Meta Cloud API)
+
+**Scale — from $349/yr (sale)** · 1-site $349/yr (regular $449) or 15-site $599/yr (regular $749) · everything in Growth, plus
+
+* [Channel Manager](https://wpyatra.com/features/channel-manager/) — sell on Viator + GetYourGuide from one WordPress dashboard. Signed webhooks, anti-overbooking locks, real-time inventory sync.
+* [White Label](https://wpyatra.com/features/white-label/) — rebrand the admin, emails, PDFs and frontend. Full agency theming.
+* [Team & Access](https://wpyatra.com/features/team-access/) — granular roles + capability-based access for multi-staff agencies. 8 built-in roles, custom role builder, magic-link invitations, time-windowed access for contractors, scope filtering (per-destination / per-trip), append-only audit log. Defense-in-depth: every action gated on the server, UI mirrors via cap-aware controls.
+* [Webhooks](https://wpyatra.com/features/webhooks/) — outbound HTTP delivery on booking / payment / customer events. HMAC-signed payloads, retry queue with exponential backoff, dead-letter queue, certificate pinning. Wire Yatra into Zapier, Make, n8n, or your own internal systems.
+
+**Lifetime plans** also available: Starter $499 · Growth $699 · Scale $1,299 (1 site) / $1,999 (15 sites) — pay once, own it forever.
+
+[See full plan comparison and pricing →](https://wpyatra.com/pricing/)
+
+= 🥊 How Yatra compares =
+
+Considering Yatra against a SaaS booking platform or another WordPress travel plugin? We've written honest, side-by-side comparisons against each major alternative:
+
+* 🔄 **[Yatra vs Rezdy](https://wpyatra.com/yatra-vs-rezdy/)** — Sell on Viator + GetYourGuide without the $99–$499 / month Rezdy SaaS bill. Lifetime license · GPL · your data, your gateway.
+* 🔄 **[Yatra vs Bokun](https://wpyatra.com/yatra-vs-bokun/)** — Skip the per-OTA-booking fee Bokun charges (typically 2.5% per booking). Independent open-source alternative to Tripadvisor-owned Bokun.
+* 🔄 **[Yatra vs WP Travel Engine](https://wpyatra.com/yatra-vs-wp-travel-engine/)** — Same WordPress philosophy, modern architecture, broader Pro modules. Custom database tables for performance vs. WP Travel Engine's custom post types.
+
+Each page covers the feature matrix, pricing math, migration steps and FAQ — written without overpromising. Read the verdict, then [try Yatra Pro free](https://try.wpyatra.com/try-yatra-pro/) before you commit.
+
+= 🌐 Native integrations =
+
+Yatra ships with bring-your-own-credential integrations — no proxy, no markup, no per-event fees. Full directory: **[All integrations on wpyatra.com](https://wpyatra.com/integrations/)**.
+
+* **Payments**: PayPal · Pay Later · Stripe · Razorpay · Mollie · Paystack · Square · Authorize.Net · Bank Transfer
+* **OTAs**: Viator · GetYourGuide · Other OTAs (by request)
+* **Email & Messaging**: Mailchimp · WhatsApp Cloud API
+* **Analytics & Marketing**: Google Analytics 4 · Meta / Facebook Pixel
+* **Calendars & Scheduling**: Google Calendar
+* **AI Providers**: OpenAI · Anthropic Claude
+* **WordPress Ecosystem**: Gutenberg blocks (4 native) · Elementor (via Shortcode) · WooCommerce (coexistence) · Loco Translate
+
+= 🔍 Built-in travel SEO =
+
+Yatra is built to rank — your trips, destinations and activities are search-engine ready out of the box, with no extra SEO plugin required:
+
+* 🧱 **Schema.org structured data** — automatic structured markup for trips and listing pages so search engines can surface rich results for your tours.
+* 🏷️ **Meta titles, descriptions & Open Graph / Twitter cards** — per-trip and per-archive, with `{name}`-style tokens, for clean search snippets and shareable social previews.
+* 🗺️ **XML sitemap** — Yatra publishes one sitemap of every trip, destination, activity and category at `/yatra-sitemap.xml`, advertised in `robots.txt` and integrated automatically with **WordPress core, Yoast, Rank Math and All in One SEO** sitemaps. (Yatra stores content in fast custom tables, so this is what keeps it fully discoverable.)
+* 🔗 **Clean, keyword-friendly permalinks** — `/trip/…`, `/destination/…`, `/activity/…` URL bases you control under Settings.
+* 🌍 **Translation-ready interface** — every label, button and email is translatable with standard `.po`/`.mo` files via **Loco Translate**, **WPML String Translation** or **Polylang** string translation.
+
+= 🧩 Blocks and shortcodes =
+
+Use the **block editor** or **classic shortcodes** to drop catalog widgets, search and account UI into any page.
+
+**Blocks** (search the inserter for "Yatra" or the block name):
+
+* **Trip** — block name `yatra/tour` (trip grid; the registered name stays `yatra/tour` for backward compatibility, but the inserter title and UI now read **Trip**). **Trip Settings** (layout, **Featured Priority** — restrict to *Featured*, *New*, or *Limited Time* picked on the trip form's **Categorization → Featured Priority**) and **Filters**: each taxonomy (destinations, activities, trip categories, difficulty / fitness level) supports **Listing scope** — either **All published** (no ID filter saved) or **Only selected**, with **search plus checkboxes** to pick numeric classification IDs.
+* **Activity** — `yatra/activity`: same taxonomy picker pattern (All published vs search + IDs) in the sidebar; matches **`[yatra_activity]`** ID rules.
+* **Destination** — `yatra/destination`: same pattern; matches **`[yatra_destination]`** ID rules.
+* **Trip categories** — `yatra/trip-category` (same card layout as destinations; links use your trip category base from Settings).
+
+**Shortcodes** (all accept string values as in the plugin defaults — use `yes` / `no` or `0` / `1` where noted):
+
+* **`[yatra_trip]`** — Trip listing. Alias: **`[yatra_tour]`**. Filters: `destination`, `activity`, `category` accept comma-separated classification IDs. Optional: `order`, `featured_priority` (`featured` / `new` / `limited`), `per_page`, `difficulty`, `price_min`, `price_max`, `duration_min`, `duration_max`, `search`, `columns`, `show_pagination`, `title`, `card_layout`. Pagination: `trip_page`. Examples: `[yatra_trip]`, `[yatra_trip destination="44" activity="12"]`, `[yatra_trip featured_priority="new" per_page="6"]`, `[yatra_trip card_layout="compact_all"]`.
+* **`[yatra_activity]`** — Activity listing cards.
+* **`[yatra_destination]`** — Destination showcase.
+* **`[yatra_trip_category]`** — Trip category cards.
+* **`[yatra_search]`** — Advanced trip search form. Per-field visibility attributes — `keyword`, `destination`, `activities`, `duration`, `budget` — each `yes` / `no`. Omit one to inherit its **Settings → Search & Listing** toggle; pass a value to force it on/off for that placement. Example: `[yatra_search budget="no" duration="no"]`. (The built-in listing page sets these automatically from your settings.)
+* **`[yatra_login]`** — Customer login form.
+* **`[yatra_my_account]`** — Account dashboard for logged-in users.
+* **`[yatra_discount_and_deals]`** — Discounted trips.
+
+**Empty-term filtering (`hide_empty`):** `[yatra_destination]`, `[yatra_activity]` and `[yatra_trip_category]` accept `hide_empty="yes"` to skip taxonomy terms that have zero published trips. Opt-in (default `no`).
+
+**Card layout (`card_layout`):** `[yatra_trip]` / `[yatra_tour]` and `[yatra_discount_and_deals]` accept `card_layout` to set how the trip cards look for that one listing, overriding the site-wide **Settings → Design → Listing Card Layout** default. Values: `inherit` (default — follow the site setting), `standard` (full card), `compact_mobile` (compact horizontal cards on phones only, unchanged on desktop), `compact_all` (compact everywhere). The compact card shows image, title, price and a **View Details** button. Each listing is independent, so different listings on the same page can use different layouts. Example: `[yatra_trip per_page="6" card_layout="compact_all"]`. The **Trip** block offers the same choice under **Trip Settings → Card layout**.
+
+**Note:** If you're migrating from an older build, `[yatra_cart]`, `[yatra_checkout]` and `[yatra_mini_cart]` are no longer registered — checkout and the booking flow now use Yatra's own front-end routes and templates. See **[docs.wpyatra.com](https://docs.wpyatra.com)** for full shortcode reference, URLs and page setup.
+
+= 🎨 Compatible WordPress travel themes =
+
+Yatra works with most well-coded block themes, classic themes and major page builders. **Recommended themes** (optional — Yatra works with any theme):
+
+* 🧳 **[Resa — the official Yatra travel theme](https://wpyatra.com/best-wordpress-travel-theme/)** — Lighthouse-fast, mobile-first, Gutenberg + WooCommerce ready, free on the WordPress.org theme directory. Trip card grid, departure widgets, traveler-account dashboard all pre-styled for Yatra.
+* 🧱 **[Blocksy](https://wordpress.org/themes/blocksy/?ref=yatrapluginorg)** — modern block theme
+* ⚡ **[Kadence](https://wordpress.org/themes/kadence/?ref=yatrapluginorg)** — fast, flexible theme
+
+= 🔗 Quick links =
+
+* 🏠 **[wpyatra.com](https://wpyatra.com/)** — official site
+* 💳 **[Pricing](https://wpyatra.com/pricing/)** — Starter · Growth · Scale · Lifetime plans
+* ✨ **[All features](https://wpyatra.com/features/)** — full Free + Pro capability list
+* 🌐 **[Integrations](https://wpyatra.com/integrations/)** — every native partner
+* 🥊 **[Yatra vs alternatives](https://wpyatra.com/yatra-vs-rezdy/)** — head-to-head comparisons
+* 🎨 **[WordPress travel theme (Resa)](https://wpyatra.com/best-wordpress-travel-theme/)** — recommended pairing
+* 📖 **[Documentation](https://docs.wpyatra.com/)** — installation, blocks, shortcodes, operations
+* 🎯 **[Live demo](https://demo.wpyatra.com/)** — see Yatra on a real WordPress demo
+* 🆘 **[Support / contact](https://mantrabrain.com/contact)** — help and commercial support routing
+
+= 💙 Join the community =
+
+* ⭐ **[Rate Yatra five stars](https://wordpress.org/support/plugin/yatra/reviews/?filter=5)** — helps other tour operators find the plugin
+* 💬 **[Facebook community](https://www.facebook.com/groups/yatrawordpressplugin)** — connect with other Yatra users
+* 📧 **[Email support](mailto:mantrabrain@gmail.com)** — direct email for product questions
+* 🐛 **[GitHub — issues & contributions](https://github.com/MantraBrain/yatra)** — bug reports and pull requests
+
+= 🚀 Try Yatra risk-free =
+
+* 🧪 **[Try the free Yatra plugin in WordPress Playground](https://try.new/plugins/yatra)** — spin up a temporary WordPress site with the free Yatra plugin pre-installed. No local setup, no signup, no credit card.
+* 🎁 **[Try Yatra Pro free](https://try.wpyatra.com/try-yatra-pro/)** — full Pro trial environment with every module enabled. No credit card required.
+* 💰 **14-day refund** on every paid Yatra Pro plan — see the [pricing page](https://wpyatra.com/pricing/) for the refund window terms.
+
+== Installation ==
+
+🛠️ **Quick setup**
+
+1. Install and activate **Yatra** from this screen or upload the ZIP under Plugins → Add New → Upload.
+2. Complete the setup wizard (currency, basics, permalinks as prompted).
+3. Add destinations and activities, then create your first trip under **Yatra → Trips**.
+4. Configure **PayPal** and/or **Pay Later** under Yatra payment settings (free). Add **[Yatra Pro](https://wpyatra.com/pricing/)** when you need card gateways or [Pro modules](https://wpyatra.com/features/).
+5. Place the booking experience on your site using Yatra templates, **blocks**, or **shortcodes** (see **🧩 Blocks and shortcodes** in the description above and [docs.wpyatra.com](https://docs.wpyatra.com)).
+
+== Frequently Asked Questions ==
+
+= What is the best WordPress travel booking plugin for tour operators? =
+
+Yatra is the **WordPress travel booking plugin** built around the operational reality of selling tours — scheduled departures, capacity, traveler categories, OTA distribution, dynamic pricing and deposit handling. The free plugin covers the entire booking lifecycle (trips, availability, customer accounts, reviews, reports, PDFs, transactional emails, PayPal + Pay Later); [Yatra Pro](https://wpyatra.com/pricing/) adds 20 modules across Starter, Growth and Scale tiers. Read the [head-to-head comparison vs WP Travel Engine](https://wpyatra.com/yatra-vs-wp-travel-engine/) or [vs Rezdy SaaS](https://wpyatra.com/yatra-vs-rezdy/).
+
+= Is Yatra free? =
+
+Yes. The plugin on WordPress.org is free and includes the core booking stack for many tour operators. **[Yatra Pro](https://wpyatra.com/pricing/)** is a paid upgrade for [premium gateways](https://wpyatra.com/pricing/) and [20 Pro modules](https://wpyatra.com/features/).
+
+= Do I need code skills to use Yatra? =
+
+No for day-to-day operation. Developers can override templates and use hooks for custom workflows.
+
+= Which payments are free vs Pro? =
+
+**Free:** [PayPal](https://wpyatra.com/features/paypal/) and [Pay Later](https://wpyatra.com/features/pay-later/). **[Pro](https://wpyatra.com/pricing/):** Stripe, Razorpay, Mollie, Paystack, Square, Authorize.Net, bank transfer (as supported for your account and region).
+
+= Can I take bookings without charging a card immediately? =
+
+Yes. Use **Pay Later** for offline confirmation, invoices, or pay-on-arrival flows.
+
+= Can I distribute my tours on Viator, GetYourGuide and other OTAs? =
+
+Yes — the [Channel Manager module](https://wpyatra.com/features/channel-manager/) (Scale tier) connects Yatra directly to **Viator** and **GetYourGuide** via their official APIs. Signed webhooks pull bookings back in real time; anti-overbooking locks prevent two channels selling the same seat. Other OTAs (Klook, TripAdvisor Experiences, Booking.com Experiences, Airbnb Experiences) are available by request.
+
+= Does Yatra work with WooCommerce? =
+
+Yes. Yatra runs alongside WooCommerce on the same WordPress site — Yatra stores trips in its own custom tables while WooCommerce uses WordPress orders. Both coexist without data conflicts. Many operators use Yatra for tours and WooCommerce for merchandise or gift cards.
+
+= Does Yatra support multilingual and multi-currency travel sites? =
+
+**Interface — yes.** Yatra is fully translation-ready: every label, button and email translates via standard POT / `.po` / `.mo` files using **Loco Translate**, **WPML String Translation** or **Polylang** string translation. RTL stylesheets ship in the [Resa travel theme](https://wpyatra.com/best-wordpress-travel-theme/).
+
+**Trip content — important to know.** Yatra stores trips and destinations in its own fast custom tables (not WordPress posts), so WPML and Polylang — which translate posts and taxonomies — cannot translate the trip *content* itself. For a fully multilingual catalogue today, run one site per language (WordPress Multisite, a subsite per language). Native per-language content translation is on our roadmap.
+
+**Currency.** Set your default currency in Yatra → Settings (site-level).
+
+= Does Yatra work with my theme? =
+
+It works with most modern WordPress themes. Yatra ships front-end templates; your theme controls global layout and typography. For the smoothest pairing, see **[Resa](https://wpyatra.com/best-wordpress-travel-theme/)** — the dedicated Yatra travel theme by MantraBrain, free on WordPress.org.
+
+= Are invoices and vouchers only in Pro? =
+
+Travelers can access invoices, vouchers and itineraries from the account area on the free plugin when your site is configured for it. [Pro](https://wpyatra.com/pricing/) expands payment choices and business modules — it does not remove core documents by default.
+
+= How do saved trips / wishlist work? =
+
+Saved trips appear when **[Yatra Pro](https://wpyatra.com/pricing/)** is active and **wishlist** is enabled in Yatra settings.
+
+= Is Yatra GDPR-friendly? =
+
+Use WordPress privacy tools together with Yatra: export or delete user-related data as required by your policy. Bookings and customer data live in your own WordPress database — Yatra does not ship data to an external SaaS. Payment data is handled by your chosen gateways under their terms.
+
+= Where is documentation? =
+
+See **[docs.wpyatra.com](https://docs.wpyatra.com)** and **[wpyatra.com](https://wpyatra.com/)** for features, **[Pro](https://wpyatra.com/pricing/)** and updates.
+
+= Where are shortcodes and blocks documented? =
+
+See **🧩 Blocks and shortcodes** in the description above. Full walkthroughs (pages, permalinks, checkout URLs) are in the documentation.
+
+= Does Yatra provide cart or checkout shortcodes? =
+
+**No.** Checkout and the booking flow run on Yatra's own front-end routes and templates — drop them on any page via the plugin's pretty permalinks (see the Permalink settings). Catalog, search, login and account still have shortcodes and blocks as listed in the description.
+
+= What does Yatra Pro cost? =
+
+Pricing starts at **$99/yr** (Starter, sale) and goes up to **$599/yr** (Scale 15-site, sale). Lifetime plans available from **$499** one-time. Every Pro tier includes a **14-day refund** window. See the **[full pricing breakdown](https://wpyatra.com/pricing/)**.
+
+== Screenshots ==
+
+1. Trip pages that sell themselves — gallery, duration, season and a sticky "Book Now" price button on any theme
+2. Book in a few taps, no redirects — live departure availability, traveller count and enquiry, all inline
+3. Your whole operation at a glance — bookings, revenue and upcoming departures the moment you log in
+4. Every trip in one organised list — search, filter by status, and see pricing, type and availability instantly
+5. Build a complete trip in one place — basics, pricing, itinerary, media and SEO, guided step by step
+6. Never lose track of a reservation — filter by traveller, payment state and status across every departure
+7. Full booking detail, one-click invoice — payment summary, traveller records and a downloadable invoice
+8. Every transaction accounted for — Stripe, PayPal, bank transfer and manual payments in one ledger
+9. Run offers without spreadsheets — coupon codes with usage limits, expiry dates and live status
+
+== Changelog ==
+
+= 3.1.3 — 22 November 2026 =
+
+* New - Email override templates can be limited to bookings paid with a chosen payment method, or to balances charged automatically to a saved card (needs Yatra Pro 3.1.3 or later). Without Yatra Pro 3.1.3 nothing changes.
+* Security - PayPal (Simple mode) payment notifications are now accepted only when the payment was made to the PayPal account configured in Yatra and in the booking's currency. Before, a genuine PayPal payment to any other account could be used to mark a booking as paid. Thanks to kta1kri for the responsible disclosure.
+* Security - A PayPal (Advanced mode) order is now applied only to the booking it was created for, and only for the amount actually captured. Before, an order paid for one booking could be reused to mark another booking as paid.
+* Security - The public payment confirmation and payment return endpoints now credit only a payment the gateway reports as completed, for its real amount and currency, and refuse a transaction that belongs to another booking or was already recorded. Before, a single cheap payment could mark other bookings as fully paid.
+* Fix - A PayPal (Advanced mode) deposit was recorded as full payment when the customer returned from PayPal before the webhook arrived.
+* Developers - A payment gateway's verifyPayment() result is now credited only when it reports a paid amount (`amount` above 0, and a `status` such as completed or succeeded when it sends one); a booking_id or currency it reports must match the booking. Third-party gateways that returned no amount were credited the amount due and are now refused.
+* Fix - The trip available-dates API (`/trips/{id}/available-dates`) listed dates excluded on a recurring rule, though the booking calendar hid them and they couldn't be booked.
+* Fix - The same API listed a sold-out date with all its seats free when the date came from a recurring rule.
+
+= 3.1.2 — 15 November 2026 =
+
+* Fix - The {{payment_type_label}} email tag printed the stored type ("installment", "final", "manual") instead of a readable name. It now shows "Installment 2 of 4", "Final payment" or "Balance payment".
+
+= 3.1.1 — 8 November 2026 =
+
+* Fix - Creating or updating a group discount with size ranges logged a PHP warning ("Undefined array key min_group_size"), which could break the save on sites that display PHP warnings.
+* Fix - With Yatra's Timezone set west of UTC (for example the Americas), departure cards, the checkout summary and the booking confirmation page showed the day before the booked date, so the confirmation email seemed to show the next day. Dates now show as booked.
+* Fix - Travel dates in emails, invoices and PDFs could shift by a day when another plugin changed PHP's timezone. They now always show the booked date.
+* Fix - Emails sent through Yatra's own SMTP setting showed accented letters, dashes and emoji as garbled symbols (such as "Ã©"). They're now sent as UTF-8.
+* Fix - Sending through Yatra's own SMTP setting could stop with a critical error when no other plugin had loaded WordPress's mailer first.
+* Fix - With Yatra's own SMTP setting on, an email with several Cc or Bcc addresses (including the "always Bcc" archive address) or a named Reply-To was silently not sent.
+* Fix - A site title containing "&" or an apostrophe appeared in email subjects as "&amp;" or "&#039;".
+* Fix - Emails showed "Contact for pricing" instead of $0.00 for a fully paid booking's amount due, a zero payment or a zero scheduled amount. Reminder emails still leave out the balance line when nothing is due.
+* Fix - The booking date and time on the confirmation page were shifted by the site's timezone offset.
+* Improvement - Editing an email template that isn't sent, such as "New Booking Confirmation", now says so and links to the one customers receive.
+* Fix - When a trip had an additional service, checkout showed that service's price as the "Price per person" (for example $40.00 on a $1,350 trip). Totals were correct, but the line was wrong.
+* Fix - A trip's Minimum Travelers setting is now enforced. Before, it was only displayed, and customers could book fewer. The counter now starts at the minimum and smaller bookings are refused. **If you accept solo travelers on a trip, check that its Minimum Travelers is set to 1.** Bookings you create yourself in the admin aren't affected.
+* Fix - Group discounts now apply to trips using Regular Pricing. Before, they only worked with Traveler-Based Pricing and silently gave no discount otherwise.
+* Fix - On a new install, trip pages returned "page not found" until permalinks were saved once. Activating Yatra now sets this up by itself.
+* Fix - On trips with fixed departures, the booking card preselected today, so Check Availability usually said no departures were available. It now opens on the next departure.
+* Fix - Adding one specific date to a trip hid all of its recurring dates from customers, though they could still be booked. Both are now listed, and a specific date replaces a rule only on its own day.
+* Fix - Saving an availability date or recurring rule left you on the form instead of returning to the list, so saving again reported a duplicate date.
+* Fix - "Save for Review", "Mark as Approved", "Suspend" and "Archive" in the trip status menu published the trip instead. Each now saves the status it says.
+* Fix - The Archive action in the Trips list was refused when saving.
+* Fix - Draft trips could be opened by logged-out visitors. Unpublished trips are now visible only to staff.
+* Fix - The trip editor's main button now says "Publish Trip" until a trip is published.
+* Fix - "Update Draft" on a published trip took it offline without warning, so its page returned "page not found". The button no longer appears on published trips. To take a trip offline, choose "Save as Draft" from the status menu.
+* Improvement - Publishing a trip with no price now asks you to confirm first.
+* Improvement - Sections with nothing in them are no longer shown on the trip page, and age limits left at their defaults are hidden. To show a section anyway, use the `yatra_trip_tab_has_content` filter.
+* Fix - The Create Trip window previewed the wrong web address for the trip.
+* Fix - Hidden screen-reader text appeared inside the WordPress media window on Yatra screens.
+
+**Fixed**
+* **The phone country defaulted to the United States on German "Sie" sites.** The booking form picks the phone country from the site language, but a language variant such as *Deutsch (Sie)* (`de_DE_formal`) or `de_CH_informal` was not recognised, so it fell back to +1. It now uses the country part of the locale (Germany, Switzerland).
+* **A Stripe card payment skipped guest email verification and charged the full amount.** With *Require guest email verification* on, the booking form correctly held a guest's booking until they clicked the link in their inbox — but the Stripe card form ignored that and went on to create a payment anyway, charging the card before the email was verified and for the full price, whatever deposit or part payment the guest had chosen. The guest now sees the same "Check your email" screen as with any other payment method, and nothing is charged until they verify. Apple Pay and Google Pay behave the same way.
+* **"Show more reviews" did nothing.** The button on a trip page had no code behind it. It now loads the next reviews below the ones shown, in the same order and style, and hides itself when there are no more. It also no longer appears on trips whose reviews already fit on the page.
+* **Reviewers' email addresses were visible through the public reviews API.** `GET /wp-json/yatra/v1/trips/{id}/reviews` — reachable without logging in — included every reviewer's email address. It is now left out for visitors; staff who can view reviews still see it.
+* **"Similar Adventures" showed the regular price instead of the discounted one.** The cards worked out their own price from the trip's legacy sale price and ignored the current discount and traveller-category prices. They now use the same price, struck-through original and discount badge as the trip's own card on the listing page.
+* **Google Calendar failures are now explained.** After *Sync All Bookings* or *Resync Everything*, any booking that could not be synced is listed under the buttons with the reason — for example Google refusing access to the calendar, a booking whose trip has been deleted, or a booking without a travel date — and each failure is written to Tools → Logs when Settings → Advanced → *Enable Logging* is on. Previously only the number of failures was shown, and the reasons reached no log you could see. The reasons come from the matching Yatra Pro update; with an older Yatra Pro the screen works as before.
+
+= 3.1.0 — 1 November 2026 =
+
+
+**Fixed**
+* **Refunds were deducted twice, leaving a negative amount paid.** Recording a refund wrote the refund as its own entry *and* marked the original payment refunded, so the same money came off the booking twice over: a 1,000 payment with a 150 refund stored the amount paid as −150 instead of 850, reported more outstanding than the trip costs, and reset the payment status to *Pending* — indistinguishable from a booking that had never paid. A refund is now a single entry of its own and the original payment keeps its own record, so what you received, what you sent back and what that leaves are each counted once; the booking screen reports all three. A fully refunded booking now reads *Refunded* rather than *Pending*, including where you marked a payment refunded by hand. Because the original payment is no longer closed off, a second partial refund against the same payment is possible where it previously was not, and a new check refuses any refund that would send back more than the booking ever received. Bookings whose stored figures are already wrong are recalculated once, automatically, on the first admin page you open after updating; bookings with no refunds are not touched. Each booking's previous figures are copied to a backup table (`yatra_refund_totals_repair_backup_v1`) before they change; if a copy cannot be made, that booking is left alone and retried later.
+* **Every booking was counted twice on the customer's record.** A customer with two bookings was shown as having four — in My Account and on the Customers screen alike. The booking count, total spent and traveller totals stored against a customer were added up by hand, and one checkout added to them twice, because both the checkout and the booking service create-or-update the customer record. Nothing ever subtracted either, so cancelling or deleting a booking left the count where it was, and a customer an operator added by hand started life showing one booking they had never made. These figures are now worked out from the bookings themselves whenever a booking is created, changed, cancelled or deleted, so they cannot drift again. Counts already stored wrong are repaired once, automatically, on the first admin page you open after updating. Before rebuilding, the current figures are copied to a backup table (`yatra_customers_stats_backup_v1`); if that copy cannot be made, the rebuild waits an hour and tries again.
+* **Cancelled trips were counted as upcoming.** "Upcoming Trips" in My Account looked only at the travel date, so a trip the customer had cancelled kept being counted and listed as upcoming. A cancelled or refunded booking is no longer upcoming, and the Dashboard and Bookings pages now agree about a trip departing today — one used to count it and the other not.
+* **The payment section of the booking form could not be translated.** On a translated site the booking form came out in the site's language right up to the payment methods, which stayed in English — the one part of the checkout a customer cannot miss. Yatra had written each gateway's name and description into your saved settings in English when it was installed, and several of those seeded texts did not match the gateway's own wording, so the checkout mistook them for labels you had typed yourself and used them in place of the translatable ones. Yatra now recognises its own old defaults and lets them translate, without touching your saved settings: a name or description you genuinely customised is still shown exactly as you wrote it, and new installs no longer store these labels at all. The date-format hint in empty date fields ("YYYY-MM-DD") is translatable too, so it can follow your locale's convention.
+* **The confirmation page promised travel documents that were never sent.** Under *What's Next*, Yatra told every customer they would receive "a detailed itinerary and preparation guide within 24-48 hours" — nothing sends one, so customers waited for an email that was not coming and then asked where it was. The pay-later confirmation email said the same. Both now point to where the booking really lives: its details, trip itinerary and any balance due are in My Account, linked using your configured account address. A customer who booked as a guest is told how to reach it instead — create an account with the email address they booked with and the booking appears there — and if your site does not allow registration they are simply asked to keep their confirmation email, rather than being sent to a login page that holds nothing for them.
+* **Booking statuses were missing from the My Account bookings list.** Every booking in the list showed a "Pending" badge whatever its real status, the Completed filter found nothing and the Pending filter only matched on payment, because the list did not carry the booking's status at all (the booking detail page did, which is why the two disagreed). The list now carries it, so badges, filters and counts all read the real status.
+* **Late bookings never got the trip reminder.** The daily reminder went only to bookings travelling exactly the configured number of days out, so a booking made or confirmed inside that window — booked one day before a three-day reminder, say — never received one, and neither did a booking whose reminder day WP-Cron missed. Every eligible booking travelling between today and the reminder day now gets its reminder on the next daily run, once, and a late reminder states the real number of days left instead of the configured number. *Resend email → Trip reminder* on a booking now sends exactly the same email as the automatic one, including the outstanding-balance block, and reports an error instead of "sent" when the Trip reminder email is switched off.
+* **The archive pages' structured data described an empty list.** The trip archive and the destination, activity and trip-category listings printed `CollectionPage` JSON-LD with a hardcoded empty `ItemList` (`"numberOfItems": 0`) even when the page showed cards. The list now holds the cards actually shown — each with its URL, name and position — following filters, sorting and pagination (page 2 continues from position 11), and a page with no results leaves the list out instead of printing it empty. SEO titles, meta descriptions, canonical URLs, robots directives, prev/next links and sitemaps are unchanged. New filter `yatra_seo_collection_page_schema` to change or remove the list.
+* **The Payments method filter offered the wrong choices.** *All Methods* always listed Credit Card, PayPal, Bank Transfer and Cash, whatever was set up, so most gateways named in the table could not be chosen — on a site using Stripe and Bank Transfer, Stripe could not be filtered at all, and "Bank Transfer" missed bank transfers taken at checkout. The filter now lists the payment methods you have enabled plus any method that already has payments recorded, with the same names the table shows, so a gateway you switched off stays filterable for its past payments. The two spellings of one method (a checkout "bank_transfer" and a hand-entered "Bank Transfer") appear once and filter together in every language, and the table now shows a hand-entered method under the same translated name as the gateway.
+* **The enquiry page could stop with a fatal error on older setups.** On PHP 7.4/8.0 with WordPress 6.0–6.4, reading a trip's enquiry settings called a PHP 8.1 function WordPress only provides from 6.5. It now works on every supported PHP and WordPress version.
+* **Trip listings made a request back to your own site for every card.** To decide whether to show the "Group Discounts" badge, each trip card on a listing page called the site's REST API over HTTP while the page was being built — up to a dozen extra requests per page, and on hosts that block such loopback requests each one waited for a timeout, making listings very slow. The badge information is now read directly, with the same result and no extra requests.
+* **The trip listing price filter always showed "$".** The price range under *Filters* was redrawn by the page script with a hard-coded dollar sign, so a store in euros or pounds showed "$9 - $8,999" as soon as the page finished loading or the slider moved. It now uses your currency, symbol position, decimals and separators — exactly as prices are printed elsewhere.
+* **Parts of the admin stayed English on sites translated with a WordPress.org language pack.** Screens that load separately from the main admin script — the Trip Consent form editor among them — never received their translations, because WordPress only loads the translation file for the main script. Those screens now get their translations whichever way the site is translated, and plural forms follow the language's own rules. A few labels in the admin header (the Pro version, the license status badge and the dark-mode button) and the Trip Consent field-type tooltips were not translatable at all; they are now.
+* **A recurring departure's booking cutoff was only enforced by the calendar.** *Booking Cutoff (hours before)* and the "bookings open N days ahead" limit on a recurring departure correctly removed those dates from the trip calendar, but the booking itself was not checked: a date inside the cutoff matched no departure, was treated as an open-dated trip and the booking went through — from an old link, a page left open, or a request made directly. Such a booking is now refused ("Booking cutoff has passed for this departure.", or "This departure is not open for booking." before bookings open). Tip: the cutoff is set in hours, so 20 days is 480.
+* **Admin calendars always started the week on Sunday.** The availability calendar and the admin date pickers ignored *Settings → General → Week Starts On*, which the frontend calendars already honoured. They now start on the configured day, and their weekday names are translatable.
+* **The Google Calendar settings showed a "Sync Departures" switch that did nothing.** Nothing ever created an event from it. Departures reach the calendar through *One event per departure*, which is built from bookings, so the switch is removed and the Sync Bookings description explains this. The setting stays stored, so nothing saved is lost.
+
+**New**
+* **Payment notes are now a history rather than a single field.** The Notes box on a payment held one value, so recording why a refund was issued wrote over whatever was there before, and nothing recorded when a note was added or who added it. Payments → *Notes* now keeps a dated, attributed list: every note stays visible as new ones are added, each showing the time and the member of staff who wrote it. Anything already in the old Notes field is still shown, first in the list and marked as recorded before the history existed — nothing is migrated or overwritten, so the old field keeps working exactly as it did.
+* **A separate cancellation email for cancellations you make.** Yatra has only ever had one customer cancellation email, so a trip you cancelled told the customer their own cancellation had been received. Yatra already records who ended a booking; it now uses that. Switch on *Email While Cancelling → Cancelled by us* in Settings → Emails and a cancellation you make uses its own wording, while one the customer asked for — or one the unpaid-booking expiry produces — keeps the ordinary email. Off by default, so nothing changes until you ask for it, and if that wording is switched off or left empty the ordinary cancellation email is sent instead rather than nothing at all.
+* **Payment due dates are now shown to customers and to you.** A booking with a balance outstanding showed the amount owed but never said when it was owed — not in the customer's account, not on the booking screen, and not on the Payments screen. All three now show the next payment due date (or *Overdue since*, when it has passed) with the amount, and list each instalment separately where there is more than one. On Payments it is a *Next Due* column you switch on from the column picker, so no existing layout changes until you ask for it. Requires Yatra Pro with Scheduled Payments switched on, since that is what defines when a balance falls due; with it off there is no due date to show and nothing changes.
+* **The lead traveller's date of birth and nationality now reach the customer profile.** A booking collects them from the lead traveller, but the customer record was built only from the Contact section — which on a default form has no date-of-birth or nationality field — so those two stayed empty and the customer was asked for them a second time on their profile. They are now taken from the lead traveller, along with gender. An existing profile is never overwritten: only a blank is filled, so anything the customer has set themselves is kept exactly as it is.
+* **New `{{payment_reference}}` merge tag.** Payment emails could only show the gateway's **Transaction ID**, which is empty for anything recorded by hand — so the line either sat blank or had to be left out. Yatra's own payment number (`PAY-000004`), the one already shown on the Payments screen, the invoice and the customer's account, is now available as **Payment Reference** in Available Variables. It is filled for every recorded payment, so a customer always has a number to quote.
+* **You can now record why a booking was cancelled, and tell the customer.** The cancellation email has always been able to print a reason — `{{cancellation_reason}}` is a documented merge tag and the booking table has a column for it — but nothing except the unpaid-booking expiry cron ever wrote to it, so an operator cancelling a booking by hand had no way to say why and the tag arrived empty. The booking screen now offers a **Cancellation Reason** when you set a booking to Cancelled, and it is saved with the status change so the customer's email carries it. Leave it blank and the email is exactly what it was before.
+* **Email templates that cannot send are now labelled.** Two of the built-in templates are older names for templates still in use — they sit on the same event, look identical in Emails → Templates, and editing the wrong one has no effect at all. Such a template now carries a *Not in use* badge naming the one that handles the event instead, so the wording you edit is the wording that gets sent.
+* **Customers can now keep a postal code on their profile.** The My Account profile asked for country, city and street address but had no postal/ZIP field, so a customer could never give a complete address — and the postal code already stored on their Yatra customer record was not shown back to them either. The field is now on the profile, saved to the same customer record the booking form and the admin Customers screen use, and read back when the page loads, so what the customer enters is what they see next time.
+* **Notes on excluded dates and periods.** In a recurring availability rule, each excluded date or period now has an optional note — *Easter break*, *guide on leave* — so everyone managing availability can see why a date is closed, long after it was blocked. Notes are visible to your team only, never to customers, and are plain text up to 200 characters. Existing exclusions are unchanged and simply have no note.
+* **Booking-form answers in emails read like the booking page.** Merge tags for booking-form answers — the `contact_…`, `emergency_…` and `lead_traveler_…` tags and `{{traveler_custom_fields_html}}` — printed the stored value: a dropdown's internal value (*spouse*, *gluten_free*) or a country code (*DE*). They now print what the booking page shows — the option's label (*Spouse/Partner*, *Gluten Free*, translated like on the booking form) and the country name (*Germany*) — and the traveller block uses each field's own label. Free-text answers are unchanged.
+* **Choose a Google Calendar from a list.** Once connected, *Settings → Integration → Google Calendar* offers the calendars the account can add events to, instead of only a Calendar ID box. Requires the matching Yatra Pro release; with an older Pro the box works as before.
+* **Settings for the new Google Calendar options.** The Google Calendar dashboard gains *Calendar time zone* and *Event text* (your own event title and details with variables). Both need the matching Yatra Pro release and stay hidden without it.
+* **Resend the trip reminder from the bookings list.** The row actions menu on Bookings now has *Resend trip reminder*, next to *Resend confirmation email*. It sends the same email as *Resend email → Trip reminder* on the booking itself. It is offered only for trips still to come, not for cancelled, refunded or completed bookings.
+* **New `yatra_booking_inserted` action.** Fired as soon as a booking is stored, for every booking — including one still waiting for e-mail verification, which delays `yatra_booking_created`. For integrations that must act at checkout time, such as recording the visitor's consent choice.
+
+
+The full history for older releases is kept with the source: https://github.com/mantrabrain/yatra/blob/master/readme.txt
+
+== Upgrade Notice ==
+
+= 3.0.8 =
+Release **3.0.8** — new XML sitemap for trips, destinations, activities and categories (integrated with WordPress core, Yoast, Rank Math and All in One SEO, advertised in robots.txt), Additional Services percentage-pricing fix, Bank Transfer / deposit fix on guest and waitlist checkout, and broader translation coverage. No database changes — safe to update from 3.0.x.
+
+= 3.0.4 =
+Release **3.0.4** — Unicode / Cyrillic slug support end-to-end, pricing single-source-of-truth (sidebar = payment-gateway amount), pricing summary cleanup, services dedupe fix, Loco script-translation fallback so React surfaces (account page, admin) pick up `.json` translations from Loco's workspace, mobile sticky-bar JS extraction, FSE template support, and CI pipeline fixes. Safe to update from 3.0.3.
+
+= 3.0.3 =
+Release **3.0.3** (`[yatra_trip_category]` shortcode, versioned upgrades, discounts, single-trip and admin polish). Safe to update from 3.0.2.x.
+
+= 3.0.2.5 =
+Maintenance release (setup wizard autosave, admin notices). Safe to update from 3.0.2.4.
+
+= 3.0.2.4 =
+Bugfix release (trip permanent-delete REST endpoint, bulk trip confirmation UX). Safe to update from 3.0.2.3.
+
+= 3.0.2.3 =
+Maintenance update (admin UX, REST license route, trip list stability in Departures/Availability). Safe to update from 3.0.2.2.
+
+= 3.0.2.2 =
+Patch release. Safe to update from 3.0.2.1.
+
+= 3.0.2.1 =
+Readme update (Pro feature links to pricing). Safe to update from 3.0.2.
+
+= 3.0.2 =
+Readme / documentation listing update only. Safe to update from 3.0.1.
+
+= 3.0.1 =
+Maintenance update (banner, WordPress.org readme/assets, and small fixes). Safe to update from 3.0.0.
+
+= 3.0.0 =
+Major release. Back up your site and database before upgrading from 2.x. Update free Yatra from WordPress.org first; then align **[Yatra Pro](https://wpyatra.com/pricing/)** with a version compatible with 3.0.
+
+== Additional Information ==
+
+= Privacy =
+
+Booking and customer data are stored in your WordPress database. Payment processing is performed by the gateways you enable; review each provider's privacy and PCI documentation. Yatra does not ship customer data to an external SaaS.
+
+= Credits =
+
+Yatra is developed by **MantraBrain**. Third-party libraries include components such as React (admin UI), Vite, TanStack Query, and others as shipped in the plugin package.
+
+= Contributing =
+
+Issues and contributions: [GitHub — Yatra](https://github.com/MantraBrain/yatra)
+
+If Yatra helps your business, a ⭐ **five-star review** on WordPress.org and considering **💎 [Yatra Pro](https://wpyatra.com/pricing/)** when you need paid features both help sustain development. Thank you for using Yatra.

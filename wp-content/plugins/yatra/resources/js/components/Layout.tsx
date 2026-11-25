@@ -1,0 +1,1515 @@
+import React, {
+  useState,
+  useMemo,
+  useEffect,
+  useRef,
+  useCallback,
+} from "react";
+import { useMutation } from "@tanstack/react-query";
+import {
+  LayoutDashboard,
+  MapPin,
+  Calendar,
+  CalendarClock,
+  CalendarDays,
+  Star,
+  BarChart3,
+  Settings,
+  Wrench,
+  Moon,
+  FileText,
+  CreditCard,
+  Package,
+  UserCircle,
+  FolderTree,
+  Tag,
+  TrendingUp,
+  List,
+  Activity,
+  Crown,
+  Sparkles,
+  ChevronDown,
+  ChevronRight,
+  Mail,
+  Key,
+  FileSignature,
+  Route,
+  BadgePercent,
+  Plane,
+  MessageSquare,
+  Cloud,
+  MessageCircle,
+  Network,
+  Webhook,
+  Users,
+  Puzzle,
+  ArrowLeft,
+  Gift,
+  RotateCcw,
+  Sun,
+  User,
+} from "lucide-react";
+import { __, sprintf } from "../lib/i18n";
+import { Button } from "../components/ui/button";
+import { Tooltip } from "../components/ui/tooltip";
+import { useToast } from "../components/ui/toast";
+import { postFlushRewriteRules } from "../api/settings-api";
+
+// Helper function to extract Gravatar URL from WordPress get_avatar HTML
+function extractGravatarUrl(avatarHtml: string, size: number): string {
+  if (!avatarHtml) {
+    return `https://www.gravatar.com/avatar/00000000000000000000000000000000?s=${size}&d=identicon&r=pg`;
+  }
+
+  // Extract src attribute from img tag
+  const imgMatch = avatarHtml.match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (imgMatch && imgMatch[1]) {
+    // Replace size parameter if needed
+    return imgMatch[1].replace(/s=\d+/, `s=${size}`);
+  }
+
+  // Fallback to default
+  return `https://www.gravatar.com/avatar/00000000000000000000000000000000?s=${size}&d=identicon&r=pg`;
+}
+
+// Helper function to get Gravatar URL using WordPress data
+function getGravatarUrl(size: number): string {
+  const avatarHtml = (window as any)?.yatraAdmin?.currentUserAvatar || "";
+  return extractGravatarUrl(avatarHtml, size);
+}
+
+import { ConditionalRender } from "../components/ui/conditional-render";
+import {
+  readMenuOverrides,
+  readMenuOrder,
+  readUiChrome,
+  DEFAULT_MENU_ITEMS,
+  type MenuOverrides,
+} from "../lib/sidebar-menu-defaults";
+import { MenuIcon } from "../lib/menu-icon";
+import { Card, CardContent } from "../components/ui/card";
+import { Badge } from "../components/ui/badge";
+import { isProPluginActive, isModuleActive } from "../lib/plugin-utils";
+import { navigateMenu } from "../hooks/useNavigate";
+import { canCap } from "../hooks/useCapabilities";
+import {
+  useNotificationCounts,
+  SUBPAGE_TO_SECTION,
+} from "../hooks/useNotificationCounts";
+import { InlineNotices } from "./notices/InlineNotices";
+
+interface LayoutProps {
+  children: React.ReactNode;
+}
+
+const Layout: React.FC<LayoutProps> = ({ children }) => {
+  // Load dark mode preference from localStorage
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem("yatra-dark-mode");
+    return saved === "true";
+  });
+
+  // Apply dark mode to document on mount and when it changes
+  useEffect(() => {
+    const root = document.documentElement;
+    if (darkMode) {
+      root.classList.add("dark");
+      localStorage.setItem("yatra-dark-mode", "true");
+    } else {
+      root.classList.remove("dark");
+      localStorage.setItem("yatra-dark-mode", "false");
+    }
+  }, [darkMode]);
+
+  const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
+  const userDropdownRef = useRef<HTMLDivElement | null>(null);
+
+  // License status state for real-time updates
+  const [licenseStatus, setLicenseStatus] = useState<string | null>(
+    (window as any).yatraAdmin?.licenseStatus || null,
+  );
+
+  const { showToast } = useToast();
+  const flushRewriteRulesMutation = useMutation({
+    mutationFn: async () => postFlushRewriteRules(),
+    onSuccess: () => {
+      showToast(__("Rewrite rules flushed successfully", "yatra"), "success");
+    },
+    onError: (error: any) => {
+      showToast(
+        error?.message || __("Failed to flush rewrite rules", "yatra"),
+        "error",
+      );
+    },
+  });
+
+  // Track URL changes to update menu state
+  const [urlKey, setUrlKey] = useState(0);
+  const [navRefreshKey, setNavRefreshKey] = useState(0);
+
+  /** SPA: avoid full reload — keeps PHP boot splash from showing on every sidebar click */
+  const handleMenuNavClick = useCallback(
+    (e: React.MouseEvent<HTMLAnchorElement>, subpage: string, tab?: string) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.button !== 0) {
+        return;
+      }
+      e.preventDefault();
+      navigateMenu(subpage, tab);
+    },
+    [],
+  );
+
+  // Close dropdowns when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        userDropdownRef.current &&
+        !userDropdownRef.current.contains(event.target as Node)
+      ) {
+        setIsUserDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  useEffect(() => {
+    const handleLocationChange = () => {
+      setUrlKey((prev) => prev + 1);
+    };
+
+    // Listen for popstate (back/forward button)
+    window.addEventListener("popstate", handleLocationChange);
+
+    // Also check periodically (fallback for direct navigation)
+    const interval = setInterval(() => {
+      const currentSearch = window.location.search;
+      if (currentSearch !== (window as any).__lastSearch) {
+        (window as any).__lastSearch = currentSearch;
+        handleLocationChange();
+      }
+    }, 100);
+
+    return () => {
+      window.removeEventListener("popstate", handleLocationChange);
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Listen for module updates to refresh navigation
+  useEffect(() => {
+    const handleModuleUpdate = () => {
+      // Force re-render of menu items by updating navRefreshKey
+      setNavRefreshKey((prev) => prev + 1);
+      // Also update urlKey to ensure all memoized values refresh
+      setUrlKey((prev) => prev + 1);
+    };
+
+    const handleForceRefresh = () => {
+      setNavRefreshKey((prev) => prev + 1);
+      setUrlKey((prev) => prev + 1);
+    };
+
+    const handleLicenseStatusUpdate = (event: any) => {
+      const newStatus = event.detail?.status;
+      if (newStatus) {
+        setLicenseStatus(newStatus);
+      }
+    };
+
+    window.addEventListener("yatra-modules-updated", handleModuleUpdate);
+    window.addEventListener("yatra-force-nav-refresh", handleForceRefresh);
+    window.addEventListener(
+      "yatra-license-status-updated",
+      handleLicenseStatusUpdate,
+    );
+
+    return () => {
+      window.removeEventListener("yatra-modules-updated", handleModuleUpdate);
+      window.removeEventListener("yatra-force-nav-refresh", handleForceRefresh);
+      window.removeEventListener(
+        "yatra-license-status-updated",
+        handleLicenseStatusUpdate,
+      );
+    };
+  }, []);
+
+  // Get current subpage and tab from URL
+  const currentSubpage = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("subpage") || "dashboard";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlKey]);
+
+  // "New since last seen" counts for the sidebar badges (Bookings / Payments /
+  // Abandoned Recovery). Read-only — if the request fails, no badge is shown.
+  const { data: newCounts } = useNotificationCounts();
+  const getNewCount = (subpage: string): number => {
+    const section = SUBPAGE_TO_SECTION[subpage];
+    if (!section) return 0;
+    const value = newCounts?.[section];
+    return typeof value === "number" && value > 0 ? value : 0;
+  };
+
+  const currentTab = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("tab") || "all";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlKey]);
+
+  const currentAction = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("action");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlKey]);
+
+  // Check if we're on the trip form page
+  const isTripFormPage = useMemo(() => {
+    return (
+      currentSubpage === "trips" &&
+      (currentTab === "all" || !currentTab) &&
+      (currentAction === "create" || currentAction === "edit")
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSubpage, currentTab, currentAction, urlKey]);
+
+  // Track expanded submenus — start with the parent of the page being loaded
+  // open, so a deep link or a refresh lands with the right submenu already
+  // expanded (no flash of a collapsed menu).
+  //
+  // Derived from the menu definition rather than a hardcoded list of parents:
+  // it used to name `trips` and `itinerary` explicitly, which meant every other
+  // parent (Payments, and anything added later) stayed collapsed on refresh.
+  const [expandedMenus, setExpandedMenus] = useState<string[]>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const subpage = params.get("subpage") || "dashboard";
+
+    return DEFAULT_MENU_ITEMS.some(
+      (item) => item.slug === subpage && (item.submenu?.length ?? 0) > 0,
+    )
+      ? [subpage]
+      : [];
+  });
+
+  // Get base admin URL
+  const baseUrl = useMemo(() => {
+    return window.yatraAdmin?.siteUrl
+      ? `${window.yatraAdmin.siteUrl}/wp-admin/admin.php?page=yatra`
+      : "/wp-admin/admin.php?page=yatra";
+  }, []);
+
+  const menuItems = useMemo(
+    // Every menu label is wrapped in __() with a literal string so
+    // gettext extraction (scripts/extract-js-pot.mjs) picks them up
+    // and Loco / Poedit / wp i18n can translate them. Previously most
+    // were raw English literals — translations existed in the .po but
+    // never reached the UI because there was no translation lookup at
+    // render time. Wrapping is the WordPress-canonical way; the
+    // pre_load_script_translations filter then delivers the locale
+    // data to wp.i18n on every admin page load.
+    () =>
+      [
+        {
+          subpage: "dashboard",
+          label: __("Dashboard", "yatra"),
+          icon: LayoutDashboard,
+          cap: "yatra_access_admin",
+        },
+        {
+          subpage: "trips",
+          label: __("Trips", "yatra"),
+          icon: MapPin,
+          cap: "yatra_view_trips",
+          submenu: [
+            { tab: "all", label: __("All Trips", "yatra"), icon: List },
+            {
+              tab: "activities",
+              label: __("Activities", "yatra"),
+              icon: Activity,
+            },
+            {
+              tab: "destinations",
+              label: __("Destinations", "yatra"),
+              icon: Route,
+            },
+            {
+              tab: "categories",
+              label: __("Categories", "yatra"),
+              icon: FolderTree,
+            },
+            {
+              tab: "difficulty-levels",
+              label: __("Difficulty Levels", "yatra"),
+              icon: TrendingUp,
+            },
+            // Availability - FREE feature, always show
+            {
+              tab: "availability",
+              label: __("Availability", "yatra"),
+              icon: CalendarDays,
+            },
+            // Attributes - FREE feature, always show
+            { tab: "attributes", label: __("Attributes", "yatra"), icon: Tag },
+            // Additional Services - show only if Pro plugin is active and module is enabled
+            ...(isProPluginActive() && isModuleActive("additional_services")
+              ? [
+                  {
+                    tab: "additional-services",
+                    label: __("Additional Services", "yatra"),
+                    icon: Package,
+                    isPremium: true,
+                  },
+                ]
+              : []),
+            // Trip Consent - show only if Pro plugin is active and module is enabled
+            ...(isProPluginActive() && isModuleActive("trip_consent")
+              ? [
+                  {
+                    tab: "trip-consent",
+                    label: __("Trip Consent", "yatra"),
+                    icon: FileSignature,
+                    isPremium: true,
+                  },
+                ]
+              : []),
+          ],
+        },
+        {
+          subpage: "traveler-categories",
+          label: __("Traveler Categories", "yatra"),
+          icon: UserCircle,
+          cap: "yatra_manage_trip_taxonomies",
+        },
+        {
+          subpage: "itinerary",
+          label: __("Itinerary", "yatra"),
+          icon: FileText,
+          cap: "yatra_edit_trips",
+          submenu: [
+            { tab: "item-types", label: __("Item Types", "yatra"), icon: Tag },
+            { tab: "items", label: __("Items", "yatra"), icon: Route },
+            {
+              tab: "itinerary",
+              label: __("Itinerary", "yatra"),
+              icon: FileText,
+            },
+          ],
+        },
+        // Departures - FREE feature, always show
+        {
+          subpage: "departures",
+          label: __("Departures", "yatra"),
+          icon: Calendar,
+          cap: "yatra_view_departures",
+        },
+        {
+          subpage: "discounts",
+          label: __("Discounts", "yatra"),
+          icon: BadgePercent,
+          cap: "yatra_manage_discounts",
+        },
+        {
+          subpage: "payments",
+          label: __("Payments", "yatra"),
+          icon: CreditCard,
+          cap: "yatra_view_financial_reports",
+          // Payments only becomes a parent when the Pro "Scheduled Payments"
+          // module is enabled — otherwise there is nothing to nest and it stays
+          // exactly as it was: a single item that navigates straight to the
+          // payments list. Children are only rendered for a visible parent, so
+          // the pair inherits the Payments capability gate.
+          //
+          // `undefined` rather than an empty array: the rest of this component
+          // treats "has a submenu" as truthiness, and an empty array would read
+          // as a parent with no matching child — which would stop the Payments
+          // item highlighting on its own page.
+          submenu: (window as any).yatraAdmin?.scheduledPaymentsEnabled
+            ? [
+                {
+                  tab: "all",
+                  label: __("All Payments", "yatra"),
+                  icon: CreditCard,
+                },
+                {
+                  // "Scheduled" alone — the parent already says Payments. This
+                  // label is also the page's heading (the top bar reads it from
+                  // the active submenu item).
+                  tab: "scheduled",
+                  label: __("Scheduled", "yatra"),
+                  icon: CalendarClock,
+                  isPremium: true,
+                },
+              ]
+            : undefined,
+        },
+        {
+          subpage: "bookings",
+          label: __("Bookings", "yatra"),
+          icon: Calendar,
+          cap: "yatra_view_bookings",
+        },
+        {
+          subpage: "customers",
+          label: __("Customers", "yatra"),
+          icon: UserCircle,
+          cap: "yatra_view_customers",
+        },
+        {
+          subpage: "travelers",
+          label: __("Travelers", "yatra"),
+          icon: Plane,
+          cap: "yatra_view_customers",
+        },
+        {
+          subpage: "enquiries",
+          label: __("Enquiries", "yatra"),
+          icon: MessageSquare,
+          cap: "yatra_view_enquiries",
+        },
+        {
+          subpage: "reviews",
+          label: __("Reviews", "yatra"),
+          icon: Star,
+          cap: "yatra_view_reviews",
+        },
+        {
+          subpage: "reports",
+          label: __("Reports", "yatra"),
+          icon: BarChart3,
+          cap: "yatra_view_operational_reports",
+        },
+        // Email — SMTP & transactional for all; Pro adds automation tabs on the same screen
+        {
+          subpage: "email-automation",
+          label: __("Email", "yatra"),
+          icon: Mail,
+          isPremium: false,
+          cap: "yatra_manage_emails",
+        },
+        // Abandoned Booking Recovery - show only if Pro plugin is active and module is enabled
+        ...(isProPluginActive() && isModuleActive("abandoned_booking_recovery")
+          ? [
+              {
+                subpage: "abandoned-recovery",
+                label: __("Abandoned Recovery", "yatra"),
+                icon: RotateCcw,
+                isPremium: true,
+                cap: "yatra_manage_email_automation",
+              },
+            ]
+          : []),
+        // Dynamic Pricing - show only if Pro plugin is active and module is enabled
+        ...(isProPluginActive() && isModuleActive("dynamic_pricing")
+          ? [
+              {
+                subpage: "dynamic-pricing",
+                label: __("Dynamic Pricing", "yatra"),
+                icon: TrendingUp,
+                isPremium: true,
+                cap: "yatra_edit_trips",
+              },
+            ]
+          : []),
+        {
+          subpage: "modules",
+          label: __("Modules", "yatra"),
+          icon: Puzzle,
+          cap: "yatra_manage_modules",
+        },
+        // White Label — only when the Agency-tier module is actually enabled.
+        // (Agency license alone is not enough; the module toggle must be on,
+        // otherwise users would see a link to a disabled feature. To get
+        // here for the first time, an Agency admin enables the module from
+        // Yatra → Modules.) The `whiteLabelEnabled` flag from
+        // AdminAssetsProvider already implies Agency-active.
+        // White Label — needs Agency-tier license AND module toggle on.
+        // Mirrors the AI Assistant gate below so both menus appear /
+        // disappear instantly when their module toggles, while staying
+        // license-safe if the client-side `whiteLabelEnabled` flag is
+        // ever stale or over-eager. AdminAssetsProvider seeds both
+        // `isAgency` and `whiteLabelEnabled`; useModules.ts updates the
+        // latter on toggle and fires `yatra-modules-updated` which bumps
+        // navRefreshKey → this memo recomputes → menu appears.
+        ...((window as any).yatraAdmin?.isAgency &&
+        (window as any).yatraAdmin?.whiteLabelEnabled
+          ? [
+              {
+                subpage: "white-label",
+                label: __("White Label", "yatra"),
+                icon: Crown,
+                isPremium: true,
+                cap: "yatra_manage_white_label",
+              },
+            ]
+          : []),
+        // AI Assistant — only when BOTH the license tier qualifies
+        // (Growth or Agency) AND the module toggle is on. Operators who
+        // disable the module shouldn't keep seeing the menu item — it
+        // would lead to a settings page they've explicitly opted out of.
+        // The toggle handler in useModules.ts updates
+        // window.yatraAdmin.aiAssistantEnabled and fires
+        // `yatra-modules-updated`, which bumps navRefreshKey so this
+        // memo recomputes immediately without a page reload.
+        ...((window as any).yatraAdmin?.isAiEligible &&
+        (window as any).yatraAdmin?.aiAssistantEnabled
+          ? [
+              {
+                subpage: "ai-assistant",
+                label: __("AI Assistant", "yatra"),
+                icon: Sparkles,
+                isPremium: true,
+                cap: "yatra_manage_ai",
+              },
+            ]
+          : []),
+        // WhatsApp Notifications — Growth/Agency module. Same gate
+        // pattern as AI Assistant: needs the AI-eligibility flag (which
+        // is the Growth-or-Agency tier check) AND the module toggle on.
+        // useModules.ts updates `whatsappEnabled` on toggle + fires
+        // `yatra-modules-updated` so this menu appears instantly without
+        // a page reload.
+        ...((window as any).yatraAdmin?.isAiEligible &&
+        (window as any).yatraAdmin?.whatsappEnabled
+          ? [
+              {
+                subpage: "whatsapp",
+                label: __("WhatsApp", "yatra"),
+                icon: MessageCircle,
+                isPremium: true,
+                cap: "yatra_manage_whatsapp",
+              },
+            ]
+          : []),
+        // Channel Manager — Agency-tier OTA distribution hub. Same gate
+        // pattern as White Label: needs the Agency license AND the module
+        // toggle on. useModules.ts updates `channelManagerEnabled` on
+        // toggle + fires `yatra-modules-updated` so this menu appears
+        // instantly without a page reload.
+        ...((window as any).yatraAdmin?.isAgency &&
+        (window as any).yatraAdmin?.channelManagerEnabled
+          ? [
+              {
+                subpage: "channel-manager",
+                label: __("Channel Manager", "yatra"),
+                icon: Network,
+                isPremium: true,
+                cap: "yatra_manage_channel_manager",
+              },
+            ]
+          : []),
+        // Webhooks — Agency-tier outbound integration hub. Same gate
+        // as Channel Manager / White Label: Agency license + module on.
+        ...((window as any).yatraAdmin?.isAgency &&
+        (window as any).yatraAdmin?.webhooksEnabled
+          ? [
+              {
+                subpage: "webhooks",
+                label: __("Webhooks", "yatra"),
+                icon: Webhook,
+                isPremium: true,
+                cap: "yatra_manage_webhooks",
+              },
+            ]
+          : []),
+        // Team & Access — Agency-tier granular roles + capability-level
+        // access + audit log. Gate matches Webhooks: Agency license +
+        // module on. The page itself is also cap-gated server-side; the
+        // sidebar entry is just UX.
+        ...((window as any).yatraAdmin?.isAgency &&
+        (window as any).yatraAdmin?.teamEnabled
+          ? [
+              {
+                subpage: "team",
+                label: __("Team & Access", "yatra"),
+                icon: Users,
+                isPremium: true,
+                cap: "yatra_manage_team",
+              },
+            ]
+          : []),
+        {
+          subpage: "license",
+          label: __("License", "yatra"),
+          icon: Key,
+          cap: "yatra_manage_settings",
+        },
+        {
+          subpage: "settings",
+          label: __("Settings", "yatra"),
+          icon: Settings,
+          cap: "yatra_manage_settings",
+        },
+      ]
+        // Cap-gate every entry. canCap() returns true for WP admins and
+        // when the Team module isn't enabled (= admin-only mode), so this
+        // is a no-op on every site without team management. With team
+        // management active, non-admin team members only see the menus
+        // their role's caps permit.
+        //
+        // Items without a `cap` field are always shown (default-allow).
+        .filter((item: any) => !item.cap || canCap(item.cap)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [navRefreshKey],
+  ); // Re-calculate when navRefreshKey changes
+
+  /**
+   * Apply White Label customizations on top of the base menuItems.
+   *
+   * Implementation: factor menuItems into a flat atom registry, apply
+   * label/icon/hidden overrides, then rebuild the menu tree honoring
+   * the saved parent override (cross-parent moves) and per-parent
+   * order map. URLs always come from the atom's intrinsic identity —
+   * promoting a submenu to top-level does NOT change its route, so
+   * App.tsx routing keeps working unchanged.
+   */
+  const brandedMenuItems = useMemo(() => {
+    const overrides: MenuOverrides = readMenuOverrides();
+    const orderMap = readMenuOrder();
+
+    interface Atom {
+      key: string; // "trips" or "trips.activities"
+      defaultParent: string; // "" for top-level, parent slug for submenu
+      label: string;
+      iconOverride?: unknown;
+      icon: any;
+      // Bag of routing/render props copied from the original menu item.
+      subpage: string;
+      tab?: string;
+      isPremium?: boolean;
+    }
+
+    const atoms: Atom[] = [];
+    const atomByKey = new Map<string, Atom>();
+
+    const apply = (
+      key: string,
+      defaultParent: string,
+      base: any,
+      fallbackLabel: string,
+    ): Atom | null => {
+      const ov = overrides[key];
+      if (ov?.hidden) return null;
+      const labelOverride =
+        ov?.label && typeof ov.label === "string" && ov.label.trim() !== ""
+          ? ov.label
+          : null;
+      const atom: Atom = {
+        key,
+        defaultParent,
+        label: labelOverride ?? fallbackLabel,
+        iconOverride: ov?.icon,
+        icon: base.icon,
+        subpage: base.subpage ?? defaultParent ?? key,
+        tab: base.tab,
+        isPremium: base.isPremium,
+      };
+      atoms.push(atom);
+      atomByKey.set(key, atom);
+      return atom;
+    };
+
+    for (const item of menuItems) {
+      apply(item.subpage, "", item, item.label);
+      if (item.submenu) {
+        for (const sub of item.submenu as any[]) {
+          apply(
+            `${item.subpage}.${sub.tab}`,
+            item.subpage,
+            { icon: sub.icon, subpage: item.subpage, tab: sub.tab },
+            sub.label,
+          );
+        }
+      }
+    }
+
+    // Resolve each atom's effective parent (override wins; "" = top-level).
+    const effectiveParent = (atom: Atom): string => {
+      const ov = overrides[atom.key];
+      if (ov && typeof ov.parent === "string") {
+        // Only accept the override if it points at a known top-level atom
+        // (or empty for top-level). Otherwise fall back to the default.
+        if (ov.parent === "") return "";
+        if (atomByKey.get(ov.parent)?.defaultParent === "") return ov.parent;
+      }
+      return atom.defaultParent;
+    };
+
+    // Group atoms by effective parent and order each group.
+    const groups = new Map<string, Atom[]>();
+    for (const atom of atoms) {
+      const parent = effectiveParent(atom);
+      // Self-parenting guard — should never happen but stay defensive.
+      if (parent === atom.key) continue;
+      const list = groups.get(parent) ?? [];
+      list.push(atom);
+      groups.set(parent, list);
+    }
+
+    const orderGroup = (parent: string, group: Atom[]): Atom[] => {
+      const saved = orderMap[parent] ?? [];
+      if (saved.length === 0) return group;
+      const byKey = new Map(group.map((a) => [a.key, a]));
+      const seen = new Set<string>();
+      const ordered: Atom[] = [];
+      for (const k of saved) {
+        const atom = byKey.get(k);
+        if (atom && !seen.has(k)) {
+          ordered.push(atom);
+          seen.add(k);
+        }
+      }
+      for (const atom of group) {
+        if (!seen.has(atom.key)) ordered.push(atom);
+      }
+      return ordered;
+    };
+
+    const topLevel = orderGroup("", groups.get("") ?? []);
+    return topLevel.map((atom) => {
+      const childAtoms = orderGroup(atom.key, groups.get(atom.key) ?? []);
+      return {
+        // React key. NOT `subpage`: a child promoted to top-level keeps its
+        // parent's subpage (`payments.scheduled` → subpage `payments`), so two
+        // siblings could share it. Duplicate keys make React reconcile the
+        // wrong nodes and throw "removeChild ... not a child of this node".
+        menuKey: atom.key,
+        subpage: atom.subpage,
+        label: atom.label,
+        icon: atom.icon,
+        iconOverride: atom.iconOverride,
+        isPremium: atom.isPremium,
+        submenu: childAtoms.length
+          ? childAtoms.map((child) => ({
+              // Unique per child, for the same reason as `menuKey` above:
+              // subpage + tab can repeat once items are moved between parents.
+              menuKey: child.key,
+              // Submenu rendering supports both legacy intra-parent items
+              // (matching parent's subpage) and promoted/demoted items
+              // that point at their own subpage.
+              tab: child.defaultParent === atom.subpage ? child.tab : undefined,
+              label: child.label,
+              icon: child.icon,
+              iconOverride: child.iconOverride,
+              // Promoted top-level items now-as-children get an absolute href.
+              href:
+                child.defaultParent === atom.subpage
+                  ? undefined
+                  : `${baseUrl}&subpage=${child.subpage}${child.tab ? `&tab=${child.tab}` : ""}`,
+              subpage: child.subpage,
+              tab_orig: child.tab,
+            }))
+          : undefined,
+      };
+    });
+  }, [menuItems, baseUrl]);
+
+  // Keep the active page's parent expanded as the URL changes. Lives here
+  // (after `brandedMenuItems`) so it reads the menu actually being rendered —
+  // that includes parents the menu customizer created by demoting an item into
+  // one, which the static defaults above don't know about.
+  useEffect(() => {
+    const parentOfCurrentPage = brandedMenuItems.find(
+      (item: any) =>
+        item.subpage === currentSubpage && (item.submenu?.length ?? 0) > 0,
+    );
+    if (!parentOfCurrentPage) {
+      return;
+    }
+
+    setExpandedMenus((prev) =>
+      prev.includes(parentOfCurrentPage.subpage)
+        ? prev
+        : [...prev, parentOfCurrentPage.subpage],
+    );
+  }, [currentSubpage, urlKey, brandedMenuItems]);
+
+  /** UI chrome visibility flags (version, Back to WP, Join Community). */
+  const uiChrome = useMemo(() => readUiChrome(), []);
+
+  const isActive = (subpage: string, tab?: string) => {
+    // The Google Calendar dashboard is reached from Settings → Integration, so
+    // keep the Settings menu item highlighted while that page is open.
+    if (subpage === "settings" && currentSubpage === "google-calendar") {
+      return true;
+    }
+    if (tab) {
+      return currentSubpage === subpage && currentTab === tab;
+    }
+    // For parent menu items, check if current subpage matches
+    // or if any submenu item is active
+    if (currentSubpage === subpage) {
+      const menuItem = menuItems.find((item) => item.subpage === subpage);
+      if (menuItem?.submenu) {
+        // If it has submenu, check if any submenu item is active
+        return menuItem.submenu.some((sub) => sub.tab === currentTab);
+      }
+      return true;
+    }
+    return false;
+  };
+
+  const isMenuExpanded = (subpage: string) => {
+    return expandedMenus.includes(subpage);
+  };
+
+  const toggleMenu = (subpage: string) => {
+    setExpandedMenus((prev) =>
+      prev.includes(subpage)
+        ? prev.filter((m) => m !== subpage)
+        : [...prev, subpage],
+    );
+  };
+
+  const getUrl = (subpage: string, tab?: string) => {
+    if (subpage === "dashboard") {
+      return baseUrl;
+    }
+    if (tab) {
+      return `${baseUrl}&subpage=${subpage}&tab=${tab}`;
+    }
+    return `${baseUrl}&subpage=${subpage}`;
+  };
+
+  return (
+    <div
+      className={`min-h-screen ${darkMode ? "dark bg-gray-900" : "bg-gray-50"}`}
+    >
+      <div className="flex h-screen overflow-hidden">
+        {/* Sidebar */}
+        <aside className="w-64 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col">
+          {/* Logo */}
+          <div className="h-16 px-6 flex items-center justify-center border-b border-gray-200 dark:border-gray-700">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-3">
+                {(() => {
+                  const brandName =
+                    (window as any).yatraAdmin?.brandName || "Yatra";
+                  const brandInitial = brandName.charAt(0).toUpperCase() || "Y";
+                  return (window as any).yatraAdmin?.brandLogoUrl ? (
+                    <img
+                      src={(window as any).yatraAdmin.brandLogoUrl}
+                      alt={brandName}
+                      width={32}
+                      height={32}
+                      className="w-8 h-8 rounded-lg object-contain shrink-0 bg-blue-600 p-1 border border-blue-700 dark:border-blue-500"
+                    />
+                  ) : (
+                    <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
+                      <span className="text-white font-bold text-lg">
+                        {brandInitial}
+                      </span>
+                    </div>
+                  );
+                })()}
+                <div className="flex flex-col">
+                  <span className="text-xl font-bold text-gray-900 dark:text-white">
+                    {(window as any).yatraAdmin?.brandName || "Yatra"}
+                  </span>
+                  {!uiChrome.hideVersion && (
+                    <div className="flex items-center gap-2 text-[10px] text-gray-500 dark:text-gray-400">
+                      <span>v{window.yatraAdmin?.version || "1.0.0"}</span>
+                      {(window as any).yatraAdmin?.proVersion && (
+                        <span className="px-1.5 py-0.5 bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded font-medium">
+                          {sprintf(
+                            /* translators: %s: Yatra Pro version number. */
+                            __("Pro v%s", "yatra"),
+                            (window as any).yatraAdmin?.proVersion,
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Navigation + Bottom Actions */}
+          <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+            {brandedMenuItems.map((item) => {
+              const Icon = item.icon;
+              const hasSubmenu = item.submenu && item.submenu.length > 0;
+              const isExpanded = hasSubmenu && isMenuExpanded(item.subpage);
+              const active = isActive(item.subpage);
+
+              return (
+                // Keyed by the unique menu key, and by the item's shape: when a
+                // module toggle turns a plain item into a parent (Payments →
+                // All Payments / Scheduled) the branch below swaps an <a> for a
+                // <button> + children, and a shape-aware key makes React remount
+                // that subtree cleanly instead of reusing mismatched nodes.
+                <div
+                  key={`${(item as any).menuKey ?? item.subpage}:${
+                    hasSubmenu ? "parent" : "leaf"
+                  }`}
+                >
+                  {hasSubmenu ? (
+                    <>
+                      <button
+                        onClick={() => toggleMenu(item.subpage)}
+                        className={`w-full flex items-center justify-between gap-3 px-4 py-3 rounded-lg text-sm transition-colors ${
+                          active
+                            ? "bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 font-medium"
+                            : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+                        }`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <MenuIcon
+                            icon={(item as any).iconOverride}
+                            fallback={Icon}
+                            className="w-5 h-5"
+                          />
+                          <span>{item.label}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {/* New-since-last-seen badge. Also rendered here, not
+                              only on flat items: a section that gains children
+                              (Payments) would otherwise lose its badge. */}
+                          {!active && getNewCount(item.subpage) > 0 && (
+                            <span
+                              className="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1.5 rounded-full bg-red-500 text-white text-[10px] font-semibold leading-none"
+                              aria-label={`${getNewCount(item.subpage)} ${__("new", "yatra")}`}
+                            >
+                              {getNewCount(item.subpage) > 99
+                                ? "99+"
+                                : getNewCount(item.subpage)}
+                            </span>
+                          )}
+                          {isExpanded ? (
+                            <ChevronDown className="w-4 h-4" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4" />
+                          )}
+                        </div>
+                      </button>
+                      {isExpanded && item.submenu && (
+                        <div className="ml-4 mt-1 space-y-1">
+                          {item.submenu.map((subItem: any) => {
+                            // Promoted / demoted child carries its own
+                            // routing target via subpage + tab_orig; the
+                            // default in-parent child uses the parent's
+                            // subpage with its tab.
+                            const navSubpage = subItem.subpage ?? item.subpage;
+                            const navTab = subItem.tab ?? subItem.tab_orig;
+                            const subActive = navTab
+                              ? isActive(navSubpage, navTab)
+                              : isActive(navSubpage);
+                            const SubIcon = subItem.icon;
+                            return (
+                              <a
+                                key={
+                                  subItem.menuKey ??
+                                  `${navSubpage}.${navTab ?? ""}`
+                                }
+                                href={getUrl(navSubpage, navTab)}
+                                onClick={(e) =>
+                                  handleMenuNavClick(e, navSubpage, navTab)
+                                }
+                                className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-colors relative ${
+                                  subActive
+                                    ? "bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 font-medium"
+                                    : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
+                                }`}
+                              >
+                                <div className="flex items-center gap-3">
+                                  {SubIcon && (
+                                    <div className="w-4 h-4">
+                                      <MenuIcon
+                                        icon={(subItem as any).iconOverride}
+                                        fallback={SubIcon}
+                                        className="w-4 h-4"
+                                      />
+                                    </div>
+                                  )}
+                                  <span className="text-sm">
+                                    {subItem.label}
+                                  </span>
+                                </div>
+                                {subItem.isPremium && !isProPluginActive() && (
+                                  <div className="absolute inset-y-0 right-2 flex items-center justify-center">
+                                    <div className="w-4 h-4 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white flex items-center justify-center">
+                                      <Crown className="w-2.5 h-2.5" />
+                                    </div>
+                                  </div>
+                                )}
+                              </a>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <a
+                      href={getUrl(item.subpage)}
+                      onClick={(e) => handleMenuNavClick(e, item.subpage)}
+                      className={`flex items-center gap-3 px-4 py-3 rounded-lg text-sm transition-colors relative ${
+                        active
+                          ? "bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 font-medium"
+                          : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <MenuIcon
+                          icon={(item as any).iconOverride}
+                          fallback={Icon}
+                          className="w-5 h-5"
+                        />
+                        <span>{item.label}</span>
+                      </div>
+                      {/* New-since-last-seen badge (Bookings / Payments /
+                          Abandoned Recovery). Hidden while viewing that page. */}
+                      {!active && getNewCount(item.subpage) > 0 && (
+                        <span
+                          className="ml-auto inline-flex items-center justify-center min-w-[18px] h-[18px] px-1.5 rounded-full bg-red-500 text-white text-[10px] font-semibold leading-none"
+                          aria-label={`${getNewCount(item.subpage)} ${__("new", "yatra")}`}
+                        >
+                          {getNewCount(item.subpage) > 99
+                            ? "99+"
+                            : getNewCount(item.subpage)}
+                        </span>
+                      )}
+                      {item.isPremium && !isProPluginActive() && (
+                        <div className="absolute inset-y-0 right-2 flex items-center justify-center">
+                          <div className="w-4 h-4 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white flex items-center justify-center">
+                            <Crown className="w-2.5 h-2.5" />
+                          </div>
+                        </div>
+                      )}
+                      {item.subpage === "license" &&
+                        isProPluginActive() &&
+                        licenseStatus && (
+                          <Badge
+                            variant={
+                              licenseStatus === "active"
+                                ? "success"
+                                : licenseStatus === "expired"
+                                  ? "error"
+                                  : licenseStatus === "invalid"
+                                    ? "error"
+                                    : "error"
+                            }
+                            className="text-[10px] px-2 py-0.5"
+                          >
+                            {licenseStatus === "active"
+                              ? __("Active", "yatra")
+                              : licenseStatus === "expired"
+                                ? __("Expired", "yatra")
+                                : licenseStatus === "invalid"
+                                  ? __("Invalid", "yatra")
+                                  : __("Inactive", "yatra")}
+                          </Badge>
+                        )}
+                    </a>
+                  )}
+                </div>
+              );
+            })}
+          </nav>
+
+          {!isProPluginActive() && (
+            <div className="shrink-0 px-4 pb-3">
+              <a
+                href="https://wpyatra.com/pricing/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="group flex flex-col gap-0.5 rounded-lg border border-amber-200/90 dark:border-amber-800/40 bg-amber-50/60 dark:bg-amber-950/25 px-3 py-2.5 text-left transition-colors hover:bg-amber-50 dark:hover:bg-amber-950/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-gray-800"
+              >
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-900 dark:text-amber-200">
+                  <Crown
+                    className="w-3.5 h-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                    aria-hidden
+                  />
+                  {__("Upgrade to Pro", "yatra")}
+                </span>
+                <span className="text-[11px] leading-snug text-amber-800/75 dark:text-amber-300/70">
+                  {__("Premium features & integrations — view plans.", "yatra")}
+                </span>
+              </a>
+            </div>
+          )}
+
+          {/* Sticky bottom back link */}
+          {!uiChrome.hideBackToWp && (
+            <div className="border-t border-gray-200 dark:border-gray-700 p-4">
+              <a
+                href={
+                  window.yatraAdmin?.siteUrl
+                    ? `${window.yatraAdmin.siteUrl}/wp-admin/`
+                    : "/wp-admin/"
+                }
+                className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg text-xs font-medium text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <ArrowLeft className="w-3 h-3" />
+                  <span>{__("Back to WordPress", "yatra")}</span>
+                </span>
+              </a>
+            </div>
+          )}
+        </aside>
+
+        {/* Main Content */}
+        <div
+          className={`flex-1 flex flex-col ${isTripFormPage ? "overflow-hidden" : "overflow-y-auto"}`}
+        >
+          {/* Top Bar */}
+          <header className="h-16 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-6 flex items-center">
+            <div className="flex items-center justify-between w-full">
+              <div className="flex items-center gap-3 flex-wrap min-w-0">
+                <h1 className="text-2xl font-semibold text-gray-900 dark:text-white">
+                  {(() => {
+                    // Show specific text for trip form page
+                    if (isTripFormPage) {
+                      return currentAction === "create"
+                        ? "Create Trip"
+                        : "Edit Trip";
+                    }
+
+                    const activeItem = brandedMenuItems.find((item) =>
+                      isActive(item.subpage),
+                    );
+                    if (activeItem?.submenu && currentTab) {
+                      const activeSubItem = activeItem.submenu.find(
+                        (sub) => sub.tab === currentTab,
+                      );
+                      return activeSubItem?.label || activeItem.label;
+                    }
+                    return activeItem?.label || __("Dashboard", "yatra");
+                  })()}
+                </h1>
+
+                {/* Conversion pill — visible only on free-plugin installs. */}
+                {/* Hidden as soon as the Pro plugin is active. Single edit */}
+                {/* in this top-bar surfaces it on every admin page.        */}
+                {/* Gift icon leads on the "free" promise (operators read   */}
+                {/* the icon before the text). Real Tooltip component       */}
+                {/* instead of the browser `title` attribute so the hint    */}
+                {/* matches the rest of the admin's hover-help style.       */}
+                {!isProPluginActive() && (
+                  <Tooltip
+                    side="bottom"
+                    content={__(
+                      "Spin up a free Pro trial site in one click — no credit card required.",
+                      "yatra",
+                    )}
+                  >
+                    <a
+                      href="https://try.wpyatra.com/try-yatra-pro/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900 ring-1 ring-amber-200 hover:bg-amber-100 hover:ring-amber-300 dark:bg-amber-950/40 dark:text-amber-100 dark:ring-amber-800 dark:hover:bg-amber-900/50 transition-colors"
+                    >
+                      <Gift className="h-3.5 w-3.5" />
+                      {__("Try Yatra Pro for free", "yatra")}
+                    </a>
+                  </Tooltip>
+                )}
+              </div>
+
+              <div className="flex items-center gap-4">
+                {/* Back to WordPress button */}
+                {!uiChrome.hideBackToWp && (
+                  <a
+                    href={
+                      window.yatraAdmin?.siteUrl
+                        ? `${window.yatraAdmin.siteUrl}/wp-admin/`
+                        : "/wp-admin/"
+                    }
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-3 py-2 text-sm text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                    {__("Back to WordPress", "yatra")}
+                  </a>
+                )}
+
+                {/* Tourtify — the hosted (cloud) edition. A MantraBrain promo, so
+                    it is hidden together with Join Community on white-labelled
+                    dashboards. */}
+                {!uiChrome.hideJoinCommunity && (
+                  <a
+                    href="https://tourtify.com/?utm_source=yatra-plugin&utm_medium=admin-header&utm_campaign=yatra-cloud&utm_content=dashboard-header"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40 ring-1 ring-blue-200 dark:ring-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 rounded-lg transition-colors"
+                  >
+                    <Cloud className="w-4 h-4 shrink-0" aria-hidden />
+                    {__("Cloud", "yatra")}
+                    <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-semibold uppercase leading-none tracking-wide text-white">
+                      {__("New", "yatra")}
+                    </span>
+                  </a>
+                )}
+
+                {!uiChrome.hideJoinCommunity && (
+                  <a
+                    href="https://www.facebook.com/groups/yatrawordpressplugin"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-3 py-2 text-sm text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                  >
+                    <MessageSquare className="w-4 h-4 shrink-0" aria-hidden />
+                    {__("Join Community", "yatra")}
+                  </a>
+                )}
+
+                {/* Flush permalink (same API as Settings → Permalink); icon + native title for tooltip */}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => flushRewriteRulesMutation.mutate()}
+                  disabled={flushRewriteRulesMutation.isPending}
+                  className="h-9 w-9 shrink-0 border-gray-300 dark:border-gray-600"
+                  title={
+                    flushRewriteRulesMutation.isPending
+                      ? __("Flushing...", "yatra")
+                      : __("Flush permalink", "yatra")
+                  }
+                  aria-label={
+                    flushRewriteRulesMutation.isPending
+                      ? __("Flushing rewrite rules", "yatra")
+                      : __("Flush permalink", "yatra")
+                  }
+                >
+                  <RotateCcw
+                    className={`h-4 w-4 ${flushRewriteRulesMutation.isPending ? "animate-spin" : ""}`}
+                    aria-hidden
+                  />
+                </Button>
+
+                <ConditionalRender capability="yatra_edit_trips">
+                  <Button
+                    variant={currentSubpage === "tools" ? "default" : "outline"}
+                    onClick={() => {
+                      navigateMenu("tools");
+                    }}
+                    className={`flex items-center gap-2 ${
+                      currentSubpage === "tools"
+                        ? "bg-blue-600 hover:bg-blue-700 text-white border-blue-600"
+                        : ""
+                    }`}
+                  >
+                    <Wrench className="w-4 h-4" />
+                    {__("Tools", "yatra")}
+                  </Button>
+                </ConditionalRender>
+                <button
+                  onClick={() => {
+                    setDarkMode(!darkMode);
+                  }}
+                  className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-400"
+                  aria-label={
+                    darkMode
+                      ? __("Switch to light mode", "yatra")
+                      : __("Switch to dark mode", "yatra")
+                  }
+                >
+                  {darkMode ? (
+                    <Sun className="w-5 h-5" />
+                  ) : (
+                    <Moon className="w-5 h-5" />
+                  )}
+                </button>
+
+                <div className="relative">
+                  <button
+                    onClick={() => setIsUserDropdownOpen((prev) => !prev)}
+                    className="flex items-center gap-3 pl-4 border-l border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700 p-2 transition-colors"
+                    aria-label={__("User menu", "yatra")}
+                  >
+                    <div className="w-8 h-8 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
+                      <img
+                        src={getGravatarUrl(32)}
+                        alt={__("User avatar", "yatra")}
+                        className="w-full h-full object-cover"
+                        onError={(e) => {
+                          e.currentTarget.style.display = "none";
+                          e.currentTarget.parentElement!.innerHTML =
+                            '<svg class="w-5 h-5 text-gray-600 dark:text-gray-400 m-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>';
+                        }}
+                      />
+                    </div>
+                  </button>
+
+                  {isUserDropdownOpen && (
+                    <div
+                      ref={userDropdownRef}
+                      className="absolute right-0 top-12 z-50 w-64"
+                    >
+                      <Card className="shadow-xl border border-gray-200 dark:border-gray-700">
+                        <CardContent className="p-0">
+                          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+                            <div className="flex items-center gap-3">
+                              <div className="w-10 h-10 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
+                                <img
+                                  src={getGravatarUrl(40)}
+                                  alt={__("User avatar", "yatra")}
+                                  className="w-full h-full object-cover"
+                                  onError={(e) => {
+                                    e.currentTarget.style.display = "none";
+                                    e.currentTarget.parentElement!.innerHTML =
+                                      '<svg class="w-6 h-6 text-gray-600 dark:text-gray-400 m-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>';
+                                  }}
+                                />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                                  {(window as any)?.yatraAdmin
+                                    ?.currentUserDisplayName ||
+                                    (window as any)?.yatraAdmin
+                                      ?.currentUserLogin ||
+                                    "Admin"}
+                                </div>
+                                <div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                                  {(window as any)?.yatraAdmin
+                                    ?.currentUserEmail || ""}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+                          <a
+                            href={`${(window as any)?.yatraAdmin?.siteUrl || ""}/wp-admin/profile.php`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="w-full text-left px-4 py-3 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-3 transition-colors"
+                          >
+                            <User className="w-4 h-4" />
+                            {__("Edit Profile", "yatra")}
+                          </a>
+
+                          <a
+                            href={`${(window as any)?.yatraAdmin?.siteUrl || ""}/wp-admin/`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="w-full text-left px-4 py-3 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-3 transition-colors"
+                          >
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M10 19l-7-7m0 0l7-7m-7 7h18"
+                              />
+                            </svg>
+                            {__("Back to WordPress", "yatra")}
+                          </a>
+
+                          <button
+                            onClick={() => {
+                              const admin = (window as any)?.yatraAdmin;
+                              const siteUrl = admin?.siteUrl || "";
+                              window.location.href = `${siteUrl}/wp-login.php?action=logout`;
+                            }}
+                            className="w-full text-left px-4 py-3 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20 flex items-center gap-3 transition-colors"
+                          >
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
+                              />
+                            </svg>
+                            {__("Logout", "yatra")}
+                          </button>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </header>
+
+          {/* Admin notices (Review / Buy Pro, etc.) */}
+          <InlineNotices />
+
+          {/* License Warning Banner */}
+          {isProPluginActive() &&
+            licenseStatus &&
+            licenseStatus !== "active" && (
+              <div className="bg-red-50 dark:bg-red-950/30 border-l-4 border-b-2 border-red-500">
+                <div className="px-6 py-3">
+                  <div className="flex items-center gap-4">
+                    <div className="flex-shrink-0">
+                      <div className="w-10 h-10 rounded-lg bg-red-500 flex items-center justify-center">
+                        <svg
+                          className="w-6 h-6 text-white"
+                          fill="currentColor"
+                          viewBox="0 0 20 20"
+                        >
+                          <path
+                            fillRule="evenodd"
+                            d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                            clipRule="evenodd"
+                          />
+                        </svg>
+                      </div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-red-800 dark:text-red-200">
+                        <span className="font-semibold">
+                          {licenseStatus === "expired"
+                            ? "License Expired: "
+                            : licenseStatus === "invalid"
+                              ? "Invalid License: "
+                              : "License Not Activated: "}
+                        </span>
+                        {licenseStatus === "expired"
+                          ? "Renew your license to continue receiving updates and support."
+                          : licenseStatus === "invalid"
+                            ? "Please check your license key."
+                            : "Activate your license to receive updates and support."}
+                      </p>
+                    </div>
+                    <a
+                      href={getUrl("license")}
+                      onClick={(e) => handleMenuNavClick(e, "license")}
+                      className="flex-shrink-0 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-md transition-colors"
+                    >
+                      {licenseStatus === "expired"
+                        ? "Renew Now"
+                        : "Activate Now"}
+                    </a>
+                  </div>
+                </div>
+              </div>
+            )}
+
+          {/* Page Content */}
+          <main
+            className={`flex-1 ${isTripFormPage ? "p-0 overflow-hidden flex flex-col" : "p-6 overflow-y-auto"}`}
+          >
+            <div
+              className={
+                isTripFormPage
+                  ? "flex-1 min-h-0 overflow-hidden flex flex-col"
+                  : currentSubpage === "tools"
+                    ? ""
+                    : "space-y-6"
+              }
+            >
+              {children}
+            </div>
+          </main>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Layout;

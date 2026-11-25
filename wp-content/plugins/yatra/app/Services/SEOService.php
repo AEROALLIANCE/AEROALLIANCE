@@ -1,0 +1,1241 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Services;
+
+use Yatra\Services\SettingsService;
+
+/**
+ * SEO Service
+ * 
+ * Production-ready centralized SEO management for all Yatra pages
+ * Handles meta tags, Open Graph, Twitter Cards, and Schema markup
+ * Follows SOLID principles for extensibility and maintainability
+ * 
+ * @package Yatra\Services
+ */
+class SEOService
+{
+    /**
+     * Page types supported by SEO service
+     */
+    public const PAGE_TYPE_TRIP = 'trip';
+    public const PAGE_TYPE_TRIP_ARCHIVE = 'trip_archive';
+    public const PAGE_TYPE_DESTINATION = 'destination';
+    public const PAGE_TYPE_ACTIVITY = 'activity';
+    public const PAGE_TYPE_CATEGORY = 'category';
+    /** Browse-all index: /destination/, /activity/, /trip-category/ (and plain ?yatra_page=). */
+    public const PAGE_TYPE_DESTINATION_LISTING = 'destination_listing';
+    public const PAGE_TYPE_ACTIVITY_LISTING = 'activity_listing';
+    public const PAGE_TYPE_CATEGORY_LISTING = 'category_listing';
+
+    /**
+     * Valid page types for validation
+     */
+    private const VALID_PAGE_TYPES = [
+        self::PAGE_TYPE_TRIP,
+        self::PAGE_TYPE_TRIP_ARCHIVE,
+        self::PAGE_TYPE_DESTINATION,
+        self::PAGE_TYPE_ACTIVITY,
+        self::PAGE_TYPE_CATEGORY,
+        self::PAGE_TYPE_DESTINATION_LISTING,
+        self::PAGE_TYPE_ACTIVITY_LISTING,
+        self::PAGE_TYPE_CATEGORY_LISTING,
+    ];
+
+    /**
+     * Cache key prefix
+     */
+    private const CACHE_KEY_PREFIX = 'yatra_seo_';
+
+    /**
+     * Cache expiration time (1 hour)
+     */
+    private const CACHE_EXPIRATION = 3600;
+
+    /**
+     * SEO data structure
+     */
+    private array $seoData = [
+        'title' => '',
+        'description' => '',
+        'keywords' => '',
+        'image' => '',
+        'url' => '',
+        'type' => '',
+        'published_time' => '',
+        'modified_time' => '',
+        'author' => '',
+        'publisher' => '',
+    ];
+
+    /**
+     * Current page context
+     */
+    private string $pageType = '';
+    private $pageObject = null;
+
+    /**
+     * Instance cache for performance
+     */
+    private static array $instanceCache = [];
+
+    /**
+     * Get SEO instance for specific page type with caching and validation
+     * 
+     * @param string $pageType The page type
+     * @param mixed $pageObject The page object (trip, destination, etc.)
+     * @return self SEO service instance
+     * @throws \InvalidArgumentException If page type is invalid
+     */
+    public static function forPage(string $pageType, $pageObject = null): self
+    {
+        // Validate page type
+        if (!in_array($pageType, self::VALID_PAGE_TYPES, true)) {
+            throw new \InvalidArgumentException(
+                sprintf('Invalid page type "%s". Valid types: %s', 
+                    $pageType, 
+                    implode(', ', self::VALID_PAGE_TYPES)
+                )
+            );
+        }
+
+        // Generate cache key
+        $cacheKey = self::CACHE_KEY_PREFIX . md5($pageType . serialize($pageObject));
+        
+        // Check cache first
+        if (isset(self::$instanceCache[$cacheKey])) {
+            return self::$instanceCache[$cacheKey];
+        }
+
+        // Create new instance
+        $instance = new self();
+        $instance->pageType = $pageType;
+        $instance->pageObject = $pageObject;
+        
+        // Cache the instance
+        self::$instanceCache[$cacheKey] = $instance;
+        
+        return $instance;
+    }
+
+    /**
+     * Generate and output all SEO meta tags with error handling
+     */
+    public function generateMetaTags(): void
+    {
+        try {
+            $this->collectSEOData();
+            
+            if (empty($this->seoData['url'])) {
+                $this->seoData['url'] = $this->getCurrentUrl();
+            }
+            
+            $this->outputBasicMetaTags();
+            $this->outputOpenGraphTags();
+            $this->outputTwitterCardTags();
+            $this->outputAdvancedMetaTags();
+            $this->outputPaginationRelLinks();
+            $this->outputSchemaMarkup();
+            
+        } catch (\Exception $e) {
+            // Log error and fail gracefully
+
+            // Output basic fallback meta tags
+            $this->outputFallbackMetaTags();
+        }
+    }
+
+    /**
+     * Get page title (for document_title filter) with error handling
+     * 
+     * @return string The formatted page title
+     */
+    public function getTitle(): string
+    {
+        try {
+            $this->collectSEOData();
+            $title = $this->sanitizeText($this->seoData['title'] ?? '');
+            
+            if (!empty($title)) {
+                return $title . ' - ' . $this->sanitizeText(get_bloginfo('name'));
+            }
+            
+            return '';
+        } catch (\Exception $e) {
+            return '';
+        }
+    }
+
+    /**
+     * Canonical URL for the current HTTP request (og:url, link rel=canonical).
+     * Must not use the HTTP referer.
+     */
+    private function getCurrentUrl(): string
+    {
+        if (!empty($_SERVER['HTTP_HOST'])) {
+            $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+                || (!empty($_SERVER['SERVER_PORT']) && (string) $_SERVER['SERVER_PORT'] === '443')
+                || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])
+                    && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+            $scheme = $https ? 'https' : 'http';
+            $host = strtolower(\sanitize_text_field(\wp_unslash((string) $_SERVER['HTTP_HOST'])));
+            $uri = $_SERVER['REQUEST_URI'] ?? '/';
+            $uri = \is_string($uri) && $uri !== '' ? $uri : '/';
+            $url = $scheme . '://' . $host . $uri;
+            $validated = \filter_var($url, \FILTER_VALIDATE_URL);
+            if ($validated) {
+                return \esc_url_raw($validated);
+            }
+        }
+
+        global $wp;
+        if (isset($wp->request) && \is_string($wp->request)) {
+            $base = \home_url(\user_trailingslashit($wp->request));
+            if (!empty($_GET) && \is_array($_GET)) {
+                $base = \add_query_arg(\array_map('sanitize_text_field', \wp_unslash($_GET)), $base);
+            }
+
+            return \esc_url_raw($base);
+        }
+
+        return \home_url('/');
+    }
+
+    /**
+     * Output fallback meta tags in case of errors
+     */
+    private function outputFallbackMetaTags(): void
+    {
+        $title = $this->sanitizeText(get_bloginfo('name'));
+        $description = $this->sanitizeText(get_bloginfo('description'));
+        
+        if (!empty($description)) {
+            echo '<meta name="description" content="' . esc_attr($description) . '">' . "\n";
+        }
+        
+        echo '<meta property="og:title" content="' . esc_attr($title) . '">' . "\n";
+        echo '<meta property="og:type" content="website">' . "\n";
+        echo '<meta property="og:url" content="' . esc_url(home_url()) . '">' . "\n";
+        echo '<meta name="twitter:card" content="summary">' . "\n";
+        echo '<link rel="canonical" href="' . esc_url(home_url()) . '">' . "\n";
+    }
+
+    /**
+     * Sanitize text for SEO output
+     * 
+     * @param string $text Text to sanitize
+     * @return string Sanitized text
+     */
+    private function sanitizeText(string $text): string
+    {
+        return wp_strip_all_tags(strip_tags($text));
+    }
+
+    /**
+     * Expand SEO meta placeholders for taxonomy terms.
+     *
+     * The destination / activity / category meta forms tell the operator to
+     * "Use {name} as placeholder" in the meta title, description and keywords.
+     * Those values are stored verbatim (the term may be renamed later), so the
+     * token must be substituted here, at render time, with the term's name.
+     * No-op when the value contains no token, so plain values are untouched.
+     *
+     * @param string $value Stored meta value, possibly containing {name}
+     * @param string $name  Term name to substitute
+     * @return string Value with {name} replaced
+     */
+    private function expandTermTokens(string $value, string $name): string
+    {
+        if ($value === '' || strpos($value, '{') === false) {
+            return $value;
+        }
+
+        return str_replace(['{name}', '{Name}'], $name, $value);
+    }
+
+    /**
+     * Validate and sanitize URL
+     * 
+     * @param string $url URL to validate
+     * @return string Validated URL
+     */
+    private function validateUrl(string $url): string
+    {
+        return esc_url(filter_var($url, FILTER_VALIDATE_URL) ?: '');
+    }
+
+    /**
+     * Collect SEO data based on page type with error handling
+     */
+    private function collectSEOData(): void
+    {
+        try {
+            switch ($this->pageType) {
+                case self::PAGE_TYPE_TRIP_ARCHIVE:
+                    $this->collectTripArchiveData();
+                    break;
+                case self::PAGE_TYPE_DESTINATION:
+                    $this->collectDestinationData();
+                    break;
+                case self::PAGE_TYPE_ACTIVITY:
+                    $this->collectActivityData();
+                    break;
+                case self::PAGE_TYPE_CATEGORY:
+                    $this->collectCategoryData();
+                    break;
+                case self::PAGE_TYPE_DESTINATION_LISTING:
+                    $this->collectDestinationListingData();
+                    break;
+                case self::PAGE_TYPE_ACTIVITY_LISTING:
+                    $this->collectActivityListingData();
+                    break;
+                case self::PAGE_TYPE_CATEGORY_LISTING:
+                    $this->collectCategoryListingData();
+                    break;
+                case self::PAGE_TYPE_TRIP:
+                    $this->collectTripData();
+                    break;
+                default:
+                    throw new \InvalidArgumentException("Unsupported page type: {$this->pageType}");
+            }
+        } catch (\Exception $e) {
+
+            // Set default values on error
+            $this->setDefaultSEOData();
+        }
+    }
+
+    /**
+     * Set default SEO data as fallback
+     */
+    private function setDefaultSEOData(): void
+    {
+        $this->seoData = array_merge($this->seoData, [
+            'title' => get_bloginfo('name'),
+            'description' => get_bloginfo('description'),
+            'author' => get_bloginfo('name'),
+            'publisher' => get_bloginfo('name'),
+            'type' => 'website',
+            'url' => $this->getCurrentUrl(),
+            'published_time' => date('c'),
+            'modified_time' => date('c'),
+        ]);
+    }
+
+    /**
+     * Collect SEO data for trip archive page with validation
+     */
+    private function collectTripArchiveData(): void
+    {
+        try {
+            $this->seoData['title'] = $this->sanitizeText(SettingsService::getString('seo_trip_meta_title', ''));
+            $this->seoData['description'] = $this->sanitizeText(SettingsService::getString('seo_trip_meta_description', ''));
+            $this->seoData['keywords'] = $this->sanitizeText(SettingsService::getString('seo_trip_meta_keywords', ''));
+            if ($this->seoData['title'] === '') {
+                $this->seoData['title'] = $this->sanitizeText(\__('All Trips', 'yatra'));
+            }
+            if ($this->seoData['description'] === '') {
+                $tagline = $this->sanitizeText(\get_bloginfo('description'));
+                $this->seoData['description'] = $tagline !== ''
+                    ? $tagline
+                    : $this->sanitizeText(
+                        \__('Browse and compare trips, then open a trip for full details and booking.', 'yatra')
+                    );
+            }
+            
+            // Get image from settings (attachment ID) with validation
+            $imageId = SettingsService::getInt('seo_trip_meta_image', 0);
+            
+            if ($imageId > 0) {
+                $imageUrl = wp_get_attachment_url($imageId);
+                
+                if ($imageUrl && filter_var($imageUrl, FILTER_VALIDATE_URL)) {
+                    $this->seoData['image'] = $this->validateUrl($imageUrl);
+                }
+            }
+            
+            $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+            $this->seoData['type'] = 'website';
+            $this->seoData['published_time'] = date('c');
+            $this->seoData['modified_time'] = date('c');
+            $this->seoData['author'] = $this->sanitizeText(get_bloginfo('name'));
+            $this->seoData['publisher'] = $this->sanitizeText(get_bloginfo('name'));
+            
+        } catch (\Exception $e) {
+            $this->setDefaultSEOData();
+        }
+    }
+
+    private function collectDestinationListingData(): void
+    {
+        $this->seoData['title'] = $this->sanitizeText(\__('All Destinations', 'yatra'));
+        $this->seoData['description'] = $this->sanitizeText(
+            \__('Explore destinations we visit and find trips that match where you want to go.', 'yatra')
+        );
+        $this->seoData['keywords'] = '';
+        $this->seoData['image'] = '';
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        $this->seoData['type'] = 'website';
+        $this->seoData['published_time'] = \date('c');
+        $this->seoData['modified_time'] = \date('c');
+        $this->seoData['author'] = $this->sanitizeText(\get_bloginfo('name'));
+        $this->seoData['publisher'] = $this->sanitizeText(\get_bloginfo('name'));
+    }
+
+    private function collectActivityListingData(): void
+    {
+        $this->seoData['title'] = $this->sanitizeText(\__('All Activities', 'yatra'));
+        $this->seoData['description'] = $this->sanitizeText(
+            \__('Browse experiences and find trips built around the activities you love.', 'yatra')
+        );
+        $this->seoData['keywords'] = '';
+        $this->seoData['image'] = '';
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        $this->seoData['type'] = 'website';
+        $this->seoData['published_time'] = \date('c');
+        $this->seoData['modified_time'] = \date('c');
+        $this->seoData['author'] = $this->sanitizeText(\get_bloginfo('name'));
+        $this->seoData['publisher'] = $this->sanitizeText(\get_bloginfo('name'));
+    }
+
+    private function collectCategoryListingData(): void
+    {
+        $this->seoData['title'] = $this->sanitizeText(\__('Trip Categories', 'yatra'));
+        $this->seoData['description'] = $this->sanitizeText(
+            \__('Browse trips by style or theme—adventure, family, luxury, and more.', 'yatra')
+        );
+        $this->seoData['keywords'] = '';
+        $this->seoData['image'] = '';
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        $this->seoData['type'] = 'website';
+        $this->seoData['published_time'] = \date('c');
+        $this->seoData['modified_time'] = \date('c');
+        $this->seoData['author'] = $this->sanitizeText(\get_bloginfo('name'));
+        $this->seoData['publisher'] = $this->sanitizeText(\get_bloginfo('name'));
+    }
+
+    /**
+     * Collect SEO data for destination page
+     */
+    private function collectDestinationData(): void
+    {
+        if (!$this->pageObject) {
+            return;
+        }
+
+        $destination = $this->pageObject;
+        $metadata = [];
+        if (!empty($destination->metadata)) {
+            if (\is_array($destination->metadata)) {
+                $metadata = $destination->metadata;
+            } else {
+                $maybe = \maybe_unserialize($destination->metadata);
+                $metadata = \is_array($maybe) ? $maybe : [];
+            }
+        }
+
+        $name = (string) ($destination->name ?? '');
+        $title = $metadata['seo_title'] ?? $destination->name ?? '';
+        $this->seoData['title'] = $this->sanitizeText($this->expandTermTokens((string) $title, $name));
+        $descRaw = $metadata['seo_description'] ?? $destination->description ?? '';
+        $descRaw = $this->expandTermTokens((string) $descRaw, $name);
+        $this->seoData['description'] = $this->sanitizeText(\wp_trim_words(\wp_strip_all_tags($descRaw), 45, '…'));
+        $this->seoData['keywords'] = $this->sanitizeText($this->expandTermTokens((string) ($metadata['seo_keywords'] ?? ''), $name));
+        
+        // Get featured image or gallery image
+        $this->seoData['image'] = $destination->featured_image_url ?? 
+                               ($destination->gallery_images[0] ?? '');
+        
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        
+        $this->seoData['type'] = 'place';
+        $this->seoData['published_time'] = date('c', strtotime($destination->created_at ?? 'now'));
+        $this->seoData['modified_time'] = date('c', strtotime($destination->updated_at ?? 'now'));
+        $this->seoData['author'] = get_bloginfo('name');
+        $this->seoData['publisher'] = get_bloginfo('name');
+    }
+
+    /**
+     * Collect SEO data for activity page
+     */
+    private function collectActivityData(): void
+    {
+        if (!$this->pageObject) {
+            return;
+        }
+
+        $activity = $this->pageObject;
+        $metadata = [];
+        if (!empty($activity->metadata)) {
+            if (\is_array($activity->metadata)) {
+                $metadata = $activity->metadata;
+            } else {
+                $maybe = \maybe_unserialize($activity->metadata);
+                $metadata = \is_array($maybe) ? $maybe : [];
+            }
+        }
+
+        $name = (string) ($activity->name ?? '');
+        $this->seoData['title'] = $this->sanitizeText($this->expandTermTokens((string) ($metadata['seo_title'] ?? $activity->name ?? ''), $name));
+        $descRaw = $metadata['seo_description'] ?? $activity->description ?? '';
+        $descRaw = $this->expandTermTokens((string) $descRaw, $name);
+        $this->seoData['description'] = $this->sanitizeText(\wp_trim_words(\wp_strip_all_tags($descRaw), 45, '…'));
+        $this->seoData['keywords'] = $this->sanitizeText($this->expandTermTokens((string) ($metadata['seo_keywords'] ?? ''), $name));
+        
+        // Get featured image or gallery image
+        $this->seoData['image'] = $activity->featured_image_url ?? 
+                               ($activity->gallery_images[0] ?? '');
+        
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        
+        $this->seoData['type'] = 'article';
+        $this->seoData['published_time'] = date('c', strtotime($activity->created_at ?? 'now'));
+        $this->seoData['modified_time'] = date('c', strtotime($activity->updated_at ?? 'now'));
+        $this->seoData['author'] = get_bloginfo('name');
+        $this->seoData['publisher'] = get_bloginfo('name');
+    }
+
+    /**
+     * Collect SEO data for category page
+     */
+    private function collectCategoryData(): void
+    {
+        if (!$this->pageObject) {
+            return;
+        }
+
+        $category = $this->pageObject;
+        $metadata = [];
+        if (!empty($category->metadata)) {
+            if (\is_array($category->metadata)) {
+                $metadata = $category->metadata;
+            } else {
+                $maybe = \maybe_unserialize($category->metadata);
+                $metadata = \is_array($maybe) ? $maybe : [];
+            }
+        }
+
+        $name = (string) ($category->name ?? '');
+        $this->seoData['title'] = $this->sanitizeText($this->expandTermTokens((string) ($metadata['seo_title'] ?? $category->name ?? ''), $name));
+        $descRaw = $metadata['seo_description'] ?? $category->description ?? '';
+        $descRaw = $this->expandTermTokens((string) $descRaw, $name);
+        $this->seoData['description'] = $this->sanitizeText(\wp_trim_words(\wp_strip_all_tags($descRaw), 45, '…'));
+        $this->seoData['keywords'] = $this->sanitizeText($this->expandTermTokens((string) ($metadata['seo_keywords'] ?? ''), $name));
+        
+        // Get featured image or gallery image
+        $this->seoData['image'] = $category->featured_image_url ?? 
+                               ($category->gallery_images[0] ?? '');
+        
+        $this->seoData['url'] = $this->validateUrl($this->getCurrentUrl());
+        
+        $this->seoData['type'] = 'article';
+        $this->seoData['published_time'] = date('c', strtotime($category->created_at ?? 'now'));
+        $this->seoData['modified_time'] = date('c', strtotime($category->updated_at ?? 'now'));
+        $this->seoData['author'] = get_bloginfo('name');
+        $this->seoData['publisher'] = get_bloginfo('name');
+    }
+
+    /**
+     * Collect SEO data for single trip page
+     */
+    private function collectTripData(): void
+    {
+        if (!$this->pageObject) {
+            return;
+        }
+
+        $trip = $this->pageObject;
+
+        $customTitle = trim((string) ($trip->meta_title ?? ''));
+        $displayTitle = '';
+        if (\is_object($trip) && \method_exists($trip, 'getTitle')) {
+            $displayTitle = $this->sanitizeText($trip->getTitle());
+        } else {
+            $displayTitle = $this->sanitizeText((string) ($trip->title ?? $trip->name ?? ''));
+        }
+
+        $this->seoData['title'] = $customTitle !== ''
+            ? $this->sanitizeText($customTitle)
+            : $displayTitle;
+
+        $customDesc = trim((string) ($trip->meta_description ?? ''));
+        $fallbackDesc = '';
+        if (\is_object($trip) && \method_exists($trip, 'getShortDescription')) {
+            $short = $trip->getShortDescription();
+            if (!empty($short)) {
+                $fallbackDesc = $this->sanitizeText(\wp_strip_all_tags((string) $short));
+            }
+        }
+        if ($fallbackDesc === '' && !empty($trip->description)) {
+            $fallbackDesc = $this->sanitizeText(
+                \wp_trim_words(\wp_strip_all_tags((string) $trip->description), 40, '…')
+            );
+        }
+        if ($fallbackDesc === '') {
+            $fallbackDesc = $this->sanitizeText(SettingsService::getString('seo_trip_meta_description', ''));
+        }
+        $this->seoData['description'] = $customDesc !== ''
+            ? $this->sanitizeText($customDesc)
+            : $fallbackDesc;
+
+        $customKeywords = trim((string) ($trip->meta_keywords ?? ''));
+        $this->seoData['keywords'] = $customKeywords !== ''
+            ? $this->sanitizeText($customKeywords)
+            : $this->sanitizeText(SettingsService::getString('seo_trip_meta_keywords', ''));
+
+        $this->seoData['image'] = $this->resolveTripSeoImageUrl($trip);
+
+        $this->seoData['url'] = function_exists('yatra_get_trip_permalink')
+            ? yatra_get_trip_permalink($trip)
+            : home_url('/' . SettingsService::getTripBase() . '/' . ($trip->slug ?? ''));
+
+        $this->seoData['type'] = 'article';
+        $this->seoData['published_time'] = date('c', strtotime($trip->created_at ?? 'now'));
+        $this->seoData['modified_time'] = date('c', strtotime($trip->updated_at ?? 'now'));
+        $this->seoData['author'] = get_bloginfo('name');
+        $this->seoData['publisher'] = get_bloginfo('name');
+    }
+
+    /**
+     * Resolve share/SEO image URL for a trip (featured, gallery, then global trip SEO image setting).
+     *
+     * @param object $trip
+     */
+    private function resolveTripSeoImageUrl(object $trip): string
+    {
+        $raw = '';
+        if (!empty($trip->featured_image_url)) {
+            $raw = (string) $trip->featured_image_url;
+        } elseif (!empty($trip->gallery_images) && \is_array($trip->gallery_images)) {
+            $first = $trip->gallery_images[0] ?? null;
+            if (\is_string($first)) {
+                $raw = $first;
+            } elseif (\is_array($first)) {
+                $raw = (string) ($first['url'] ?? $first['src'] ?? '');
+            }
+        }
+
+        if ($raw === '') {
+            $imageId = SettingsService::getInt('seo_trip_meta_image', 0);
+            if ($imageId > 0) {
+                $url = \wp_get_attachment_url($imageId);
+                if ($url && \filter_var($url, FILTER_VALIDATE_URL)) {
+                    $raw = $url;
+                }
+            }
+        }
+
+        return $raw !== '' ? $this->validateUrl($raw) : '';
+    }
+
+    /**
+     * The page's language as WordPress reports it, reduced to what hreflang
+     * and Open Graph accept: language + optional region (`de-DE`, `en-US`,
+     * `ca`). Read at render time through get_locale()/the `locale` filter, so
+     * a German install, WPML and Polylang per-page languages all resolve
+     * correctly. WordPress variant locales such as `de_DE_formal` ("Deutsch
+     * (Sie)") or `pt_PT_ao90` carry a third segment that is not a region —
+     * Google ignores an hreflang like `de-DE-formal` and Facebook rejects
+     * `de_DE_formal` — so only the first two segments are kept. Falls back to
+     * `en-US` when WP has no locale, which keeps existing English sites
+     * byte-identical.
+     */
+    private function languageTag(): string
+    {
+        $locale = (string) get_locale();
+        if ($locale === '') {
+            $locale = str_replace('-', '_', (string) get_bloginfo('language'));
+        }
+
+        $parts = preg_split('/[_-]/', $locale) ?: [];
+        $language = strtolower((string) ($parts[0] ?? ''));
+        if (!preg_match('/^[a-z]{2,3}$/', $language)) {
+            return 'en-US';
+        }
+
+        $region = strtoupper((string) ($parts[1] ?? ''));
+
+        return preg_match('/^[A-Z]{2}$/', $region) ? $language . '-' . $region : $language;
+    }
+
+    /**
+     * Same language in Open Graph form (`de_DE`, `en_US`).
+     */
+    private function ogLocale(): string
+    {
+        return str_replace('-', '_', $this->languageTag());
+    }
+
+    /**
+     * Output basic meta tags
+     */
+    private function outputBasicMetaTags(): void
+    {
+        if (!empty($this->seoData['description'])) {
+            echo '<meta name="description" content="' . esc_attr($this->truncateText($this->seoData['description'], 160)) . '">' . "\n";
+        }
+
+        if (!empty($this->seoData['keywords'])) {
+            echo '<meta name="keywords" content="' . esc_attr($this->seoData['keywords']) . '">' . "\n";
+        }
+    }
+
+    /**
+     * Output Open Graph meta tags
+     */
+    private function outputOpenGraphTags(): void
+    {
+        echo '<meta property="og:locale" content="' . esc_attr($this->ogLocale()) . '">' . "\n";
+        echo '<meta property="og:site_name" content="' . esc_attr(get_bloginfo('name')) . '">' . "\n";
+        echo '<meta property="og:title" content="' . esc_attr($this->seoData['title']) . '">' . "\n";
+        echo '<meta property="og:description" content="' . esc_attr($this->truncateText($this->seoData['description'], 160)) . '">' . "\n";
+        echo '<meta property="og:type" content="' . esc_attr($this->seoData['type']) . '">' . "\n";
+        echo '<meta property="og:url" content="' . esc_url($this->seoData['url']) . '">' . "\n";
+
+        if (!empty($this->seoData['image'])) {
+            echo '<meta property="og:image" content="' . esc_url($this->seoData['image']) . '">' . "\n";
+            echo '<meta property="og:image:width" content="1200">' . "\n";
+            echo '<meta property="og:image:height" content="630">' . "\n";
+            echo '<meta property="og:image:alt" content="' . esc_attr($this->seoData['title']) . '">' . "\n";
+        }
+
+        if (!empty($this->seoData['published_time'])) {
+            echo '<meta property="article:published_time" content="' . esc_attr($this->seoData['published_time']) . '">' . "\n";
+        }
+
+        if (!empty($this->seoData['modified_time'])) {
+            echo '<meta property="article:modified_time" content="' . esc_attr($this->seoData['modified_time']) . '">' . "\n";
+        }
+    }
+
+    /**
+     * Output Twitter Card meta tags
+     */
+    private function outputTwitterCardTags(): void
+    {
+        echo '<meta name="twitter:card" content="summary_large_image">' . "\n";
+        echo '<meta name="twitter:title" content="' . esc_attr($this->seoData['title']) . '">' . "\n";
+        echo '<meta name="twitter:description" content="' . esc_attr($this->truncateText($this->seoData['description'], 160)) . '">' . "\n";
+
+        if (!empty($this->seoData['image'])) {
+            echo '<meta name="twitter:image" content="' . esc_url($this->seoData['image']) . '">' . "\n";
+        }
+    }
+
+    /**
+     * The robots directive for this page.
+     *
+     * Normally "index, follow" with the usual snippet hints, exactly as before.
+     * When the operator has both dropped this content type from the sitemap and
+     * opted in to noindexing excluded types, it becomes "noindex, follow" —
+     * because removing a URL from a sitemap does not stop Google indexing it,
+     * and this page was previously asserting the opposite.
+     *
+     * "follow" is kept deliberately: the page should stop being indexed, but
+     * links out of it (to trips that ARE published) should still be crawled.
+     */
+    private function robotsDirective(): string
+    {
+        $indexable = 'index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1';
+
+        if (!SettingsService::isEnabled('sitemap_noindex_excluded')) {
+            return $indexable;
+        }
+
+        $sitemapType = $this->sitemapTypeForPage();
+        if ($sitemapType === '') {
+            return $indexable;
+        }
+
+        if (!class_exists(\Yatra\Sitemap\SitemapService::class)) {
+            return $indexable;
+        }
+
+        $sitemap = new \Yatra\Sitemap\SitemapService();
+
+        return $sitemap->isTypeEnabled($sitemapType) ? $indexable : 'noindex, follow';
+    }
+
+    /**
+     * Map this page onto the sitemap content type that governs it.
+     *
+     * The taxonomy listing pages are published by the sitemap's `archive` type
+     * (the trip listing plus each taxonomy index), so they follow it.
+     *
+     * @return string '' when no sitemap type owns this page.
+     */
+    private function sitemapTypeForPage(): string
+    {
+        switch ($this->pageType) {
+            case self::PAGE_TYPE_TRIP:
+                return \Yatra\Sitemap\SitemapService::TYPE_TRIP;
+            case self::PAGE_TYPE_DESTINATION:
+                return \Yatra\Sitemap\SitemapService::TYPE_DESTINATION;
+            case self::PAGE_TYPE_ACTIVITY:
+                return \Yatra\Sitemap\SitemapService::TYPE_ACTIVITY;
+            case self::PAGE_TYPE_CATEGORY:
+                return \Yatra\Sitemap\SitemapService::TYPE_CATEGORY;
+            case self::PAGE_TYPE_TRIP_ARCHIVE:
+            case self::PAGE_TYPE_DESTINATION_LISTING:
+            case self::PAGE_TYPE_ACTIVITY_LISTING:
+            case self::PAGE_TYPE_CATEGORY_LISTING:
+                return \Yatra\Sitemap\SitemapService::TYPE_ARCHIVE;
+            default:
+                return '';
+        }
+    }
+
+    /**
+     * Output advanced meta tags
+     */
+    private function outputAdvancedMetaTags(): void
+    {
+        echo '<meta name="robots" content="' . esc_attr($this->robotsDirective()) . '">' . "\n";
+        echo '<link rel="canonical" href="' . esc_url($this->seoData['url']) . '">' . "\n";
+        echo '<meta name="author" content="' . esc_attr($this->seoData['author']) . '">' . "\n";
+        echo '<meta name="publisher" content="' . esc_attr($this->seoData['publisher']) . '">' . "\n";
+        echo '<meta name="lastmod" content="' . esc_attr($this->seoData['modified_time']) . '">' . "\n";
+        echo '<link rel="alternate" hreflang="' . esc_attr($this->languageTag()) . '" href="' . esc_url($this->seoData['url']) . '">' . "\n";
+        echo '<meta name="revisit-after" content="7 days">' . "\n";
+        echo '<meta name="distribution" content="global">' . "\n";
+        echo '<meta name="rating" content="general">' . "\n";
+    }
+
+    /**
+     * rel="prev" / rel="next" for paginated trip archive and taxonomy listings (Google-supported series hints).
+     */
+    private function outputPaginationRelLinks(): void
+    {
+        $prevUrl = '';
+        $nextUrl = '';
+
+        switch ($this->pageType) {
+            case self::PAGE_TYPE_TRIP_ARCHIVE:
+                $ctx = $GLOBALS['yatra_trip_listing_context'] ?? null;
+                if (!\is_array($ctx)) {
+                    return;
+                }
+                $pagination = $ctx['pagination'] ?? null;
+                if (!\is_array($pagination)) {
+                    return;
+                }
+                if (!empty($pagination['prev_url']) && \is_string($pagination['prev_url'])) {
+                    $prevUrl = $pagination['prev_url'];
+                }
+                if (!empty($pagination['next_url']) && \is_string($pagination['next_url'])) {
+                    $nextUrl = $pagination['next_url'];
+                }
+                break;
+
+            case self::PAGE_TYPE_DESTINATION:
+            case self::PAGE_TYPE_ACTIVITY:
+            case self::PAGE_TYPE_CATEGORY:
+                $td = $GLOBALS['yatra_taxonomy_data'] ?? null;
+                if (!$td || !\is_object($td)) {
+                    return;
+                }
+                $total = \max(1, (int) ($td->trips_pages ?? 1));
+                $current = (int) ($td->trips_current_page ?? 1);
+                if ($current < 1) {
+                    $current = 1;
+                }
+                $current = \min($current, $total);
+                if (!\function_exists('yatra_build_current_request_paged_url')) {
+                    return;
+                }
+                if ($current > 1) {
+                    $prevUrl = (string) yatra_build_current_request_paged_url($current - 1);
+                }
+                if ($current < $total) {
+                    $nextUrl = (string) yatra_build_current_request_paged_url($current + 1);
+                }
+                break;
+
+            case self::PAGE_TYPE_DESTINATION_LISTING:
+            case self::PAGE_TYPE_ACTIVITY_LISTING:
+            case self::PAGE_TYPE_CATEGORY_LISTING:
+                $meta = $GLOBALS['yatra_archive_browse_pagination'] ?? null;
+                if (!\is_array($meta)) {
+                    return;
+                }
+                $total = \max(1, (int) ($meta['total_pages'] ?? 1));
+                $current = (int) ($meta['current_page'] ?? 1);
+                if ($current < 1) {
+                    $current = 1;
+                }
+                $current = \min($current, $total);
+                if (!\function_exists('yatra_build_archive_listing_url')) {
+                    return;
+                }
+                if ($current > 1) {
+                    $prevUrl = (string) yatra_build_archive_listing_url($current - 1);
+                }
+                if ($current < $total) {
+                    $nextUrl = (string) yatra_build_archive_listing_url($current + 1);
+                }
+                break;
+
+            default:
+                return;
+        }
+
+        if ($prevUrl !== '') {
+            echo '<link rel="prev" href="' . esc_url($prevUrl) . '">' . "\n";
+        }
+        if ($nextUrl !== '') {
+            echo '<link rel="next" href="' . esc_url($nextUrl) . '">' . "\n";
+        }
+    }
+
+    /**
+     * Output Schema markup
+     */
+    private function outputSchemaMarkup(): void
+    {
+        $schema = $this->generateSchemaMarkup();
+        if (!empty($schema)) {
+            // JSON_HEX_TAG|JSON_HEX_AMP escape < > & as \u00xx so no string value
+            // (e.g. user-submitted review text/author) can break out of this
+            // <script> block — a </script> in a review would otherwise be XSS.
+            // Google parses the \u-escaped JSON identically.
+            echo '<script type="application/ld+json">' . json_encode($schema, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP) . '</script>' . "\n";
+        }
+    }
+
+    /**
+     * Generate schema markup based on page type
+     */
+    private function generateSchemaMarkup(): array
+    {
+        $baseSchema = [
+            '@context' => 'https://schema.org',
+            'name' => $this->seoData['title'],
+            'description' => $this->seoData['description'],
+            'url' => $this->seoData['url'],
+            'publisher' => [
+                '@type' => 'Organization',
+                'name' => get_bloginfo('name'),
+                'url' => home_url()
+            ],
+            'dateModified' => $this->seoData['modified_time'],
+            'datePublished' => $this->seoData['published_time'],
+            'inLanguage' => $this->languageTag(),
+            'isPartOf' => [
+                '@type' => 'WebSite',
+                'name' => get_bloginfo('name'),
+                'url' => home_url()
+            ]
+        ];
+
+        // Add image if available
+        if (!empty($this->seoData['image'])) {
+            $baseSchema['image'] = $this->seoData['image'];
+        }
+
+        switch ($this->pageType) {
+            case self::PAGE_TYPE_TRIP_ARCHIVE:
+            case self::PAGE_TYPE_DESTINATION_LISTING:
+            case self::PAGE_TYPE_ACTIVITY_LISTING:
+            case self::PAGE_TYPE_CATEGORY_LISTING:
+                return $this->generateCollectionPageSchema($baseSchema);
+            case self::PAGE_TYPE_DESTINATION:
+                return $this->generatePlaceSchema($baseSchema);
+            case self::PAGE_TYPE_TRIP:
+                // A tour with ratings/reviews must be a Google-supported review
+                // type (Product) with the rating + reviews nested inside it —
+                // NOT a TouristTrip/Article, which Google rejects for review
+                // snippets ("invalid object type for parent_node").
+                return $this->generateTripProductSchema($baseSchema);
+            case self::PAGE_TYPE_ACTIVITY:
+            case self::PAGE_TYPE_CATEGORY:
+                return $this->generateArticleSchema($baseSchema);
+            default:
+                return $baseSchema;
+        }
+    }
+
+    /**
+     * Generate CollectionPage schema for archive pages
+     */
+    private function generateCollectionPageSchema(array $baseSchema): array
+    {
+        $schema = array_merge($baseSchema, [
+            '@type' => 'CollectionPage',
+        ]);
+
+        // mainEntity lists exactly the cards rendered on this page (after
+        // filters, sorting and pagination). When nothing is rendered — or a
+        // theme template override didn't expose its rows — it is omitted
+        // rather than emitted as an empty ItemList.
+        $items = $this->collectCollectionPageItems();
+        if (!empty($items)) {
+            $schema['mainEntity'] = [
+                '@type' => 'ItemList',
+                'numberOfItems' => count($items),
+                'itemListElement' => $items,
+            ];
+        }
+
+        /**
+         * Filter the CollectionPage JSON-LD on Yatra archive/listing pages.
+         *
+         * Return the schema with `mainEntity` changed or unset to adjust only
+         * the item list; titles, meta, canonical and robots are unaffected.
+         *
+         * @param array  $schema   CollectionPage schema.
+         * @param string $pageType SEOService::PAGE_TYPE_* listing constant.
+         * @param array  $items    ListItem entries used for mainEntity.
+         */
+        $filtered = apply_filters('yatra_seo_collection_page_schema', $schema, $this->pageType, $items);
+
+        return \is_array($filtered) ? $filtered : $schema;
+    }
+
+    /**
+     * ListItem entries for the cards rendered on the current listing page.
+     *
+     * Reads the rows the listing request already loaded (no extra listing
+     * query); positions continue across pages (page 2 starts at per_page + 1).
+     */
+    private function collectCollectionPageItems(): array
+    {
+        $rows = [];
+        $offset = 0;
+        $permalinkFn = '';
+
+        switch ($this->pageType) {
+            case self::PAGE_TYPE_TRIP_ARCHIVE:
+                $ctx = $GLOBALS['yatra_trip_listing_context'] ?? null;
+                if (!\is_array($ctx) || empty($ctx['trips']) || !\is_array($ctx['trips'])) {
+                    return [];
+                }
+                $rows = $ctx['trips'];
+                $perPage = max(1, (int) ($ctx['results']['per_page'] ?? 1));
+                $offset = (max(1, (int) ($ctx['current_page'] ?? 1)) - 1) * $perPage;
+                $permalinkFn = 'yatra_get_trip_permalink';
+                break;
+
+            case self::PAGE_TYPE_DESTINATION_LISTING:
+            case self::PAGE_TYPE_ACTIVITY_LISTING:
+            case self::PAGE_TYPE_CATEGORY_LISTING:
+                $meta = $GLOBALS['yatra_archive_browse_pagination'] ?? null;
+                if (!\is_array($meta) || empty($meta['items']) || !\is_array($meta['items'])) {
+                    return [];
+                }
+                $rows = $meta['items'];
+                $offset = max(0, (int) ($meta['offset'] ?? 0));
+                $permalinkFn = [
+                    self::PAGE_TYPE_DESTINATION_LISTING => 'yatra_get_destination_permalink',
+                    self::PAGE_TYPE_ACTIVITY_LISTING => 'yatra_get_activity_permalink',
+                    self::PAGE_TYPE_CATEGORY_LISTING => 'yatra_get_category_permalink',
+                ][$this->pageType];
+                break;
+
+            default:
+                return [];
+        }
+
+        if (!\function_exists($permalinkFn)) {
+            return [];
+        }
+
+        $items = [];
+        $position = $offset;
+        foreach (array_values($rows) as $row) {
+            if (!\is_object($row)) {
+                continue;
+            }
+
+            // Same URL source as the rendered card (Trip model or the
+            // permalink helper called with the row id), so links match.
+            if ($row instanceof \Yatra\Models\Trip) {
+                $url = $row->getPermalink();
+                $name = $row->getTitle();
+            } elseif ($this->pageType === self::PAGE_TYPE_TRIP_ARCHIVE) {
+                $url = $permalinkFn($row);
+                $name = (string) ($row->title ?? '');
+            } else {
+                $url = $permalinkFn($row->id ?? $row);
+                $name = (string) ($row->name ?? '');
+            }
+
+            // esc_url_raw, not validateUrl(): JSON needs a literal "&" (not
+            // "&#038;"), and FILTER_VALIDATE_URL rejects non-ASCII slugs.
+            $url = esc_url_raw((string) $url, ['http', 'https']);
+            if ($url === '') {
+                continue;
+            }
+
+            $position++;
+            $item = [
+                '@type' => 'ListItem',
+                'position' => $position,
+                'url' => $url,
+            ];
+            $name = $this->sanitizeText($name);
+            if ($name !== '') {
+                $item['name'] = $name;
+            }
+            $items[] = $item;
+        }
+
+        return $items;
+    }
+
+    /**
+     * Generate Place schema for destination pages
+     */
+    private function generatePlaceSchema(array $baseSchema): array
+    {
+        return array_merge($baseSchema, [
+            '@type' => 'Place',
+            'address' => $this->pageObject->address ?? '',
+            'geo' => [
+                '@type' => 'GeoCoordinates',
+                'latitude' => $this->pageObject->latitude ?? '',
+                'longitude' => $this->pageObject->longitude ?? ''
+            ]
+        ]);
+    }
+
+    /**
+     * Generate Article schema for content pages
+     */
+    private function generateArticleSchema(array $baseSchema): array
+    {
+        return array_merge($baseSchema, [
+            '@type' => 'Article',
+            'headline' => $this->seoData['title'],
+            'author' => [
+                '@type' => 'Organization',
+                'name' => get_bloginfo('name')
+            ]
+        ]);
+    }
+
+    /**
+     * Generate Product schema for a single trip, with rating + reviews nested
+     * INSIDE the product (the structure Google requires for review snippets).
+     *
+     * `aggregateRating` and `review` are added only when approved reviews exist —
+     * an empty aggregateRating is itself a structured-data error. Each review
+     * carries the required author / reviewRating / reviewBody / datePublished so
+     * Google no longer reports "Missing field author" or "Missing field itemReviewed".
+     */
+    private function generateTripProductSchema(array $baseSchema): array
+    {
+        $trip = $this->pageObject;
+
+        $tripId = (\is_object($trip) && isset($trip->id)) ? (int) $trip->id : 0;
+        $avg = (\is_object($trip) && \method_exists($trip, 'getAverageRating'))
+            ? (float) $trip->getAverageRating()
+            : 0.0;
+        $count = (\is_object($trip) && \method_exists($trip, 'getReviewCount'))
+            ? (int) $trip->getReviewCount()
+            : 0;
+
+        // No approved reviews → keep the generic Article (unchanged behaviour).
+        // A Product is emitted ONLY when there's a real rating to nest, which is
+        // exactly what fixes the review markup — and it avoids emitting a bare
+        // Product (offers/review/rating all absent) that Google would flag as
+        // incomplete on the many tours that have no reviews yet.
+        if (!($tripId > 0 && $count > 0 && $avg > 0)) {
+            return $this->generateArticleSchema($baseSchema);
+        }
+
+        $schema = [
+            '@context' => 'https://schema.org',
+            '@type' => 'Product',
+            'name' => $this->seoData['title'],
+            'url' => $this->seoData['url'],
+            'brand' => [
+                '@type' => 'Brand',
+                'name' => get_bloginfo('name'),
+            ],
+        ];
+        if (!empty($this->seoData['description'])) {
+            $schema['description'] = $this->seoData['description'];
+        }
+        if (!empty($this->seoData['image'])) {
+            $schema['image'] = $this->seoData['image'];
+        }
+
+        $schema['aggregateRating'] = [
+            '@type' => 'AggregateRating',
+            'ratingValue' => (string) round($avg, 1),
+            'reviewCount' => (string) $count,
+            'bestRating' => '5',
+            'worstRating' => '1',
+        ];
+
+        $rows = [];
+        try {
+            $rows = (new \Yatra\Repositories\ReviewRepository())->findApprovedByTripId($tripId, 10);
+        } catch (\Throwable $e) {
+            $rows = [];
+        }
+
+        $reviews = [];
+        foreach ($rows as $row) {
+            $rating = (int) ($row->rating ?? 0);
+            if ($rating < 1 || $rating > 5) {
+                continue;
+            }
+            // Strip tags on every user-derived value — even though the emitter
+            // now \u-escapes < > &, keep the data itself clean/plain-text.
+            $authorName = trim(\wp_strip_all_tags((string) ($row->author_name ?? $row->user_display_name ?? '')));
+            if ($authorName === '') {
+                $authorName = __('Anonymous', 'yatra');
+            }
+
+            $review = [
+                '@type' => 'Review',
+                'author' => ['@type' => 'Person', 'name' => $authorName],
+                'reviewRating' => [
+                    '@type' => 'Rating',
+                    'ratingValue' => (string) $rating,
+                    'bestRating' => '5',
+                    'worstRating' => '1',
+                ],
+            ];
+
+            $title = $this->sanitizeText(trim((string) ($row->title ?? '')));
+            if ($title !== '') {
+                $review['name'] = $title;
+            }
+            $body = $this->sanitizeText(trim(\wp_strip_all_tags((string) ($row->content ?? ''))));
+            if ($body !== '') {
+                $review['reviewBody'] = $body;
+            }
+            $created = (string) ($row->created_at ?? '');
+            if ($created !== '') {
+                $ts = strtotime($created);
+                if ($ts) {
+                    $review['datePublished'] = date('Y-m-d', $ts);
+                }
+            }
+
+            $reviews[] = $review;
+        }
+
+        if (!empty($reviews)) {
+            $schema['review'] = $reviews;
+        }
+
+        return $schema;
+    }
+
+    /**
+     * Truncate text to specified length
+     */
+    private function truncateText(string $text, int $length): string
+    {
+        if (strlen($text) <= $length) {
+            return $text;
+        }
+
+        return substr($text, 0, $length - 3) . '...';
+    }
+}

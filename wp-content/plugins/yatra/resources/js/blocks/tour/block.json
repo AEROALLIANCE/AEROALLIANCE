@@ -1,0 +1,89 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "yatra/tour",
+  "title": "Trip",
+  "category": "yatra",
+  "icon": "palmtree",
+  "description": "Display trip listings with customizable options",
+  "keywords": ["tour", "trip", "trips", "tours", "travel", "yatra"],
+  "textdomain": "yatra",
+  "attributes": {
+    "order": {
+      "type": "string",
+      "default": "desc"
+    },
+    "featured": {
+      "type": "boolean",
+      "default": false
+    },
+    "featured_priority": {
+      "type": "string",
+      "default": "",
+      "enum": ["", "featured", "new", "limited"]
+    },
+    "per_page": {
+      "type": "number",
+      "default": 10
+    },
+    "columns": {
+      "type": "number",
+      "default": 3
+    },
+    "title": {
+      "type": "string",
+      "default": "Our Trips"
+    },
+    "show_pagination": {
+      "type": "boolean",
+      "default": true
+    },
+    "cardLayout": {
+      "type": "string",
+      "default": "inherit",
+      "enum": ["inherit", "standard", "compact_mobile", "compact_all"]
+    },
+    "destinationIds": {
+      "type": "array",
+      "default": []
+    },
+    "activityIds": {
+      "type": "array",
+      "default": []
+    },
+    "categoryIds": {
+      "type": "array",
+      "default": []
+    },
+    "difficultyIds": {
+      "type": "array",
+      "default": []
+    },
+    "price_min": {
+      "type": "string",
+      "default": ""
+    },
+    "price_max": {
+      "type": "string",
+      "default": ""
+    },
+    "duration_min": {
+      "type": "string",
+      "default": ""
+    },
+    "duration_max": {
+      "type": "string",
+      "default": ""
+    },
+    "search": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "supports": {
+    "html": false,
+    "inserter": true,
+    "align": ["wide", "full"]
+  },
+  "editorScript": "yatra-tour-block-editor"
+}

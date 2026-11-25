@@ -1,0 +1,657 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Services;
+
+use Yatra\Helpers\FormatHelper;
+use Yatra\PaymentGateways\PaymentGatewayRegistry;
+use Yatra\Repositories\TravellerRepository;
+
+/**
+ * Extra merge tags for booking-based transactional emails: gateway, schedule, travelers, custom fields.
+ *
+ * @see TransactionalEmailTemplateService::variablesFromBooking()
+ */
+final class BookingEmailRichMergeTags
+{
+    /**
+     * Keys merged into {@see TransactionalEmailTemplateService::variablesFromBooking()} when booking id > 0.
+     *
+     * @return array<string, string>
+     */
+    public static function forBooking(object $booking): array
+    {
+        $bid = (int) ($booking->id ?? 0);
+        if ($bid <= 0) {
+            return self::emptyTags();
+        }
+
+        $gatewaySlug = trim((string) ($booking->payment_gateway ?? ''));
+        $scheduleRaw = trim((string) ($booking->payment_method ?? ''));
+
+        $repo = new TravellerRepository();
+        $travellers = $repo->getByBookingId($bid);
+
+        $special = trim((string) ($booking->special_requests ?? ''));
+
+        $fieldMaps = self::formFieldMaps((int) ($booking->trip_id ?? 0));
+
+        return array_merge([
+            'payment_gateway' => $gatewaySlug,
+            'payment_gateway_label' => self::gatewayLabel($gatewaySlug),
+            'payment_schedule' => $scheduleRaw,
+            'payment_schedule_label' => self::paymentScheduleLabel($scheduleRaw),
+            'travelers_list' => self::buildTravelersPlainList($travellers),
+            'travelers_list_html' => self::buildTravelersListHtml($travellers),
+            'traveler_custom_fields_html' => self::buildTravelerCustomFieldsHtml($travellers, $fieldMaps['traveler']),
+            'booking_custom_fields_html' => self::buildBookingCustomFieldsHtml($booking),
+            'special_requests' => $special,
+            'special_requests_html' => $special !== '' ? nl2br(esc_html($special)) : '',
+        ], self::contactAndEmergencyTags($booking, $fieldMaps), self::leadTravellerTags($travellers, $fieldMaps['traveler']));
+    }
+
+    /**
+     * Booking-form field definitions for the booking's trip, keyed by field id
+     * per section — the same form the booking view reads, so an answer can be
+     * shown the way the booking page shows it.
+     *
+     * Covers the trip's resolved fields plus any per-trip condition's fields
+     * (Pro), so an answer to a field only some trips ask still finds its label.
+     *
+     * @return array{contact: array<string, array<string, mixed>>, emergency: array<string, array<string, mixed>>, traveler: array<string, array<string, mixed>>}
+     */
+    private static function formFieldMaps(int $tripId): array
+    {
+        static $cache = [];
+
+        $maps = ['contact' => [], 'emergency' => [], 'traveler' => []];
+        if (!function_exists('yatra_get_booking_form_config')) {
+            return $maps;
+        }
+        if (isset($cache[$tripId])) {
+            return $cache[$tripId];
+        }
+
+        try {
+            $config = yatra_get_booking_form_config($tripId > 0 ? $tripId : null);
+        } catch (\Throwable $e) {
+            $config = [];
+        }
+
+        $sections = [
+            'contact_form' => 'contact',
+            'emergency_contact_form' => 'emergency',
+            'traveler_form' => 'traveler',
+        ];
+        foreach ($sections as $sectionKey => $mapKey) {
+            $section = is_array($config) ? ($config[$sectionKey] ?? null) : null;
+            if (!is_array($section)) {
+                continue;
+            }
+            $fields = is_array($section['fields'] ?? null) ? $section['fields'] : [];
+            foreach ((array) ($section['conditions'] ?? []) as $condition) {
+                if (is_array($condition) && is_array($condition['fields'] ?? null)) {
+                    $fields = array_merge($fields, $condition['fields']);
+                }
+            }
+            foreach ($fields as $field) {
+                if (!is_array($field) || empty($field['id'])) {
+                    continue;
+                }
+                $id = sanitize_key((string) $field['id']);
+                if ($id !== '' && !isset($maps[$mapKey][$id])) {
+                    $maps[$mapKey][$id] = $field;
+                }
+            }
+        }
+
+        return $cache[$tripId] = $maps;
+    }
+
+    /**
+     * An answer as the booking page shows it: a dropdown answer as its option
+     * label ("Spouse/Partner", not "spouse") and a country code as the country
+     * name ("Germany", not "DE"). Anything else — and any value the form no
+     * longer offers — is returned as stored.
+     *
+     * @param array<string, mixed>|null $field Field definition, when known.
+     * @param mixed                     $value Stored answer.
+     */
+    private static function displayValue(?array $field, string $fieldId, $value): string
+    {
+        $raw = self::scalarToPlain($value);
+        if ($raw === '' || !is_scalar($value)) {
+            return $raw;
+        }
+
+        $type = is_array($field) ? (string) ($field['type'] ?? '') : '';
+
+        if ($type === 'select' && is_array($field['options'] ?? null)) {
+            foreach ($field['options'] as $option) {
+                if (is_array($option) && isset($option['value']) && (string) $option['value'] === $raw) {
+                    $label = trim((string) ($option['label'] ?? ''));
+                    if ($label === '') {
+                        return $raw;
+                    }
+
+                    return function_exists('yatra_translate_form_string') ? yatra_translate_form_string($label) : $label;
+                }
+            }
+
+            return $raw;
+        }
+
+        $isCountry = $type === 'country'
+            || ($type === '' && in_array($fieldId, ['country', 'nationality'], true));
+        if ($isCountry && preg_match('/^[A-Za-z]{2}$/', $raw)) {
+            return FormatHelper::getCountryName($raw);
+        }
+
+        return $raw;
+    }
+
+    /**
+     * A field's label as the form shows it, or the humanised key when the
+     * field is no longer on the form.
+     *
+     * @param array<string, mixed>|null $field
+     */
+    private static function fieldLabel(?array $field, string $fieldId): string
+    {
+        $label = is_array($field) ? trim((string) ($field['label'] ?? '')) : '';
+        if ($label === '') {
+            return self::humanizeKey($fieldId);
+        }
+
+        return function_exists('yatra_translate_form_string') ? yatra_translate_form_string($label) : $label;
+    }
+
+    /**
+     * Expose the lead traveller's answers as {{lead_traveler_<field_id>}}.
+     *
+     * The traveller section is asked once per traveller, so a field there has
+     * as many values as there are people on the booking and cannot become a
+     * flat merge tag — {{traveler_custom_fields_html}} prints the lot instead.
+     * The lead traveller is the exception: there is exactly one, so each of
+     * their answers has a single unambiguous value.
+     *
+     * This matters most for a field the form builder marks "lead traveller
+     * only" (`applies_to: lead`). An operator can ask the lead a question no
+     * one else sees, and until now had no way to put the answer in an email
+     * except by printing the whole traveller block for everybody.
+     *
+     * Values come from the lead's stored answers, which is where the builder's
+     * own fields land — including first_name and last_name, since the traveller
+     * section carries its own name fields separate from the contact section.
+     *
+     * @param array<int, array<string, mixed>> $travellers Rows from TravellerRepository::getByBookingId().
+     * @return array<string, string>
+     */
+    private static function leadTravellerTags(array $travellers, array $fieldMap = []): array
+    {
+        if ($travellers === []) {
+            return [];
+        }
+
+        $lead = null;
+        foreach ($travellers as $row) {
+            if (!empty($row['is_lead'])) {
+                $lead = $row;
+                break;
+            }
+        }
+        // Older bookings may predate the is_lead flag; the first traveller is
+        // the lead by position, which is how the booking form collects them.
+        if ($lead === null) {
+            $lead = $travellers[0];
+        }
+
+        $fields = isset($lead['fields']) && is_array($lead['fields']) ? $lead['fields'] : [];
+        $tags = [];
+        foreach ($fields as $key => $value) {
+            $k = sanitize_key((string) $key);
+            // Leading underscore marks internal bookkeeping, as elsewhere here.
+            if ($k === '' || strpos((string) $key, '_') === 0) {
+                continue;
+            }
+            if (!is_scalar($value) && $value !== null) {
+                continue;
+            }
+            $tags['lead_traveler_' . $k] = self::displayValue($fieldMap[$k] ?? null, $k, $value);
+        }
+
+        return $tags;
+    }
+
+    /**
+     * Expose EVERY contact + emergency form field as a merge tag — DYNAMICALLY,
+     * so custom fields an operator adds to those forms are usable in emails
+     * automatically (e.g. {{emergency_name}}, {{contact_passport_no}}). Values
+     * come from the booking's contact_data / emergency_contact JSON, keyed by the
+     * field id with a `contact_` / `emergency_` prefix.
+     *
+     * @return array<string, string>
+     */
+    private static function contactAndEmergencyTags(object $booking, array $fieldMaps = []): array
+    {
+        $tags = [];
+        $contactFields = $fieldMaps['contact'] ?? [];
+        $emergencyFields = $fieldMaps['emergency'] ?? [];
+
+        // contact_data JSON → contact_<field_id> for every scalar field, shown
+        // the way the booking page shows it (option label, country name).
+        foreach (self::decodeJsonObject($booking->contact_data ?? null) as $key => $value) {
+            $k = sanitize_key((string) $key);
+            if ($k !== '' && is_scalar($value)) {
+                $tags['contact_' . $k] = self::displayValue($contactFields[$k] ?? null, $k, $value);
+            }
+        }
+        // Canonical booking column wins for country if present.
+        if (!empty($booking->contact_country)) {
+            $tags['contact_country'] = self::displayValue($contactFields['country'] ?? null, 'country', (string) $booking->contact_country);
+        }
+
+        // emergency_contact JSON → emergency_<field_id> for every scalar field.
+        foreach (self::decodeJsonObject($booking->emergency_contact ?? null) as $key => $value) {
+            $k = sanitize_key((string) $key);
+            if ($k !== '' && is_scalar($value)) {
+                $tags['emergency_' . $k] = self::displayValue($emergencyFields[$k] ?? null, $k, $value);
+            }
+        }
+
+        return $tags;
+    }
+
+    /**
+     * Decode a JSON object column into an associative array (empty on failure).
+     *
+     * @param mixed $raw
+     * @return array<string, mixed>
+     */
+    private static function decodeJsonObject($raw): array
+    {
+        if (empty($raw)) {
+            return [];
+        }
+        if (is_array($raw)) {
+            return $raw;
+        }
+        // Canonical storage is JSON, but tolerate legacy PHP-serialized values
+        // from very old bookings too — matching BookingService::formatBookingWithDetails
+        // and CustomerService — so {{contact_*}} / {{emergency_*}} merge tags
+        // resolve for those rows instead of silently rendering empty.
+        $value = maybe_unserialize($raw);
+        if (is_array($value)) {
+            return $value;
+        }
+        $decoded = json_decode((string) $value, true);
+
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public static function emptyTags(): array
+    {
+        return [
+            'payment_gateway' => '',
+            'payment_gateway_label' => '',
+            'payment_schedule' => '',
+            'payment_schedule_label' => '',
+            'travelers_list' => '',
+            'travelers_list_html' => '',
+            'traveler_custom_fields_html' => '',
+            'booking_custom_fields_html' => '',
+            'special_requests' => '',
+            'special_requests_html' => '',
+            'contact_country' => '',
+            'contact_address' => '',
+            'contact_nationality' => '',
+            'emergency_name' => '',
+            'emergency_phone' => '',
+            'emergency_relationship' => '',
+        ];
+    }
+
+    private static function gatewayLabel(string $slug): string
+    {
+        if ($slug === '') {
+            return '';
+        }
+
+        $gw = PaymentGatewayRegistry::getInstance()->get($slug);
+        if ($gw !== null) {
+            return (string) $gw->getTitle();
+        }
+
+        return self::humanizeKey($slug);
+    }
+
+    private static function paymentScheduleLabel(string $raw): string
+    {
+        $raw = strtolower($raw);
+        switch ($raw) {
+            case 'deposit':
+                return __('Deposit (balance due later)', 'yatra');
+            case 'partial':
+                return __('Partial payment', 'yatra');
+            case 'full':
+                return __('Full payment', 'yatra');
+            default:
+                return $raw !== '' ? self::humanizeKey($raw) : '';
+        }
+    }
+
+    /**
+     * @param list<array<string, mixed>> $travellers
+     */
+    private static function buildTravelersPlainList(array $travellers): string
+    {
+        if ($travellers === []) {
+            return '';
+        }
+
+        $lines = [];
+        $i = 0;
+        foreach ($travellers as $row) {
+            ++$i;
+            $fields = isset($row['fields']) && is_array($row['fields']) ? $row['fields'] : [];
+            $name = self::travelerDisplayName($fields);
+            $lead = !empty($row['is_lead']);
+            $suffix = $lead ? ' (' . __('Lead', 'yatra') . ')' : '';
+            $lines[] = sprintf('%d. %s%s', $i, $name, $suffix);
+        }
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * @param list<array<string, mixed>> $travellers
+     */
+    private static function buildTravelersListHtml(array $travellers): string
+    {
+        if ($travellers === []) {
+            return '';
+        }
+
+        $items = [];
+        $i = 0;
+        foreach ($travellers as $row) {
+            ++$i;
+            $fields = isset($row['fields']) && is_array($row['fields']) ? $row['fields'] : [];
+            $name = esc_html(self::travelerDisplayName($fields));
+            $lead = !empty($row['is_lead']);
+            $badge = $lead ? ' <span style="color:#64748b;font-size:12px;">(' . esc_html__('Lead', 'yatra') . ')</span>' : '';
+            $items[] = '<li style="margin:4px 0;">' . $name . $badge . '</li>';
+        }
+
+        return '<ul style="margin:8px 0;padding-left:20px;">' . implode('', $items) . '</ul>';
+    }
+
+    /**
+     * Dynamic / non-core traveler meta only (excludes common identity fields duplicated on the booking contact).
+     *
+     * @param list<array<string, mixed>> $travellers
+     */
+    private static function buildTravelerCustomFieldsHtml(array $travellers, array $fieldMap = []): string
+    {
+        if ($travellers === []) {
+            return '';
+        }
+
+        /** @var array<int, string> $skip */
+        $skip = apply_filters(
+            'yatra_booking_email_traveler_identity_field_keys',
+            ['first_name', 'last_name', 'email', 'phone', 'country']
+        );
+        $skip = array_fill_keys(array_map('strval', $skip), true);
+
+        $blocks = [];
+        $i = 0;
+        foreach ($travellers as $row) {
+            ++$i;
+            $fields = isset($row['fields']) && is_array($row['fields']) ? $row['fields'] : [];
+            $rows = [];
+            foreach ($fields as $key => $value) {
+                $k = (string) $key;
+                if ($k === '' || (strpos($k, '_') === 0)) {
+                    continue;
+                }
+                if (isset($skip[$k])) {
+                    continue;
+                }
+                $plain = self::scalarToPlain($value);
+                if ($plain === '') {
+                    continue;
+                }
+                $field = $fieldMap[sanitize_key($k)] ?? null;
+                $label = esc_html(self::fieldLabel($field, $k));
+                $display = self::displayValue($field, sanitize_key($k), $value);
+                $val = is_scalar($value) && $display !== $plain
+                    ? esc_html($display)
+                    : self::scalarToHtml($value);
+                $rows[] = '<tr><td style="padding:4px 12px 4px 0;vertical-align:top;color:#64748b;width:40%;">'
+                    . $label
+                    . '</td><td style="padding:4px 0;vertical-align:top;">'
+                    . $val
+                    . '</td></tr>';
+            }
+            if ($rows === []) {
+                continue;
+            }
+
+            $title = sprintf(
+                /* translators: %1$d: traveler index, %2$s: traveler display name */
+                __('Traveler %1$d — %2$s', 'yatra'),
+                $i,
+                self::travelerDisplayName($fields)
+            );
+            $blocks[] = '<div style="margin:12px 0 0;">'
+                . '<p style="margin:0 0 6px;font-weight:600;">' . esc_html($title) . '</p>'
+                . '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">'
+                . implode('', $rows)
+                . '</table></div>';
+        }
+
+        return implode('', $blocks);
+    }
+
+    /**
+     * Booking-level JSON meta (excluding internal keys) + additional services snapshot when present.
+     */
+    private static function buildBookingCustomFieldsHtml(object $booking): string
+    {
+        $parts = [];
+
+        $snapshotSection = self::formatAdditionalServicesSnapshot(self::decodeBookingMeta($booking));
+        if ($snapshotSection !== '') {
+            $parts[] = $snapshotSection;
+        }
+
+        $meta = self::decodeBookingMeta($booking);
+        foreach ($meta as $key => $value) {
+            $k = (string) $key;
+            if (self::isInternalBookingMetaKey($k)) {
+                continue;
+            }
+            $plain = self::scalarToPlain($value);
+            if ($plain === '') {
+                continue;
+            }
+            $label = esc_html(self::humanizeKey($k));
+            $val = self::scalarToHtml($value);
+            $parts[] = '<div style="margin:8px 0 0;">'
+                . '<span style="color:#64748b;">' . $label . ':</span> '
+                . $val
+                . '</div>';
+        }
+
+        return implode('', $parts);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function decodeBookingMeta(object $booking): array
+    {
+        $raw = $booking->meta ?? null;
+        if ($raw === null || $raw === '') {
+            return [];
+        }
+        if (is_array($raw)) {
+            return $raw;
+        }
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+
+            return is_array($decoded) ? $decoded : [];
+        }
+
+        return [];
+    }
+
+    private static function isInternalBookingMetaKey(string $k): bool
+    {
+        if ($k === '' || strpos($k, '_') === 0) {
+            return true;
+        }
+
+        return in_array($k, [
+            'additional_services',
+            'additional_services_updated_at',
+            'additional_services_snapshot',
+        ], true);
+    }
+
+    /**
+     * @param array<string, mixed> $meta
+     */
+    private static function formatAdditionalServicesSnapshot(array $meta): string
+    {
+        $snap = $meta['additional_services_snapshot'] ?? null;
+        if (!is_array($snap) || $snap === []) {
+            return '';
+        }
+
+        $items = [];
+        foreach ($snap as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $name = trim((string) ($row['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $price = isset($row['price']) ? (float) $row['price'] : 0.0;
+            $currency = SettingsService::getCurrency();
+            $priceBit = $price > 0 ? ' — ' . esc_html(yatra_format_price($price, $currency)) : '';
+            $items[] = '<li style="margin:4px 0;">' . esc_html($name) . $priceBit . '</li>';
+        }
+
+        if ($items === []) {
+            return '';
+        }
+
+        $heading = esc_html__('Additional services', 'yatra');
+
+        return '<div style="margin:12px 0 0;">'
+            . '<p style="margin:0 0 6px;font-weight:600;">' . $heading . '</p>'
+            . '<ul style="margin:0;padding-left:20px;">' . implode('', $items) . '</ul>'
+            . '</div>';
+    }
+
+    /**
+     * @param array<string, mixed> $fields
+     */
+    private static function travelerDisplayName(array $fields): string
+    {
+        $fn = trim((string) ($fields['first_name'] ?? ''));
+        $ln = trim((string) ($fields['last_name'] ?? ''));
+        $combined = trim($fn . ' ' . $ln);
+        if ($combined !== '') {
+            return $combined;
+        }
+        if (!empty($fields['full_name'])) {
+            return trim((string) $fields['full_name']);
+        }
+
+        return __('Traveler', 'yatra');
+    }
+
+    private static function humanizeKey(string $key): string
+    {
+        $key = str_replace(['-', '.'], '_', $key);
+
+        return ucwords(str_replace('_', ' ', $key));
+    }
+
+    /**
+     * @param mixed $value
+     */
+    private static function scalarToPlain($value): string
+    {
+        if ($value === null || $value === '') {
+            return '';
+        }
+        if (is_scalar($value)) {
+            return trim((string) $value);
+        }
+        if (is_array($value)) {
+            $enc = wp_json_encode($value);
+
+            return $enc !== false ? $enc : '';
+        }
+
+        return '';
+    }
+
+    /**
+     * @param mixed $value
+     */
+    private static function scalarToHtml($value): string
+    {
+        if ($value === null || $value === '') {
+            return '';
+        }
+        if (is_bool($value)) {
+            return $value ? esc_html__('Yes', 'yatra') : esc_html__('No', 'yatra');
+        }
+        if (is_scalar($value)) {
+            return nl2br(esc_html(trim((string) $value)));
+        }
+        if (is_array($value)) {
+            if ($value === []) {
+                return '';
+            }
+            $allScalar = true;
+            foreach ($value as $v) {
+                if (!is_scalar($v) && $v !== null) {
+                    $allScalar = false;
+                    break;
+                }
+            }
+            if ($allScalar) {
+                $lis = [];
+                foreach ($value as $k => $v) {
+                    if (is_int($k)) {
+                        $lis[] = '<li style="margin:2px 0;">' . nl2br(esc_html(trim((string) $v))) . '</li>';
+                    } else {
+                        $lis[] = '<li style="margin:2px 0;"><strong>' . esc_html(self::humanizeKey((string) $k))
+                            . ':</strong> ' . nl2br(esc_html(trim((string) $v))) . '</li>';
+                    }
+                }
+
+                return '<ul style="margin:4px 0;padding-left:18px;">' . implode('', $lis) . '</ul>';
+            }
+            $json = wp_json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+
+            return '<pre style="margin:6px 0;padding:8px;background:#f8fafc;border-radius:6px;font-size:12px;white-space:pre-wrap;">'
+                . esc_html($json !== false ? $json : '')
+                . '</pre>';
+        }
+
+        return '';
+    }
+}

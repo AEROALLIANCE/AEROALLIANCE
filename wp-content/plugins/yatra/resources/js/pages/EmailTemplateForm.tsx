@@ -1,0 +1,1993 @@
+import React, { useState, useEffect, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { __, sprintf } from "../lib/i18n";
+import { MultiSelect } from "../components/ui/multi-select";
+import { SearchableSelect } from "../components/ui/searchable-select";
+import { encodeTargets, useTripTargets } from "../hooks/useTripTargets";
+import {
+  describeEmailTargets,
+  hasEmailTargets,
+  paymentMethodOptions,
+  withPaymentMethods,
+  withTripValues,
+  type EmailOverrideTargets,
+} from "../lib/email-override-targets";
+import { EmailOverrideCreateModal } from "../components/email/EmailOverrideCreateModal";
+import {
+  fetchEmailTemplates,
+  resolveEmailTemplatesForTrip,
+} from "../api/email-automation-api";
+import { useToast } from "../components/ui/toast";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import { Badge } from "../components/ui/badge";
+import {
+  Mail,
+  ArrowLeft,
+  Save,
+  Eye,
+  Send,
+  Loader2,
+  Code,
+  Copy,
+  Check,
+  Info,
+  Zap,
+  ChevronDown,
+  Sparkles,
+} from "lucide-react";
+import { AiEmailTemplateModal } from "../components/ai/AiEmailTemplateModal";
+import { isAiEligible, isAiModuleEnabled } from "../lib/ai-availability";
+import { Switch } from "../components/ui/switch";
+import {
+  EMAIL_TEMPLATES_CATALOG,
+  getCatalogEntryByTemplateKey,
+  getCoreTemplateDefinition,
+  isCoreTemplateSlug,
+} from "../lib/email-templates-catalog";
+import {
+  isEmailAutomationModuleEnabled,
+  isModuleActive,
+  isProPluginActive,
+} from "../lib/plugin-utils";
+import {
+  fetchSettings,
+  previewCoreEmailTemplate,
+  saveSettings,
+} from "../api/settings-api";
+import { EmailPreviewModal } from "../components/email/EmailPreviewModal";
+import {
+  createEmailTemplate,
+  fetchEmailTemplate,
+  fetchEmailTemplateEvents,
+  fetchEmailTemplateVariables,
+  previewEmailTemplate,
+  sendEmailTemplateTest,
+  updateEmailTemplate,
+} from "../api/email-automation-api";
+
+interface PreviewData {
+  subject: string;
+  body: string;
+}
+
+const EmailTemplateForm: React.FC = () => {
+  const { id, isCreateMode, coreTemplateSlug, coreReadOnlyParam } =
+    useMemo(() => {
+      const params = new URLSearchParams(window.location.search);
+      const templateId = params.get("id");
+      const action = params.get("action");
+      const core = params.get("core_template") || "";
+      return {
+        id: templateId,
+        isCreateMode: action === "create",
+        coreTemplateSlug: core,
+        coreReadOnlyParam: params.get("readonly") === "1",
+      };
+    }, []);
+
+  const isCoreSettingsEdit = isCoreTemplateSlug(coreTemplateSlug);
+  // Per-template BCC/CC settings keys are derived from the template's subject
+  // key (email_tpl_booking_subject -> _bcc / _cc), exactly as the PHP side does,
+  // so the catalog needs no extra entries and a new template type is covered
+  // automatically.
+  const coreAddressKey = (
+    subjectKey: string | undefined,
+    suffix: "bcc" | "cc",
+  ): string | null =>
+    subjectKey ? subjectKey.replace(/_subject$/, "") + "_" + suffix : null;
+
+  const coreDef = isCoreSettingsEdit
+    ? getCoreTemplateDefinition(coreTemplateSlug)
+    : undefined;
+
+  const catalogEntryForCore = useMemo(
+    () =>
+      coreTemplateSlug
+        ? getCatalogEntryByTemplateKey(coreTemplateSlug)
+        : undefined,
+    [coreTemplateSlug],
+  );
+
+  /** URL ?readonly=1 — no edits at all from this screen */
+  const isCoreStrictViewOnly = isCoreSettingsEdit && Boolean(coreReadOnlyParam);
+
+  /** Module required but inactive: subject/body/save locked; on/off can still be changed (site setting). */
+  const isCoreModuleBodyLocked = useMemo(() => {
+    if (!isCoreSettingsEdit || isCoreStrictViewOnly) {
+      return false;
+    }
+    const req = catalogEntryForCore?.requiresModule;
+    if (!req) {
+      return false;
+    }
+    return !isProPluginActive() || !isModuleActive(req);
+  }, [isCoreSettingsEdit, isCoreStrictViewOnly, catalogEntryForCore]);
+
+  /** Subject/body (and merge-tag insert) read-only; strict URL also locks status. */
+  const isCoreBodyReadOnly = isCoreStrictViewOnly || isCoreModuleBodyLocked;
+
+  const isCoreViewMode = isCoreStrictViewOnly || isCoreModuleBodyLocked;
+
+  const goBack = () => {
+    window.location.href = `admin.php?page=yatra&subpage=email-automation&tab=templates`;
+  };
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+
+  const [formData, setFormData] = useState({
+    name: "",
+    description: "",
+    from_name: "",
+    from_email: "",
+    to_email: "",
+    reply_to: "",
+    bcc: "",
+    cc: "",
+    category: "booking",
+    subject: "",
+    body: "",
+    event_key: "",
+    is_active: true,
+  });
+  // Trip-specific overrides (Pro Email Automation). `targets` is only sent
+  // for override rows; `previewTrip` feeds preview / test with a real trip.
+  const [targets, setTargets] = useState<EmailOverrideTargets>({});
+  const methodOptions = useMemo(() => paymentMethodOptions(), []);
+  const [previewTrip, setPreviewTrip] = useState<number | null>(null);
+  const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [previewData, setPreviewData] = useState<PreviewData | null>(null);
+  const [testEmail, setTestEmail] = useState("");
+  const [copiedVar, setCopiedVar] = useState<string | null>(null);
+  const [showEventDropdown, setShowEventDropdown] = useState(false);
+  const [showAiModal, setShowAiModal] = useState(false);
+
+  useEffect(() => {
+    if (isCreateMode && !isEmailAutomationModuleEnabled()) {
+      window.location.href =
+        "admin.php?page=yatra&subpage=email-automation&tab=templates";
+    }
+  }, [isCreateMode]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("action") !== "edit") return;
+    const ct = params.get("core_template");
+    if (ct && !isCoreTemplateSlug(ct)) {
+      window.location.href =
+        "admin.php?page=yatra&subpage=email-automation&tab=templates";
+    }
+  }, []);
+
+  const { data: settings, isLoading: settingsLoading } = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => fetchSettings(),
+    enabled: isCoreSettingsEdit,
+  });
+
+  const { data: templateData, isLoading } = useQuery({
+    queryKey: ["email-template", id],
+    queryFn: () => fetchEmailTemplate(id as string),
+    enabled: Boolean(id) && !isCoreSettingsEdit,
+  });
+
+  // System templates own their trigger event; everything else may choose one.
+  const isSystemTemplate = Boolean((templateData as any)?.is_system);
+  const overridesSupported =
+    !isCoreSettingsEdit &&
+    !!(window as any).yatraAdmin?.emailTemplateOverridesEnabled;
+  const overrideOf = String((templateData as any)?.overrides ?? "");
+  const isOverride = overridesSupported && overrideOf !== "";
+  const isOverridableGlobal =
+    overridesSupported &&
+    !isOverride &&
+    Boolean((templateData as any)?.overridable);
+  // Global list (for the override's parent name, the global's override strip
+  // and the picker labels). Cached with the Templates tab.
+  const { data: allTemplatesData } = useQuery({
+    queryKey: ["email-templates"],
+    queryFn: () => fetchEmailTemplates(),
+    // Also read without override support: it says whether this template is sent.
+    // Core-template edits have no Pro list to read (the endpoint isn't there).
+    enabled: !isCreateMode && !isCoreSettingsEdit,
+  });
+  const allTemplates = useMemo(
+    () => (Array.isArray(allTemplatesData) ? (allTemplatesData as any[]) : []),
+    [allTemplatesData],
+  );
+  const parentTemplate = useMemo(
+    () => allTemplates.find((t) => t.template_key === overrideOf) || null,
+    [allTemplates, overrideOf],
+  );
+  // An older template for the same email (e.g. "New Booking Confirmation")
+  // isn't sent while its replacement is on, so edits to it never reach anyone.
+  // The list marks it, but this screen said nothing and saved without warning.
+  const replacedBy = useMemo(() => {
+    const self = allTemplates.find(
+      (t) => String(t.id) === String((templateData as any)?.id ?? ""),
+    );
+    if (!self || self.in_use !== false || !self.superseded_by) {
+      return null;
+    }
+    // Only say customers get the other one when it is actually switched on.
+    const current = allTemplates.find(
+      (t) => t.template_key === self.superseded_by,
+    );
+    const on =
+      current &&
+      (current.is_active === true || String(current.is_active) === "1");
+    return on ? current : null;
+  }, [allTemplates, templateData]);
+  const myOverrides = useMemo(
+    () =>
+      allTemplates
+        .filter(
+          (t) =>
+            t.overrides && t.overrides === (templateData as any)?.template_key,
+        )
+        .sort((a, b) => (a.priority || 0) - (b.priority || 0)),
+    [allTemplates, templateData],
+  );
+  const { options: tripTargetOptions } = useTripTargets(
+    overridesSupported && (isOverride || isOverridableGlobal),
+  );
+  const tripOptions = useMemo(
+    () =>
+      tripTargetOptions
+        .filter((o) => String(o.value).startsWith("trip:"))
+        .map((o) => ({
+          id: Number(String(o.value).slice(5)),
+          label: o.label.replace(/^[^:]+: /, ""),
+        })),
+    [tripTargetOptions],
+  );
+  // "Check a trip": which template the chosen trip would actually get.
+  const { data: tripResolution } = useQuery({
+    queryKey: ["email-templates-resolve", previewTrip],
+    queryFn: () => resolveEmailTemplatesForTrip(previewTrip as number),
+    enabled:
+      overridesSupported &&
+      !!previewTrip &&
+      (isOverride || isOverridableGlobal),
+  });
+
+  // Event-scoped variables: the sidebar re-fetches whenever the
+  // operator switches the trigger event so the "Available
+  // Variables" panel reflects only tags that will actually
+  // resolve at send-time for the chosen event. Empty event_key
+  // returns the full union (for the create-template starter
+  // state before they've picked an event).
+  const { data: variablesData } = useQuery({
+    queryKey: ["email-variables", formData.event_key || ""],
+    queryFn: () => fetchEmailTemplateVariables(formData.event_key || ""),
+    enabled: !isCoreSettingsEdit && isEmailAutomationModuleEnabled(),
+  });
+
+  // Trigger events. Fetch them live rather than trusting only the one-time
+  // window.yatraAdmin.emailEvents localize snapshot: that snapshot is written
+  // by the Pro module at PHP render time, but the module-enabled flag is
+  // refreshed client-side (useModules), so the two can diverge — the form
+  // opens (flag says enabled) while emailEvents is still empty, leaving the
+  // dropdown with "No Event to select". The live fetch corrects that; the
+  // localize snapshot is used as an instant fallback while it loads.
+  const { data: fetchedEvents } = useQuery({
+    queryKey: ["email-template-events"],
+    queryFn: fetchEmailTemplateEvents,
+    enabled: !isCoreSettingsEdit && isEmailAutomationModuleEnabled(),
+  });
+  // Resolve the trigger-event list from the first non-empty source. Both the
+  // live fetch AND the window.yatraAdmin.emailEvents localize are gated on the
+  // Pro Email Automation module actively delivering data (route + localize both
+  // only run when the module is enabled and the client flag agrees), so if the
+  // module gate isn't delivering — disabled, or a client/server flag drift —
+  // both are empty and the dropdown ended up unselectable. Fall back to the
+  // module-INDEPENDENT catalog (same source the templates list uses) so an event
+  // can always be chosen. `??` alone won't do — [] is not nullish.
+  const events = useMemo(() => {
+    if (Array.isArray(fetchedEvents) && fetchedEvents.length > 0) {
+      return fetchedEvents;
+    }
+    const localized = (window as any).yatraAdmin?.emailEvents;
+    if (Array.isArray(localized) && localized.length > 0) {
+      return localized;
+    }
+    // Derive a readable name from the event key (e.g. "booking.created" →
+    // "Booking Created") since the catalog keys events, not names.
+    const prettify = (key: string) =>
+      key.replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    return [
+      ...new Set(
+        EMAIL_TEMPLATES_CATALOG.map((e) => e.event_key).filter(Boolean),
+      ),
+    ].map((key) => ({ key, name: prettify(key) }));
+  }, [fetchedEvents]);
+
+  useEffect(() => {
+    if (!templateData || typeof templateData !== "object") return;
+    const t = templateData as Record<string, unknown>;
+    setFormData({
+      name: String(t.name ?? ""),
+      description: String(t.description ?? ""),
+      from_name: String(t.from_name ?? ""),
+      from_email: String(t.from_email ?? ""),
+      to_email: String(t.to_email ?? ""),
+      reply_to: String(t.reply_to ?? ""),
+      bcc: String(t.bcc ?? ""),
+      cc: String(t.cc ?? ""),
+      category: String(t.category ?? "booking"),
+      subject: String(t.subject ?? ""),
+      body: String(t.body ?? ""),
+      // An override's own event_key is stored empty; show (and fetch
+      // variables for) the global template's event instead.
+      event_key: String(t.effective_event_key || t.event_key || ""),
+      is_active: Boolean(t.is_active ?? true),
+    });
+    setTargets(
+      t.overrides && t.targets && typeof t.targets === "object"
+        ? (t.targets as EmailOverrideTargets)
+        : {},
+    );
+  }, [templateData]);
+
+  useEffect(() => {
+    if (!isCoreSettingsEdit || !settings || !coreDef) return;
+    const flag = coreDef.settingsFlag;
+    const subj = coreDef.settingsSubject;
+    const bodyKey = coreDef.settingsBody;
+    if (!flag || !subj || !bodyKey) return;
+    const s = settings as Record<string, unknown>;
+    setFormData({
+      name: coreDef.name,
+      description: coreDef.description,
+      from_name: "",
+      from_email: "",
+      to_email: coreDef.to_email || "",
+      reply_to: "",
+      bcc: String(s[coreAddressKey(subj, "bcc") ?? ""] ?? ""),
+      cc: String(s[coreAddressKey(subj, "cc") ?? ""] ?? ""),
+      category: String(coreDef.category ?? "booking"),
+      subject: String(s[subj] ?? ""),
+      body: String(s[bodyKey] ?? ""),
+      event_key: coreDef.event_key,
+      is_active: Boolean(s[flag]),
+    });
+  }, [isCoreSettingsEdit, settings, coreDef]);
+
+  const saveMutation = useMutation({
+    mutationFn: async (data: typeof formData) => {
+      if (isCreateMode) {
+        const response = await createEmailTemplate(data);
+        const r = response as {
+          success?: boolean;
+          message?: string;
+          data?: { id?: string | number };
+        };
+        if (r && r.success === false) {
+          throw new Error(r.message || __("Failed to create template"));
+        }
+        return response;
+      }
+      return await updateEmailTemplate(id as string, data);
+    },
+    onSuccess: (response) => {
+      queryClient.invalidateQueries({ queryKey: ["email-templates"] });
+      if (isCreateMode) {
+        showToast(__("Template created successfully"), "success");
+        // Redirect to edit page after creation - response.data contains the template
+        const newId = (response as { data?: { id?: string | number } })?.data
+          ?.id;
+        if (newId) {
+          window.location.href = `admin.php?page=yatra&subpage=email-automation&tab=template&action=edit&id=${newId}`;
+        } else {
+          // Fallback to list page
+          window.location.href =
+            "admin.php?page=yatra&subpage=email-automation&tab=templates";
+        }
+      } else {
+        queryClient.invalidateQueries({ queryKey: ["email-template", id] });
+        showToast(__("Template saved successfully"), "success");
+      }
+    },
+    onError: (error: any) => {
+      const message =
+        error?.message ||
+        (isCreateMode
+          ? __("Failed to create template")
+          : __("Failed to save template"));
+      showToast(message, "error");
+    },
+  });
+
+  const saveCoreMutation = useMutation({
+    mutationFn: async () => {
+      if (isCoreStrictViewOnly) {
+        throw new Error(__("This template is view-only.", "yatra"));
+      }
+      if (
+        !coreDef?.settingsFlag ||
+        !coreDef.settingsSubject ||
+        !coreDef.settingsBody
+      ) {
+        throw new Error(__("Invalid template", "yatra"));
+      }
+      if (!settings) {
+        throw new Error(__("Settings not loaded", "yatra"));
+      }
+      const base = { ...(settings as Record<string, unknown>) };
+      if (isCoreModuleBodyLocked) {
+        base[coreDef.settingsFlag] = formData.is_active;
+        await saveSettings(base);
+        return base;
+      }
+      base[coreDef.settingsSubject] = formData.subject;
+      base[coreDef.settingsBody] = formData.body;
+      base[coreDef.settingsFlag] = formData.is_active;
+
+      const bccKey = coreAddressKey(coreDef.settingsSubject, "bcc");
+      const ccKey = coreAddressKey(coreDef.settingsSubject, "cc");
+      if (bccKey) base[bccKey] = formData.bcc;
+      if (ccKey) base[ccKey] = formData.cc;
+      await saveSettings(base);
+      return base;
+    },
+    onSuccess: (saved) => {
+      queryClient.setQueryData(["settings"], saved);
+      showToast(__("Template saved", "yatra"), "success");
+    },
+    onError: (error: unknown) => {
+      const message =
+        error instanceof Error ? error.message : __("Failed to save", "yatra");
+      showToast(message, "error");
+    },
+  });
+
+  const previewMutation = useMutation({
+    mutationFn: async () => {
+      return previewEmailTemplate(id as string, previewTrip);
+    },
+    onSuccess: (data) => {
+      setPreviewData(data);
+      setShowPreview(true);
+    },
+    onError: () => {
+      showToast(__("Failed to load preview"), "error");
+    },
+  });
+
+  const corePreviewMutation = useMutation({
+    mutationFn: async () => {
+      if (!coreTemplateSlug) {
+        throw new Error(__("Invalid template", "yatra"));
+      }
+      return previewCoreEmailTemplate({
+        template_key: coreTemplateSlug,
+        subject: formData.subject,
+        body: formData.body,
+      });
+    },
+    onSuccess: (data) => {
+      setPreviewData(data);
+      setShowPreview(true);
+    },
+    onError: (error: unknown) => {
+      const message =
+        error instanceof Error ? error.message : __("Preview failed", "yatra");
+      showToast(message, "error");
+    },
+  });
+
+  const testMutation = useMutation({
+    mutationFn: async (email: string) => {
+      return sendEmailTemplateTest(id as string, email, previewTrip);
+    },
+    onSuccess: () => {
+      showToast(__("Test email sent successfully"), "success");
+      setTestEmail("");
+    },
+    onError: () => {
+      showToast(__("Failed to send test email"), "error");
+    },
+  });
+
+  const handleSubmit = (e?: React.FormEvent | React.MouseEvent) => {
+    if (e) e.preventDefault();
+
+    if (isCoreSettingsEdit) {
+      if (isCoreStrictViewOnly) {
+        return;
+      }
+      saveCoreMutation.mutate();
+      return;
+    }
+
+    if (!formData.name.trim()) {
+      showToast(__("Template name is required"), "error");
+      return;
+    }
+    if (!formData.subject.trim()) {
+      showToast(__("Subject line is required"), "error");
+      return;
+    }
+    if (isOverride && !hasEmailTargets(targets)) {
+      showToast(
+        methodOptions
+          ? __(
+              "An override needs at least one trip, category, trip type or payment method — or delete it to use the global template.",
+              "yatra",
+            )
+          : __(
+              "An override needs at least one trip, category or trip type — or delete it to use the global template.",
+              "yatra",
+            ),
+        "error",
+      );
+      return;
+    }
+
+    saveMutation.mutate(
+      isOverride
+        ? // event_key is not sent: an override always fires on its global's event.
+          ({
+            ...formData,
+            event_key: undefined,
+            targets,
+          } as unknown as typeof formData)
+        : formData,
+    );
+  };
+
+  const copyVariable = (variable: string) => {
+    const text = `{{${variable}}}`;
+
+    const markCopied = () => {
+      setCopiedVar(variable);
+      setTimeout(() => setCopiedVar(null), 2000);
+    };
+
+    // Legacy fallback: navigator.clipboard is only defined in a secure context
+    // (HTTPS or localhost). On a plain-HTTP wp-admin it is undefined, so the
+    // previous call threw and nothing was copied. execCommand("copy") works
+    // there via a temporary off-screen textarea.
+    const legacyCopy = (): boolean => {
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.setAttribute("readonly", "");
+        el.style.position = "fixed";
+        el.style.top = "-9999px";
+        document.body.appendChild(el);
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(markCopied, () => {
+        if (legacyCopy()) {
+          markCopied();
+        }
+      });
+    } else if (legacyCopy()) {
+      markCopied();
+    }
+  };
+
+  const insertVariable = (variable: string) => {
+    if (isCoreBodyReadOnly) {
+      return;
+    }
+    const textarea = document.getElementById(
+      "email-body",
+    ) as HTMLTextAreaElement;
+    if (textarea) {
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const text = formData.body;
+      const newText =
+        text.substring(0, start) + `{{${variable}}}` + text.substring(end);
+      setFormData({ ...formData, body: newText });
+    }
+  };
+
+  const showEditSkeleton =
+    !isCreateMode && (isCoreSettingsEdit ? settingsLoading : isLoading);
+
+  if (showEditSkeleton) {
+    return (
+      <div className="space-y-6">
+        {/* Header Skeleton */}
+        <div className="flex items-center justify-between animate-pulse">
+          <div className="flex items-center gap-4">
+            <div className="h-10 w-20 bg-gray-200 dark:bg-gray-700 rounded"></div>
+            <div>
+              <div className="h-8 w-56 bg-gray-200 dark:bg-gray-700 rounded mb-2"></div>
+              <div className="h-4 w-40 bg-gray-200 dark:bg-gray-700 rounded"></div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="h-10 w-24 bg-gray-200 dark:bg-gray-700 rounded"></div>
+            <div className="h-10 w-32 bg-gray-200 dark:bg-gray-700 rounded"></div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Main Form Skeleton */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Template Details Card */}
+            <Card>
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <div className="h-6 w-36 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-6 w-20 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <div className="h-4 w-28 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-10 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+                <div className="space-y-2">
+                  <div className="h-4 w-24 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-10 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+                <div className="space-y-2">
+                  <div className="h-4 w-20 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-10 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+                <div className="space-y-2">
+                  <div className="h-4 w-32 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-64 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Test Email Card */}
+            <Card>
+              <CardHeader>
+                <div className="h-6 w-32 bg-gray-200 dark:bg-gray-700 rounded"></div>
+              </CardHeader>
+              <CardContent>
+                <div className="flex gap-3">
+                  <div className="h-10 flex-1 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  <div className="h-10 w-10 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Sidebar Skeleton */}
+          <div className="space-y-6">
+            {/* Variables Card */}
+            <Card>
+              <CardHeader>
+                <div className="h-6 w-36 bg-gray-200 dark:bg-gray-700 rounded"></div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="h-4 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>
+                {[1, 2, 3].map((group) => (
+                  <div key={group} className="space-y-2">
+                    <div className="h-3 w-20 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                    {[1, 2, 3].map((item) => (
+                      <div
+                        key={item}
+                        className="h-12 w-full bg-gray-200 dark:bg-gray-700 rounded"
+                      ></div>
+                    ))}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+
+            {/* Template Info Card */}
+            <Card>
+              <CardHeader>
+                <div className="h-6 w-28 bg-gray-200 dark:bg-gray-700 rounded"></div>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="flex justify-between">
+                    <div className="h-4 w-16 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                    <div className="h-4 w-24 bg-gray-200 dark:bg-gray-700 rounded"></div>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <Button variant="ghost" onClick={() => goBack()}>
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            {__("Back")}
+          </Button>
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
+              <Mail className="w-6 h-6 text-blue-500" />
+              {isCreateMode
+                ? __("Create Email Template")
+                : isCoreViewMode
+                  ? __("View email template", "yatra")
+                  : __("Edit Email Template")}
+            </h1>
+            <p className="text-gray-500 dark:text-gray-400 mt-1">
+              {isCreateMode
+                ? __("Create a new custom email template")
+                : isCoreSettingsEdit
+                  ? isCoreViewMode
+                    ? __(
+                        "This template uses site settings. Enable Yatra Pro and the required module to edit subject and HTML body.",
+                        "yatra",
+                      )
+                    : __(
+                        "Core customer email (saved with site settings). From address is set under Email → Delivery.",
+                        "yatra",
+                      )
+                  : String(templateData?.name ?? "")}
+              {isOverride && (
+                <span className="ml-2 inline-flex items-center gap-1 text-xs align-middle">
+                  <span className="px-1.5 py-0.5 rounded font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
+                    {__("Override", "yatra")}
+                  </span>
+                  <span className="text-gray-400">
+                    {__("of global template", "yatra")}
+                  </span>
+                  {parentTemplate ? (
+                    <a
+                      href={`admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&id=${parentTemplate.id}`}
+                      className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
+                    >
+                      {parentTemplate.name}
+                    </a>
+                  ) : (
+                    <span>{overrideOf}</span>
+                  )}
+                </span>
+              )}
+              {isOverridableGlobal && (
+                <span className="ml-2 px-1.5 py-0.5 rounded text-xs font-medium align-middle bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300">
+                  {__("Global", "yatra")}
+                </span>
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {!isCreateMode && (
+            <Button
+              variant="outline"
+              onClick={() =>
+                isCoreSettingsEdit
+                  ? corePreviewMutation.mutate()
+                  : previewMutation.mutate()
+              }
+              disabled={
+                previewMutation.isPending || corePreviewMutation.isPending
+              }
+            >
+              {previewMutation.isPending || corePreviewMutation.isPending ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <Eye className="w-4 h-4 mr-2" />
+              )}
+              {__("Preview")}
+            </Button>
+          )}
+          <Button
+            onClick={handleSubmit}
+            disabled={
+              saveMutation.isPending ||
+              saveCoreMutation.isPending ||
+              isCoreStrictViewOnly
+            }
+            className="bg-blue-600 hover:bg-blue-700 text-white"
+          >
+            {saveMutation.isPending || saveCoreMutation.isPending ? (
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+            ) : (
+              <Save className="w-4 h-4 mr-2" />
+            )}
+            {isCreateMode ? __("Create Template") : __("Save Template")}
+          </Button>
+        </div>
+      </div>
+
+      {isCoreBodyReadOnly && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
+          <Info className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <p>
+            {isCoreStrictViewOnly
+              ? __(
+                  "This link is view-only. Subject, body, and status cannot be changed from this screen.",
+                  "yatra",
+                )
+              : __(
+                  "Subject and HTML body are read-only until the required module is active. You can still turn this email on or off below; values reflect your site settings.",
+                  "yatra",
+                )}
+          </p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Main Form */}
+        <div className="lg:col-span-2 space-y-6">
+          {isOverride && (
+            <div
+              className="rounded-lg border border-purple-300 dark:border-purple-800 overflow-hidden"
+              data-testid="override-applies-to"
+            >
+              <div className="px-4 py-2.5 bg-purple-50 dark:bg-purple-900/20 text-sm font-semibold text-purple-800 dark:text-purple-200">
+                {__("Applies to", "yatra")}{" "}
+                <span className="font-normal text-purple-600 dark:text-purple-300">
+                  {__(
+                    "— bookings on these trips get this override instead of the global template",
+                    "yatra",
+                  )}
+                </span>
+              </div>
+              <div className="p-4 space-y-3">
+                <MultiSelect
+                  value={encodeTargets(targets)}
+                  onChange={(vals) =>
+                    setTargets((prev) => withTripValues(prev, vals))
+                  }
+                  options={tripTargetOptions}
+                  placeholder={__(
+                    "Search trips, categories, trip types…",
+                    "yatra",
+                  )}
+                />
+                {methodOptions && (
+                  <div data-testid="override-payment-methods">
+                    <div className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                      {__("Only for bookings paid with", "yatra")}
+                    </div>
+                    <MultiSelect
+                      value={targets.payment_methods ?? []}
+                      onChange={(vals) =>
+                        setTargets((prev) => withPaymentMethods(prev, vals))
+                      }
+                      options={methodOptions}
+                      placeholder={__("Any payment method", "yatra")}
+                    />
+                  </div>
+                )}
+                {!hasEmailTargets(targets) && (
+                  <p className="text-xs text-red-600">
+                    {methodOptions
+                      ? __(
+                          "Pick at least one trip, category, trip type or payment method.",
+                          "yatra",
+                        )
+                      : __(
+                          "Pick at least one trip, category or trip type.",
+                          "yatra",
+                        )}
+                  </p>
+                )}
+                <ul className="text-xs text-gray-500 dark:text-gray-400 list-disc pl-5 space-y-0.5">
+                  <li>
+                    {__(
+                      "Any match applies. A trip in a sub-category also matches its parent category.",
+                      "yatra",
+                    )}
+                  </li>
+                  <li>
+                    {__(
+                      "When several overrides match one trip, the most specific wins — trip › category › trip type — then the priority order in the Override templates list.",
+                      "yatra",
+                    )}
+                  </li>
+                  {methodOptions && (
+                    <li>
+                      {__(
+                        "With payment methods picked, it is used only for bookings paid that way (and only on the trips above, if any). It then wins over overrides without payment methods. “Charged automatically to a saved card” matches scheduled payments Yatra will charge by itself; a gateway matches the booking's or the scheduled payment's gateway. “Charged automatically” only matches scheduled payment emails. A payment reminder for a balance charged automatically, sent from one of these, doesn't get Yatra's “Pay your balance now” button.",
+                        "yatra",
+                      )}
+                    </li>
+                  )}
+                  <li>
+                    {__(
+                      "Trips that match no override keep the global template. Switching this override off does the same for its trips.",
+                      "yatra",
+                    )}
+                  </li>
+                </ul>
+              </div>
+            </div>
+          )}
+          {isOverridableGlobal && (
+            <div
+              className="flex flex-wrap items-start gap-3 rounded-lg border border-purple-300 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/20 px-4 py-3 text-sm text-purple-900 dark:text-purple-200"
+              data-testid="global-overrides-strip"
+            >
+              <div className="flex-1">
+                {myOverrides.length === 0
+                  ? __(
+                      "No overrides yet. Every trip gets this template. Add an override to give some trips different wording.",
+                      "yatra",
+                    )
+                  : sprintf(
+                      __(
+                        "This global template has %d override(s) with their own wording. Changes you make here don't change them; every other trip gets this template.",
+                        "yatra",
+                      ),
+                      myOverrides.length,
+                    )}
+                {myOverrides.length > 0 && (
+                  <ul className="mt-1 space-y-0.5">
+                    {myOverrides.map((o) => (
+                      <li
+                        key={o.id}
+                        className="flex flex-wrap items-center gap-2"
+                      >
+                        <a
+                          href={`admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&id=${o.id}`}
+                          className="font-medium text-blue-700 dark:text-blue-300 hover:underline"
+                        >
+                          {o.name}
+                        </a>
+                        <span className="text-xs text-purple-700 dark:text-purple-300">
+                          {describeEmailTargets(o.targets, tripTargetOptions)}
+                        </span>
+                        {!o.is_active && (
+                          <span className="text-xs text-amber-700 dark:text-amber-300">
+                            {__("(off)", "yatra")}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setOverrideModalOpen(true)}
+                data-testid="add-override-from-global"
+              >
+                {__("+ Add override", "yatra")}
+              </Button>
+            </div>
+          )}
+          {replacedBy && (
+            <div
+              className="rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:border-amber-700 p-4 text-sm text-amber-900 dark:text-amber-200"
+              data-testid="template-not-in-use"
+            >
+              <p className="font-medium">
+                {__("This template isn't sent, so changes here won't reach anyone.", "yatra")}
+              </p>
+              <p className="mt-1">
+                {sprintf(
+                  /* translators: %s: name of the template that is sent instead. */
+                  __("Customers get \u201c%s\u201d for this email instead. Edit that template, or switch it off to use this one.", "yatra"),
+                  String((replacedBy as any).name || ""),
+                )}{" "}
+                {(replacedBy as any).id && (
+                  <a
+                    href={`admin.php?page=yatra&subpage=email-automation&tab=templates&action=edit&id=${(replacedBy as any).id}`}
+                    className="font-medium underline"
+                  >
+                    {sprintf(
+                      /* translators: %s: name of the template that is sent instead. */
+                      __("Edit \u201c%s\u201d", "yatra"),
+                      String((replacedBy as any).name || ""),
+                    )}
+                  </a>
+                )}
+              </p>
+            </div>
+          )}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center justify-between">
+                <span>{__("Template Details")}</span>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`text-sm ${formData.is_active ? "text-green-600 dark:text-green-400" : "text-gray-500"}`}
+                  >
+                    {formData.is_active ? __("Active") : __("Inactive")}
+                  </span>
+                  <Switch
+                    checked={formData.is_active}
+                    disabled={isCoreStrictViewOnly}
+                    onCheckedChange={(checked) =>
+                      setFormData({ ...formData, is_active: checked })
+                    }
+                  />
+                </div>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  {__("Template Name")}
+                </label>
+                <Input
+                  value={formData.name}
+                  onChange={(e) =>
+                    setFormData({ ...formData, name: e.target.value })
+                  }
+                  placeholder={__("Enter template name")}
+                  readOnly={isCoreSettingsEdit}
+                  className={
+                    isCoreSettingsEdit ? "bg-gray-50 dark:bg-gray-900/40" : ""
+                  }
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  {__("Description")}
+                </label>
+                <Input
+                  value={formData.description}
+                  onChange={(e) =>
+                    setFormData({ ...formData, description: e.target.value })
+                  }
+                  placeholder={__(
+                    "Brief description of when this email is sent",
+                  )}
+                  readOnly={isCoreSettingsEdit}
+                  className={
+                    isCoreSettingsEdit ? "bg-gray-50 dark:bg-gray-900/40" : ""
+                  }
+                />
+              </div>
+
+              {/* Event Selector */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  {__("Trigger Event")}
+                </label>
+                {Boolean(templateData?.is_system) ||
+                isCoreSettingsEdit ||
+                isOverride ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800">
+                        <Zap className="w-4 h-4" />
+                        {formData.event_key || "-"}
+                      </span>
+                      <span className="text-xs text-gray-500 dark:text-gray-400">
+                        {isOverride
+                          ? __(
+                              "Same as the global template — an override can't change when it is sent, only what it says",
+                              "yatra",
+                            )
+                          : __("System templates cannot change events")}
+                      </span>
+                    </div>
+                    {formData.event_key && (
+                      <div className="p-3 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg border border-indigo-200 dark:border-indigo-800">
+                        <p className="text-sm text-indigo-800 dark:text-indigo-300">
+                          {events.find((e: any) => e.key === formData.event_key)
+                            ?.description || ""}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="relative">
+                    {/* Dropdown Trigger Button */}
+                    <button
+                      type="button"
+                      onClick={() => setShowEventDropdown(!showEventDropdown)}
+                      className="w-full px-3 py-2.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-left flex items-center justify-between hover:border-gray-400 dark:hover:border-gray-500 transition-colors"
+                    >
+                      {formData.event_key ? (
+                        <div className="flex items-center gap-2">
+                          <Zap className="w-4 h-4 text-blue-500" />
+                          <span className="text-sm font-medium text-gray-900 dark:text-white">
+                            {events.find(
+                              (e: any) => e.key === formData.event_key,
+                            )?.name || formData.event_key}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <Mail className="w-4 h-4 text-gray-400" />
+                          <span className="text-sm text-gray-500 dark:text-gray-400">
+                            {__("No Event (Sequence Only)")}
+                          </span>
+                        </div>
+                      )}
+                      <ChevronDown
+                        className={`w-4 h-4 text-gray-400 transition-transform ${showEventDropdown ? "rotate-180" : ""}`}
+                      />
+                    </button>
+
+                    {/* Dropdown List */}
+                    {showEventDropdown && (
+                      <div className="absolute z-50 w-full mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg max-h-80 overflow-y-auto">
+                        <div className="p-2 border-b border-gray-200 dark:border-gray-700">
+                          <p className="text-xs text-gray-500 dark:text-gray-400 px-2">
+                            {__(
+                              "Select an event to trigger this email, or leave empty for sequence use",
+                            )}
+                          </p>
+                        </div>
+                        <div className="py-1">
+                          {/* None option - for templates used in sequences */}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFormData({ ...formData, event_key: "" });
+                              setShowEventDropdown(false);
+                            }}
+                            className={`w-full px-3 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors border-b border-gray-100 dark:border-gray-700 ${
+                              !formData.event_key
+                                ? "bg-indigo-50 dark:bg-indigo-900/20"
+                                : ""
+                            }`}
+                          >
+                            <div className="flex items-start gap-2">
+                              <Mail
+                                className={`w-4 h-4 mt-0.5 flex-shrink-0 ${
+                                  !formData.event_key
+                                    ? "text-blue-500"
+                                    : "text-gray-400"
+                                }`}
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span
+                                    className={`text-sm font-medium ${
+                                      !formData.event_key
+                                        ? "text-blue-800 dark:text-blue-400"
+                                        : "text-gray-900 dark:text-white"
+                                    }`}
+                                  >
+                                    {__("No Event (Sequence Only)")}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                  {__(
+                                    "This template will only be used in email sequences",
+                                  )}
+                                </p>
+                              </div>
+                              {!formData.event_key && (
+                                <Check className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                              )}
+                            </div>
+                          </button>
+                          {events.map((event: any) => (
+                            <button
+                              key={event.key}
+                              type="button"
+                              onClick={() => {
+                                setFormData({
+                                  ...formData,
+                                  event_key: event.key,
+                                });
+                                setShowEventDropdown(false);
+                              }}
+                              className={`w-full px-3 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors border-b border-gray-100 dark:border-gray-700 last:border-b-0 ${
+                                formData.event_key === event.key
+                                  ? "bg-indigo-50 dark:bg-indigo-900/20"
+                                  : ""
+                              }`}
+                            >
+                              <div className="flex items-start gap-2">
+                                <Zap
+                                  className={`w-4 h-4 mt-0.5 flex-shrink-0 ${
+                                    formData.event_key === event.key
+                                      ? "text-blue-500"
+                                      : "text-gray-400"
+                                  }`}
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className={`text-sm font-medium ${
+                                        formData.event_key === event.key
+                                          ? "text-blue-800 dark:text-blue-400"
+                                          : "text-gray-900 dark:text-white"
+                                      }`}
+                                    >
+                                      {event.name}
+                                    </span>
+                                    <code className="text-xs px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded">
+                                      {event.key}
+                                    </code>
+                                  </div>
+                                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 line-clamp-2">
+                                    {event.description}
+                                  </p>
+                                </div>
+                                {formData.event_key === event.key && (
+                                  <Check className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                                )}
+                              </div>
+                            </button>
+                          ))}
+                          {events.length === 0 && (
+                            <div className="px-3 py-3 text-xs text-amber-600 dark:text-amber-400">
+                              {__(
+                                "No trigger events are available. Enable the Email Automation module under Yatra → Modules, then reload this page.",
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Click outside to close */}
+                    {showEventDropdown && (
+                      <div
+                        className="fixed inset-0 z-40"
+                        onClick={() => setShowEventDropdown(false)}
+                      />
+                    )}
+                  </div>
+                )}
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  {__(
+                    "This email will be triggered when the selected event occurs",
+                  )}
+                </p>
+              </div>
+
+              {!isCoreSettingsEdit && (
+                <>
+                  {/* From/Reply-To Settings */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {__("From Name")}
+                      </label>
+                      <Input
+                        value={formData.from_name}
+                        onChange={(e) =>
+                          setFormData({
+                            ...formData,
+                            from_name: e.target.value,
+                          })
+                        }
+                        placeholder={__("e.g., Travel Agency Name")}
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__("Leave empty to use site default")}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {__("From Email")}
+                      </label>
+                      <Input
+                        type="email"
+                        value={formData.from_email}
+                        onChange={(e) =>
+                          setFormData({
+                            ...formData,
+                            from_email: e.target.value,
+                          })
+                        }
+                        placeholder={__("e.g., noreply@yoursite.com")}
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__("Leave empty to use site default")}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Category — lets the operator classify the template (e.g.
+                      Payment) instead of it always defaulting to Booking. The
+                      recipient (Customer/Admin) is derived server-side from the
+                      To address ({{admin_email}} => admin). Locked for core/
+                      system templates whose category is fixed. */}
+                  {!isCoreSettingsEdit && (
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {__("Category")}
+                      </label>
+                      <select
+                        aria-label={__("Category")}
+                        value={formData.category || "booking"}
+                        onChange={(e) =>
+                          setFormData({ ...formData, category: e.target.value })
+                        }
+                        disabled={isCoreViewMode || isSystemTemplate}
+                        className="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 dark:text-white disabled:opacity-60"
+                      >
+                        <option value="booking">{__("Booking")}</option>
+                        <option value="payment">{__("Payment")}</option>
+                        <option value="reminder">{__("Reminder")}</option>
+                        <option value="enquiry">{__("Enquiry")}</option>
+                        <option value="account">{__("Account")}</option>
+                        <option value="marketing">{__("Marketing")}</option>
+                      </select>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__(
+                          "How this template is grouped in the list. Recipient (Customer/Admin) follows the To address.",
+                        )}
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {__("To Email")}
+                      </label>
+                      <Input
+                        type="email"
+                        value={formData.to_email}
+                        onChange={(e) =>
+                          setFormData({ ...formData, to_email: e.target.value })
+                        }
+                        placeholder={__("e.g., {{customer_email}}")}
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__(
+                          "Recipient email. Use variables or leave empty for default",
+                        )}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        {__("Reply-To Email")}
+                      </label>
+                      <Input
+                        type="email"
+                        value={formData.reply_to}
+                        onChange={(e) =>
+                          setFormData({ ...formData, reply_to: e.target.value })
+                        }
+                        placeholder={__("e.g., support@yoursite.com")}
+                      />
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {__(
+                          "Where replies will be sent. Leave empty to use From Email",
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {isCoreSettingsEdit && (
+                <p className="text-sm text-gray-600 dark:text-gray-400 rounded-lg border border-gray-200 dark:border-gray-600 p-3 bg-gray-50 dark:bg-gray-800/50">
+                  {__(
+                    "From / reply addresses are configured under Email → Delivery. Recipient uses the customer on the booking.",
+                    "yatra",
+                  )}
+                </p>
+              )}
+
+              {/* Copy addresses — available for every template, core or Pro.
+                  Both are opt-in: left empty, no copy is sent. */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    {__("BCC", "yatra")}
+                  </label>
+                  <Input
+                    value={formData.bcc}
+                    onChange={(e) =>
+                      setFormData({ ...formData, bcc: e.target.value })
+                    }
+                    placeholder={__("e.g., archive@yoursite.com", "yatra")}
+                    disabled={isCoreViewMode}
+                  />
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    {__(
+                      "Blind copy, hidden from the recipient. Separate several addresses with commas. Leave empty to send no copy.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    {__("CC", "yatra")}
+                  </label>
+                  <Input
+                    value={formData.cc}
+                    onChange={(e) =>
+                      setFormData({ ...formData, cc: e.target.value })
+                    }
+                    placeholder={__("e.g., office@yoursite.com", "yatra")}
+                    disabled={isCoreViewMode}
+                  />
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    {__(
+                      "Visible copy — the recipient can see this address. Separate several addresses with commas.",
+                      "yatra",
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  {__("Subject Line")}
+                </label>
+                <Input
+                  value={formData.subject}
+                  onChange={(e) =>
+                    setFormData({ ...formData, subject: e.target.value })
+                  }
+                  placeholder={__("Email subject with {{variables}}")}
+                  readOnly={isCoreBodyReadOnly}
+                  className={`font-mono text-sm ${isCoreBodyReadOnly ? "bg-gray-50 dark:bg-gray-900/40" : ""}`}
+                />
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  {__("Use {{variable}} syntax to insert dynamic content")}
+                </p>
+              </div>
+
+              <div>
+                {/* Label + AI sparkle on the same row — sparkle sits
+                    to the right of the "Email Body (HTML)" label so
+                    it's visually associated with the editor it
+                    affects, not floating above Subject Line. */}
+                <div className="mb-1 flex items-center justify-between">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {__("Email Body (HTML)")}
+                  </label>
+                  {!isCoreBodyReadOnly &&
+                    isAiEligible() &&
+                    isAiModuleEnabled() && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowAiModal(true)}
+                        className="border-blue-300 text-blue-700 hover:bg-blue-50 dark:border-blue-500/40 dark:text-blue-200 dark:hover:bg-blue-900/30"
+                      >
+                        <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                        {__("Generate with AI", "yatra")}
+                      </Button>
+                    )}
+                </div>
+                <textarea
+                  id="email-body"
+                  value={formData.body}
+                  onChange={(e) =>
+                    setFormData({ ...formData, body: e.target.value })
+                  }
+                  rows={20}
+                  readOnly={isCoreBodyReadOnly}
+                  className={`w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg font-mono text-sm ${
+                    isCoreBodyReadOnly
+                      ? "bg-gray-50 dark:bg-gray-900/40 text-gray-900 dark:text-white"
+                      : "bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                  }`}
+                  placeholder={__("HTML email content...")}
+                />
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* One trip dropdown for the editor: preview, test AND "which
+              template does this trip get". It is NEVER saved — the saved
+              targeting is the Applies-to block. */}
+          {!isCreateMode &&
+            !isCoreSettingsEdit &&
+            overridesSupported &&
+            (isOverride || isOverridableGlobal) && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">
+                    {__("Try it with a real trip", "yatra")}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <div data-testid="preview-trip">
+                    <SearchableSelect
+                      value={previewTrip ? String(previewTrip) : ""}
+                      onChange={(value) =>
+                        setPreviewTrip(value ? Number(value) : null)
+                      }
+                      options={tripOptions.map((t) => ({
+                        value: String(t.id),
+                        label: t.label,
+                      }))}
+                      placeholder={__("Sample data (no trip)", "yatra")}
+                      searchPlaceholder={__("Search trips…", "yatra")}
+                    />
+                  </div>
+                  <p className="text-xs text-gray-500">
+                    {__(
+                      "Not saved. Preview and Send Test Email use this trip's real name, link and sample booking data. Which trips actually get this template is set in “Applies to”.",
+                      "yatra",
+                    )}
+                  </p>
+                  {previewTrip && tripResolution && (
+                    <div
+                      className="text-sm rounded-md border border-dashed border-gray-300 dark:border-gray-600 px-3 py-2"
+                      data-testid="check-trip-result"
+                    >
+                      <span className="text-gray-500">
+                        {__("This trip's customers get:", "yatra")}
+                      </span>{" "}
+                      {(() => {
+                        const parentKey = isOverride
+                          ? overrideOf
+                          : String((templateData as any)?.template_key || "");
+                        const hit = tripResolution.resolved[parentKey];
+                        // This check can't know how a booking is paid, so it
+                        // can't say whether a payment-method override applies.
+                        if (isOverride && (targets.payment_methods?.length ?? 0) > 0) {
+                          return (
+                            <span className="text-gray-700 dark:text-gray-300">
+                              {__(
+                                "it depends on how the booking is paid, which this check can't tell. Bookings paid with the payment methods above get this override when the trip matches too.",
+                                "yatra",
+                              )}
+                            </span>
+                          );
+                        }
+                        if (isOverride) {
+                          if (hit?.id === Number(id)) {
+                            return (
+                              <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
+                                {__("this override", "yatra")}
+                                {hit?.reason ? ` · ${hit.reason}` : ""}
+                              </span>
+                            );
+                          }
+                          const noBodyYet = !String(
+                            (templateData as any)?.body || "",
+                          ).trim()
+                            ? " — " +
+                              __(
+                                "this override has no body yet, so it is skipped",
+                                "yatra",
+                              )
+                            : "";
+                          if (hit) {
+                            return (
+                              <span className="text-amber-700 dark:text-amber-300">
+                                {sprintf(
+                                  __("“%1$s” (%2$s)", "yatra"),
+                                  hit.name,
+                                  hit.reason,
+                                )}
+                                {noBodyYet}
+                              </span>
+                            );
+                          }
+                          return (
+                            <span className="text-gray-700 dark:text-gray-300">
+                              {sprintf(
+                                __("the global template (%s)", "yatra"),
+                                parentTemplate?.name || overrideOf,
+                              )}
+                              {noBodyYet}
+                            </span>
+                          );
+                        }
+                        return hit ? (
+                          <span className="text-amber-700 dark:text-amber-300">
+                            {sprintf(
+                              __(
+                                "the override “%1$s” (%2$s), not this template",
+                                "yatra",
+                              ),
+                              hit.name,
+                              hit.reason,
+                            )}
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
+                            {__("this template", "yatra")}
+                          </span>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          {/* Test Email - Only show in edit mode */}
+          {!isCreateMode && !isCoreSettingsEdit && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Send className="w-5 h-5 text-blue-500" />
+                  {__("Send Test Email")}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex gap-3">
+                  <Input
+                    type="email"
+                    value={testEmail}
+                    onChange={(e) => setTestEmail(e.target.value)}
+                    placeholder={__("Enter email address")}
+                    className="flex-1"
+                  />
+                  <Button
+                    onClick={() => testMutation.mutate(testEmail)}
+                    disabled={!testEmail || testMutation.isPending}
+                  >
+                    {testMutation.isPending ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
+                  </Button>
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                  {__(
+                    "Send a test email with sample data to preview how it looks",
+                  )}
+                </p>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+
+        {/* Sidebar - Variables */}
+        <div className="space-y-6">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Code className="w-5 h-5 text-blue-500" />
+                {__("Available Variables")}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {!isCoreSettingsEdit && (
+                <>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {__("Click to copy, double-click to insert at cursor")}
+                  </p>
+                  {/*
+                    Subtitle showing which event the variables list is
+                    scoped to. Without this hint, operators see a
+                    different set of tags every time they switch the
+                    event dropdown and have no clear explanation why.
+                  */}
+                  {formData.event_key ? (
+                    // Show the technical event KEY (dot-notation, monospace)
+                    // as the primary label so it can't be confused with the
+                    // template's display title — earlier versions showed
+                    // the event's friendly name, which often matches what
+                    // operators name their templates ("Customer email
+                    // verification" appears as both the event name and a
+                    // common template title) and made it unclear what the
+                    // chip was scoped to. Friendly name still appears as
+                    // the parenthesised clarifier.
+                    <p className="text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/30 rounded px-2 py-1.5">
+                      {__("Variables available for trigger event:", "yatra")}{" "}
+                      <code className="font-mono text-blue-800 dark:text-blue-200 bg-blue-100 dark:bg-blue-900/40 px-1 rounded">
+                        {formData.event_key}
+                      </code>
+                      {(() => {
+                        const match = events.find(
+                          (e: any) => e.key === formData.event_key,
+                        );
+                        return match?.name ? (
+                          <span className="text-blue-600/80 dark:text-blue-400/80">
+                            {" "}
+                            ({match.name})
+                          </span>
+                        ) : null;
+                      })()}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 rounded px-2 py-1.5">
+                      {__(
+                        "Pick a trigger event below to see the variables that apply to that event. Showing the full catalog until then.",
+                        "yatra",
+                      )}
+                    </p>
+                  )}
+                </>
+              )}
+
+              {isCoreSettingsEdit && coreDef?.mergeTags ? (
+                <div className="space-y-2">
+                  <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase">
+                    {__("Merge tags", "yatra")}
+                  </p>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    {__(
+                      "Click a tag to copy; paste into subject or HTML body.",
+                      "yatra",
+                    )}
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    {coreDef.mergeTags.split(",").map((raw) => {
+                      const tag = raw.trim();
+                      const inner = tag.replace(/\{\{|\}\}/g, "").trim();
+                      if (!inner) return null;
+                      return (
+                        <button
+                          key={tag}
+                          type="button"
+                          onClick={() => copyVariable(inner)}
+                          className="rounded border border-gray-200 dark:border-gray-600 px-2 py-1 text-xs font-mono text-blue-600 dark:text-blue-400 hover:bg-gray-50 dark:hover:bg-gray-800"
+                        >
+                          {tag}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                variablesData &&
+                Object.entries(variablesData).map(
+                  ([category, variables]: [string, any]) => (
+                    <div key={category}>
+                      <h4 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase mb-2">
+                        {category}
+                      </h4>
+                      <div className="space-y-1">
+                        {variables.map((v: any) => (
+                          <button
+                            key={v.key}
+                            type="button"
+                            onClick={() => copyVariable(v.key)}
+                            onDoubleClick={() => insertVariable(v.key)}
+                            className="w-full text-left px-2 py-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors group"
+                          >
+                            <div className="flex items-center justify-between">
+                              <code className="text-xs text-blue-600 dark:text-blue-400">
+                                {`{{${v.key}}}`}
+                              </code>
+                              {copiedVar === v.key ? (
+                                <Check className="w-3 h-3 text-green-500" />
+                              ) : (
+                                <Copy className="w-3 h-3 text-gray-400 opacity-0 group-hover:opacity-100" />
+                              )}
+                            </div>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                              {v.description}
+                            </p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ),
+                )
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Template Info - Different content for create vs edit */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Info className="w-5 h-5 text-gray-500" />
+                {isCreateMode ? __("New Template") : __("Template Info")}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    {__("Event")}
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-400">
+                    <Zap className="w-3 h-3" />
+                    {formData.event_key || "-"}
+                  </span>
+                </div>
+                {/* The badge above only reports the choice. This panel sits right
+                    under "Select an event to trigger this email automatically",
+                    so give it a control that actually selects one — a plain
+                    <select>, which cannot be clipped by an ancestor and needs no
+                    open/close state, unlike the styled dropdown in the main
+                    column. System and core templates keep their fixed event. */}
+                {!isSystemTemplate && !isCoreSettingsEdit && (
+                  <select
+                    aria-label={__("Trigger Event")}
+                    value={formData.event_key || ""}
+                    onChange={(e) =>
+                      setFormData({ ...formData, event_key: e.target.value })
+                    }
+                    className="w-full mt-1 px-2 py-1.5 text-xs rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 dark:text-white"
+                  >
+                    <option value="">
+                      {__("No event (use in a sequence)")}
+                    </option>
+                    {events.map((ev: any) => (
+                      <option key={ev.key} value={ev.key}>
+                        {ev.name || ev.key}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {formData.event_key && (
+                  <p className="text-xs text-gray-500 dark:text-gray-400 italic">
+                    {events.find((e: any) => e.key === formData.event_key)
+                      ?.description || ""}
+                  </p>
+                )}
+              </div>
+              {isCreateMode ? (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {__("Type")}
+                    </span>
+                    <span className="text-gray-900 dark:text-white">
+                      {__("Custom")}
+                    </span>
+                  </div>
+                  <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
+                    <p className="text-xs text-blue-700 dark:text-blue-300">
+                      {__(
+                        "Custom templates can be edited and deleted. Select an event to trigger this email automatically.",
+                      )}
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {__("Key")}
+                    </span>
+                    <code className="text-xs bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded">
+                      {isCoreSettingsEdit
+                        ? coreDef?.template_key
+                        : String(templateData?.template_key ?? "")}
+                    </code>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {__("Category")}
+                    </span>
+                    <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                      {isCoreSettingsEdit
+                        ? coreDef?.category
+                        : String(templateData?.category ?? "")}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {__("Recipient")}
+                    </span>
+                    <span
+                      className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                        (isCoreSettingsEdit
+                          ? coreDef?.recipient_type
+                          : String(templateData?.recipient_type ?? "")) ===
+                        "admin"
+                          ? "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400"
+                          : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
+                      }`}
+                    >
+                      {(isCoreSettingsEdit
+                        ? coreDef?.recipient_type
+                        : String(templateData?.recipient_type ?? "")) ===
+                      "admin"
+                        ? __("Admin")
+                        : __("Customer")}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      {__("Type")}
+                    </span>
+                    <span className="text-gray-900 dark:text-white">
+                      {isCoreSettingsEdit || Boolean(templateData?.is_system)
+                        ? __("System")
+                        : __("Custom")}
+                    </span>
+                  </div>
+                </>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      <EmailPreviewModal
+        open={showPreview && Boolean(previewData)}
+        onClose={() => {
+          setShowPreview(false);
+          setPreviewData(null);
+        }}
+        subject={previewData?.subject ?? ""}
+        body={previewData?.body ?? ""}
+      />
+
+      {/* AI: subject + body generator. The merge-tag list comes from
+          the catalog entry when it's a core template, falling back
+          to a sensible default set when editing a custom template. */}
+      <AiEmailTemplateModal
+        open={showAiModal}
+        onClose={() => setShowAiModal(false)}
+        templateKey={
+          coreTemplateSlug || formData.event_key || "custom_template"
+        }
+        templateName={coreDef?.name || formData.name || formData.event_key}
+        templateDescription={coreDef?.description || formData.description}
+        recipientType={
+          (catalogEntryForCore?.recipient_type as "customer" | "admin") ||
+          "customer"
+        }
+        mergeTags={(() => {
+          // Catalog stores mergeTags as a comma-string like
+          // "{{customer_name}}, {{booking_reference}}, …". Coerce to
+          // the bare tag names ('customer_name') that the agent's
+          // server-side normalizer accepts.
+          const raw = catalogEntryForCore?.mergeTags ?? "";
+          if (!raw) {
+            return [
+              "site_name",
+              "site_url",
+              "customer_name",
+              "customer_email",
+              "booking_reference",
+              "trip_name",
+              "travel_date",
+              "total_amount",
+              "currency",
+            ];
+          }
+          return raw
+            .split(",")
+            .map((s) =>
+              s
+                .trim()
+                .replace(/^\{\{|\}\}$/g, "")
+                .trim(),
+            )
+            .filter(Boolean);
+        })()}
+        currentSubject={formData.subject}
+        currentBody={formData.body}
+        onAccept={({ subject, body }) =>
+          setFormData({ ...formData, subject, body })
+        }
+      />
+      {isOverridableGlobal && templateData && (
+        <EmailOverrideCreateModal
+          isOpen={overrideModalOpen}
+          onClose={() => setOverrideModalOpen(false)}
+          globals={[templateData as any]}
+          parent={templateData as any}
+        />
+      )}
+    </div>
+  );
+};
+
+export default EmailTemplateForm;

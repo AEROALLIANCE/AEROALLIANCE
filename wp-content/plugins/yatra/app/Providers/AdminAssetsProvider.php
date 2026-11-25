@@ -1,0 +1,734 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Providers;
+
+/**
+ * Admin Assets Provider
+ *
+ * Handles enqueuing of all admin-related CSS and JavaScript assets
+ * Centralizes admin asset management for better organization and maintainability
+ *
+ * @package Yatra\Providers
+ * @since 3.0.0
+ */
+class AdminAssetsProvider
+{
+    /**
+     * Full `window.yatraAdmin` payload — must match what addMediaLibraryCompatScript used to merge
+     * (permalinkStructure, tripBase, locale, etc.) so View links and REST helpers work in all modes.
+     *
+     * @return array<string, mixed>
+     */
+    private function buildAdminLocalizedData(): array
+    {
+        $current_user = wp_get_current_user();
+        $capabilities = [];
+        if ($current_user->ID > 0) {
+            $user_caps = $current_user->allcaps;
+            foreach ($user_caps as $cap => $has_cap) {
+                if (!$has_cap) continue;
+                // Mirror every `yatra_*` cap into the JS-side map (these
+                // are what React's `can()` checks against). Also
+                // explicitly include `manage_options` so the React-side
+                // admin fallback has a server-confirmed signal even on
+                // exotic installs where `isWpAdmin` or `roles` were
+                // filtered out by a third-party plugin.
+                $capStr = (string) $cap;
+                if (strpos($capStr, 'yatra_') === 0 || $capStr === 'manage_options') {
+                    $capabilities[$capStr] = true;
+                }
+            }
+        }
+
+        return apply_filters('yatra_admin_localized_data', [
+            'timeZoneIdentifiers' => self::buildTimezoneIdentifierList(),
+            'wordPressTimezone' => function_exists('wp_timezone_string')
+                ? (string) wp_timezone_string()
+                : 'UTC',
+            'timezone' => \Yatra\Services\SettingsService::getString('timezone', 'UTC'),
+            'apiUrl' => rest_url('yatra/v1'),
+            'licenseStatus' => (function () {
+                $all = get_option('yatra_license', []);
+                $status = $all['yatra-pro']['status'] ?? 'inactive';
+                return (string) $status;
+            })(),
+            'restUrl' => rest_url(),
+            'nonce' => wp_create_nonce('wp_rest'),
+            'currentUser' => $current_user->ID,
+            'currentUserEmail' => $current_user->user_email,
+            'currentUserDisplayName' => $current_user->display_name,
+            'currentUserLogin' => $current_user->user_login,
+            'currentUserAvatar' => get_avatar($current_user->ID, 96),
+            'siteUrl' => home_url(),
+            'adminUrl' => admin_url('admin.php'),
+            'pluginUrl' => YATRA_PLUGIN_URL,
+            // Public URL of the Yatra sitemap (handles plain vs pretty
+            // permalinks), shown in the SEO settings tab.
+            'sitemapUrl' => \Yatra\Sitemap\SitemapRouter::sitemapUrl(),
+            // Brand-name and brand-logo helpers are filter-backed (defaults
+            // wired in includes/helpers.php). Pro's WhiteLabel module
+            // overrides the filters when Agency white-label is active.
+            'brandLogoUrl' => function_exists('yatra_get_brand_icon_url') ? yatra_get_brand_icon_url() : '',
+            'brandName' => function_exists('yatra_get_brand_name') ? yatra_get_brand_name() : 'Yatra',
+            // White-label-specific window.yatraAdmin keys (brandMenuOverrides,
+            // brandMenuOrder, brandUiChrome, brandPrimaryColor) are injected
+            // by Pro via the `yatra_admin_localized_data` filter applied at
+            // the bottom of this method. They are NOT set here because option
+            // storage is owned by Pro's WhiteLabel module.
+            'permalinkStructure' => (get_option('permalink_structure') ?: '') ?: 'plain',
+            'tripBase' => \Yatra\Services\SettingsService::getTripBase(),
+            'bookingBase' => \Yatra\Services\SettingsService::getBookingBase(),
+            'capabilities' => $capabilities,
+            'roles' => $current_user->roles,
+            // Cap-gating fallback flag. ALWAYS injected (not just by the
+            // Team module) because the React `usePermissions.can()` helper
+            // uses it as the last-resort allow for site owners: anyone
+            // with `manage_options` passes any cap check, mirroring the
+            // server-side admin fallback in Team's Capabilities filter.
+            //
+            // Without this, free-plugin installs (or Pro installs where
+            // Team is off) silently fail every `can("yatra_*")` check —
+            // even for site owners — because the cap isn't on the
+            // administrator role record. The Team module overwrites
+            // this same key when active; semantics are identical, so
+            // the overwrite is safe.
+            'isWpAdmin' => current_user_can('manage_options'),
+            'isPro' => defined('YATRA_PRO_VERSION'),
+            // Agency-tier flag — drives the sidebar's White Label entry visibility
+            // and any other Agency-only UI affordances. Pro registers the filter
+            // unconditionally so the value is always trustworthy.
+            'isAgency' => (bool) apply_filters('yatra_is_agency_active', false),
+            // AI-eligibility flag (Growth + Agency). Drives the AI Assistant
+            // sidebar entry visibility and the per-field sparkle affordances
+            // in the trip / SEO editors.
+            'isAiEligible' => (bool) apply_filters('yatra_is_ai_eligible', false),
+            'whiteLabelEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('white_label')
+                : false,
+            'aiAssistantEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('ai_assistant')
+                : false,
+            'whatsappEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('whatsapp')
+                : false,
+            'channelManagerEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('channel_manager')
+                : false,
+            'webhooksEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('webhooks')
+                : false,
+            // Settings → Pricing (Discount Stacking) drives off these
+            // two. Setting them here (free plugin, AdminAssetsProvider)
+            // matches the pattern used by every other Pro-module flag
+            // above and decouples the React UI from Pro module boot
+            // timing — Pro's init.php is conditionally loaded by
+            // ProModuleManager only when the module is enabled, so any
+            // filter-based exposure could fail silently if boot order
+            // shifts. Reading from the canonical ModuleManager here is
+            // the source of truth.
+            'dynamicPricingEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('dynamic_pricing')
+                : false,
+            'advancedDiscountEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('advanced_discount')
+                : false,
+            // Single source of truth for every country dropdown in the
+            // React admin. Pulled from the canonical FormatHelper —
+            // operators that want a curated or reordered list apply
+            // the `yatra_countries_list` filter once and it propagates
+            // to every dropdown automatically.
+            'countries' => class_exists('\\Yatra\\Helpers\\FormatHelper')
+                ? \Yatra\Helpers\FormatHelper::getCountries()
+                : [],
+            'customLandingPagesModuleEnabled' => class_exists('\\Yatra\\Core\\Modules\\ModuleManager')
+                ? \Yatra\Core\Modules\ModuleManager::isModuleEnabled('custom_landing_pages')
+                : false,
+            // Per-trip Deposit & Payment Terms is a Pro feature (FlexiblePayments).
+            // Default false; Pro's FlexiblePaymentsModule::addAdminData() flips this
+            // to true via the `yatra_admin_localized_data` filter when active, and
+            // the React TripForm hides/shows the section based on this flag.
+            'flexiblePaymentsEnabled' => false,
+            'version' => defined('YATRA_VERSION') ? YATRA_VERSION : '1.0.0',
+            'proVersion' => defined('YATRA_PRO_VERSION') ? YATRA_PRO_VERSION : null,
+
+            'locale' => get_locale(),
+            // Settings → General → Week Starts On (0 = Sunday), clamped the
+            // same way as the frontend calendars' firstDayOfWeek, so the admin
+            // calendars start on the same day.
+            'startOfWeek' => max(0, min(6, (int) get_option('start_of_week', 1))),
+            'currency' => \Yatra\Services\SettingsService::getCurrency(),
+            'currencyPosition' => \Yatra\Services\SettingsService::getString('currency_position', 'left'),
+            'currency_position' => \Yatra\Services\SettingsService::getString('currency_position', 'left'),
+            'decimalPlaces' => \Yatra\Services\SettingsService::getPriceDecimals(),
+            'thousandSeparator' => \Yatra\Services\SettingsService::getString('thousand_separator', ','),
+            'decimalSeparator' => \Yatra\Services\SettingsService::getString('decimal_separator', '.'),
+            'date_format' => \Yatra\Services\SettingsService::get('date_format', 'Y-m-d'),
+            'time_format' => \Yatra\Services\SettingsService::get('time_format', 'H:i'),
+            'geocodingNonce' => wp_create_nonce('yatra_geocoding_nonce'),
+            'ajaxUrl' => admin_url('admin-ajax.php'),
+        ]);
+    }
+
+    /**
+     * Sorted IANA identifiers for the admin timezone control (matches PHP {@see DateTimeZone}).
+     *
+     * @return list<string>
+     */
+    private static function buildTimezoneIdentifierList(): array
+    {
+        if (!function_exists('timezone_identifiers_list')) {
+            return ['UTC'];
+        }
+
+        $ids = timezone_identifiers_list();
+        if (!is_array($ids) || $ids === []) {
+            return ['UTC'];
+        }
+
+        $ids = array_values(array_filter($ids, static function ($id): bool {
+            return is_string($id) && $id !== '';
+        }));
+
+        sort($ids, SORT_STRING);
+
+        return $ids;
+    }
+
+    /**
+     * Enqueue all admin assets
+     *
+     * @param string $hook Current admin page hook
+     * @return void
+     */
+    public function enqueueAssets(string $hook): void
+    {
+        // Only load on our admin page
+        if ($hook !== 'toplevel_page_yatra') {
+            return;
+        }
+
+        // Prevent problematic scripts that cause initialization errors
+        $this->preventProblematicScripts();
+
+        // Enqueue WordPress media library dependencies
+        $this->enqueueWordPressMedia();
+
+        // Enqueue admin React app assets
+        $this->enqueueAdminReactApp();
+
+        // Do not strip styles required by wp_enqueue_media() / wp.media(): stripping `media-views`
+        // (and replacing `forms` with an empty handle) makes the media modal invisible or broken.
+        // See: TripForm gallery / featured image / downloadable file pickers.
+
+        // Aggressive WordPress Admin CSS removal (keep media modal + its dependency chain intact)
+        $admin_css_handles = [
+            'admin-bar',
+            'admin-menu',
+            'dashboard',
+            'list-tables',
+            'edit',
+            'revisions',
+            'themes',
+            'about',
+            'nav-menus',
+            'wp-pointer',
+            'widgets',
+            'site-icon',
+            'l10n',
+            'wp-auth-check',
+            'wp-components',
+            'wp-commands',
+            'login',
+            'install',
+            'wp-reset-editor-styles',
+            'wp-admin',
+            'colors',
+        ];
+        
+        // Dequeue all WordPress admin CSS and register empty placeholders
+        foreach ($admin_css_handles as $handle) {
+            wp_dequeue_style($handle);
+            wp_deregister_style($handle);
+            // Register as empty style to satisfy dependencies
+            wp_register_style($handle, false);
+        }
+        
+        // Final safety dequeue at print time
+        add_action('wp_print_styles', function () use ($admin_css_handles) {
+            foreach ($admin_css_handles as $handle) {
+                wp_dequeue_style($handle);
+            }
+        }, 999);
+
+        // Add aggressive style loader filter to prevent WordPress admin CSS
+        add_filter('style_loader_src', function($src, $handle) use ($admin_css_handles) {
+            if (in_array($handle, $admin_css_handles)) {
+                return false; // Prevent loading actual CSS files
+            }
+            // Allow load-styles.php but individual handles will be blocked above
+            return $src;
+        }, 999, 2);
+
+        // Add inline script for media library compatibility
+        $this->addMediaLibraryCompatScript();
+    }
+
+    /**
+     * Prevent problematic WordPress scripts
+     *
+     * @return void
+     */
+    private function preventProblematicScripts(): void
+    {
+        // These scripts try to access wp.media.view before it's initialized
+        wp_dequeue_script('svg-painter');
+        wp_deregister_script('svg-painter');
+        wp_dequeue_script('image-edit');
+        wp_deregister_script('image-edit');
+    }
+
+    /**
+     * Enqueue WordPress media library dependencies
+     *
+     * @return void
+     */
+    private function enqueueWordPressMedia(): void
+    {
+        // Enqueue WordPress media library
+        wp_enqueue_media();
+
+        // Ensure wp-mediaelement is loaded
+        wp_enqueue_script('wp-mediaelement');
+
+        // Ensure media-audiovideo is loaded
+        wp_enqueue_script('media-audiovideo');
+
+        // Keep media-editor loaded - it's required by media-audiovideo
+        // Note: The initialization errors were caused by svg-painter and image-edit, not media-editor
+
+        // Ensure all required dependencies are loaded
+        wp_enqueue_script('jquery');
+        wp_enqueue_script('underscore');
+        wp_enqueue_script('backbone');
+    }
+
+    /**
+     * Enqueue admin React app assets
+     *
+     * @return void
+     */
+    private function enqueueAdminReactApp(): void
+    {
+        // Enqueue compiled React app CSS files
+        $this->enqueueAdminReactCss();
+        $this->enqueueAdminReactJs();
+    }
+
+    /**
+     * Enqueue admin React CSS files
+     *
+     * @return void
+     */
+    private function enqueueAdminReactCss(): void
+    {
+        $faPath = YATRA_PLUGIN_PATH . 'assets/vendor/fontawesome/css/all.min.css';
+        if (file_exists($faPath)) {
+            wp_enqueue_style(
+                'yatra-fontawesome-6-admin',
+                YATRA_PLUGIN_URL . 'assets/vendor/fontawesome/css/all.min.css',
+                [],
+                '6.7.2.' . filemtime($faPath)
+            );
+        }
+
+        // The WordPress admin stylesheet is removed on these screens, and with it the rule
+        // hiding screen-reader text, which then shows up inside the media window.
+        wp_register_style('yatra-admin-media-modal', false);
+        wp_enqueue_style('yatra-admin-media-modal');
+        wp_add_inline_style(
+            'yatra-admin-media-modal',
+            '.media-modal .screen-reader-text{border:0;clip-path:inset(50%);height:1px;margin:-1px;overflow:hidden;padding:0;position:absolute;width:1px;word-wrap:normal}'
+        );
+
+        $basePath = YATRA_PLUGIN_PATH . 'assets/admin/dist/css/';
+        $faHandle = file_exists($faPath) ? 'yatra-fontawesome-6-admin' : false;
+
+        // React vendor CSS (contains react-draft-wysiwyg CSS)
+        $reactVendorCss = $basePath . 'react-vendor.css';
+        if (file_exists($reactVendorCss)) {
+            $cssVersion = YATRA_VERSION . '.' . filemtime($reactVendorCss);
+            wp_enqueue_style(
+                'yatra-react-vendor',
+                YATRA_PLUGIN_URL . 'assets/admin/dist/css/react-vendor.css',
+                $faHandle ? [$faHandle] : [],
+                $cssVersion
+            );
+        }
+
+        // Index CSS (contains main component styles)
+        $indexCss = $basePath . 'index.css';
+        if (file_exists($indexCss)) {
+            $cssVersion = YATRA_VERSION . '.' . filemtime($indexCss);
+            wp_enqueue_style(
+                'yatra-index',
+                YATRA_PLUGIN_URL . 'assets/admin/dist/css/index.css',
+                ['yatra-react-vendor'],
+                $cssVersion
+            );
+        }
+    }
+
+    /**
+     * Enqueue admin React JS files
+     *
+     * @return void
+     */
+    private function enqueueAdminReactJs(): void
+    {
+        // Check if we're in development mode and Vite dev server is running
+        $isDevMode = defined('WP_DEBUG') && WP_DEBUG && defined('YATRA_DEV_MODE') && YATRA_DEV_MODE;
+        $viteDevServer = 'http://localhost:5173';
+        
+        if ($isDevMode && $this->isViteDevServerRunning($viteDevServer)) {
+            // In dev mode, inject localized data and Vite's HMR client
+            add_action('admin_head', function() use ($viteDevServer) {
+                $localized_data = $this->buildAdminLocalizedData();
+
+                ?>
+                <script>
+                    window.yatraAdmin = <?php echo wp_json_encode($localized_data); ?>;
+                </script>
+                <script type="module">
+                    import { injectIntoGlobalHook } from "<?php echo $viteDevServer; ?>/@react-refresh";
+                    injectIntoGlobalHook(window);
+                    window.$RefreshReg$ = () => {};
+                    window.$RefreshSig$ = () => (type) => type;
+                </script>
+                <script type="module" src="<?php echo $viteDevServer; ?>/@vite/client"></script>
+                <?php
+            }, 1);
+            
+            // Load the entry point as ES module
+            add_action('admin_footer', function() use ($viteDevServer) {
+                ?>
+                <script type="module" src="<?php echo $viteDevServer; ?>/resources/js/main.tsx"></script>
+                <?php
+            }, 1);
+            
+        } else {
+            // Use built assets in production
+            $appJs = YATRA_PLUGIN_PATH . 'assets/admin/dist/js/app.js';
+
+            if (file_exists($appJs)) {
+                // Version on the plugin version + the bundle's own mtime. That
+                // already changes on every update or rebuild, which is exactly
+                // when the cache must be busted.
+                //
+                // This previously appended time() . microtime(true), making the
+                // URL unique on every single request — so the ~3 MB admin bundle
+                // was re-downloaded on every admin page view and could never be
+                // cached by the browser.
+                $jsVersion = YATRA_VERSION . '.' . filemtime($appJs);
+
+                $localized_data = $this->buildAdminLocalizedData();
+
+                // Enqueue our script with media library as dependency
+                wp_enqueue_script(
+                    'yatra-admin',
+                    YATRA_PLUGIN_URL . 'assets/admin/dist/js/app.js',
+                    [
+                        'jquery',
+                        'underscore',
+                        'backbone',
+                        'media-models',
+                        'wp-mediaelement',
+                        'media-editor',
+                        'media-audiovideo',
+                        'media-views',
+                        'wp-i18n'
+                    ],
+                    $jsVersion,
+                    true
+                );
+
+                // The bundle calls the global wp.i18n.__() (it never ships its
+                // own copy), and scripts/extract-js-pot.mjs writes every admin
+                // string's `#:` reference as this bundle's path precisely so
+                // WordPress's md5(handle src) JSON lookup matches. This call is
+                // the missing last link: it tells WordPress to load
+                // i18n/languages/yatra-{locale}-{md5}.json (or the copy under
+                // WP_LANG_DIR/plugins) for the admin UI. Without it, translated
+                // admin strings never reach the SPA. Mirrors FrontendAssetsProvider.
+                if (function_exists('wp_set_script_translations')) {
+                    wp_set_script_translations('yatra-admin', 'yatra', YATRA_PLUGIN_PATH . 'i18n/languages');
+                    $this->backfillScriptTranslations('yatra-admin');
+                }
+
+                // Localize script data
+                wp_localize_script('yatra-admin', 'yatraAdmin', $localized_data);
+
+                // Phone dataset for admin displays (flag + dial-code detection of
+                // stored "+<code><number>" values in booking details).
+                wp_localize_script('yatra-admin', 'yatraPhoneData', [
+                    'countries' => \Yatra\Helpers\FormatHelper::getPhoneCountries(),
+                    'priority'  => \Yatra\Helpers\FormatHelper::getPhonePriority(),
+                    'flagBase'  => YATRA_PLUGIN_URL . 'assets/img/flags/',
+                ]);
+
+                // Start fetching the ES module as early as possible (helps shorten white/splash time before React runs)
+                $app_js_url = YATRA_PLUGIN_URL . 'assets/admin/dist/js/app.js';
+                add_action('admin_head', static function () use ($app_js_url, $jsVersion): void {
+                    $href = esc_url(add_query_arg('ver', rawurlencode((string) $jsVersion), $app_js_url));
+                    echo '<link rel="modulepreload" href="' . $href . '" />' . "\n";
+                }, 0);
+            }
+        }
+    }
+    
+    /**
+     * Check if Vite dev server is running
+     *
+     * @param string $url
+     * @return bool
+     */
+    private function isViteDevServerRunning(string $url): bool
+    {
+        // Check the actual asset URL, not the root. Uses the WP HTTP API
+        // (not raw cURL) per WP.org guidelines. Only ever called in dev mode
+        // (WP_DEBUG && YATRA_DEV_MODE), so it never runs on production loads.
+        $assetUrl = $url . '/assets/admin/dist/js/app.js';
+
+        $response = wp_remote_head($assetUrl, [
+            'timeout'     => 2,
+            'redirection' => 0,
+        ]);
+
+        if (is_wp_error($response)) {
+            return false;
+        }
+
+        return (int) wp_remote_retrieve_response_code($response) === 200;
+    }
+
+    /**
+     * Add inline script for media library compatibility
+     *
+     * @return void
+     */
+    private function addMediaLibraryCompatScript(): void
+    {
+        // `yatraAdmin` is localized once in enqueueAdminReactJs via buildAdminLocalizedData().
+        // Load WordPress translation data for the yatra domain
+        $this->loadWordPressTranslations();
+    }
+
+    /**
+     * Load WordPress translation data for JavaScript
+     *
+     * @return void
+     */
+    private function loadWordPressTranslations(): void
+    {
+        // Use WordPress built-in function to load script translations.
+        // The third argument MUST be an absolute path to the directory
+        // that contains the per-locale .json translation files.
+        //
+        // Previously this passed YATRA_PLUGIN_FILE — i.e. the main
+        // plugin PHP FILE path, not its directory. Appending
+        // "/i18n/languages" yielded ".../plugin/yatra.php/i18n/languages",
+        // a path that doesn't exist, so WordPress silently fell back to
+        // shipping source-English strings to the React admin regardless
+        // of the operator's WP locale.
+        //
+        // Use YATRA_PLUGIN_PATH (the directory, ending in /) instead,
+        // matching the block-editor side that has always worked.
+        //
+        // The actual JSON file shipped here is generated at BUILD time
+        // by scripts/build-translation-json.mjs from each locale's .po
+        // file. That script writes ONE consolidated JSON per locale
+        // named `yatra-{locale}-{md5(bundle src path)}.json`, so
+        // WordPress's native script-translation loader finds it on
+        // first try — no runtime filter / merge needed.
+        if (function_exists('wp_set_script_translations')) {
+            wp_set_script_translations('yatra-admin', 'yatra', YATRA_PLUGIN_PATH . 'i18n/languages');
+        }
+    }
+
+
+    /**
+     * Enqueue setup wizard assets
+     *
+     * @return void
+     */
+    /**
+     * Feed the admin bundle its translations when no JSON file exists.
+     *
+     * wp_set_script_translations() can only read a `yatra-{locale}-{md5}.json`
+     * file. WordPress.org language packs ship one, so translations from
+     * translate.wordpress.org simply work — but a site translated by hand, with
+     * Loco Translate or a .po/.mo dropped into wp-content/languages, has only
+     * the PHP catalogue. For those sites every string in the React admin stayed
+     * in English no matter how complete the translation was, which looked like
+     * the plugin ignoring the translation altogether.
+     *
+     * The strings are the same ones the PHP catalogue already holds, so they are
+     * handed to wp.i18n directly.
+     *
+     * A JSON file, when there is one, is still printed by core and wins for every
+     * string it holds — but it only ever holds the strings of the one file it is
+     * named after (app.js). Screens split into their own chunks (the consent form
+     * editor, for one) have JSON files keyed by their own file names, which
+     * WordPress never loads, so they stayed English on every site with a
+     * WordPress.org language pack. Whatever the JSON lacks is filled in from the
+     * PHP catalogue, without touching the JSON's own plural rules.
+     *
+     * Nothing is emitted on an untranslated site — the map comes back empty and
+     * English sites carry no extra weight.
+     */
+    private function backfillScriptTranslations(string $handle): void
+    {
+        if (!function_exists('load_script_textdomain')) {
+            return;
+        }
+
+        $json = load_script_textdomain($handle, 'yatra', YATRA_PLUGIN_PATH . 'i18n/languages');
+
+        $localeData = $this->localeDataFromTextdomain('yatra');
+        if ($localeData === []) {
+            return;
+        }
+
+        if (is_string($json) && $json !== '') {
+            $decoded = json_decode($json, true);
+            $known = [];
+            if (is_array($decoded) && isset($decoded['locale_data']) && is_array($decoded['locale_data'])) {
+                foreach ($decoded['locale_data'] as $domainData) {
+                    if (is_array($domainData)) {
+                        $known += $domainData;
+                    }
+                }
+            }
+            // Core's JSON sets the domain header (plural rules) — keep it.
+            unset($localeData['']);
+            $localeData = array_diff_key($localeData, $known);
+            if ($localeData === []) {
+                return;
+            }
+        }
+
+        wp_add_inline_script(
+            $handle,
+            'wp.i18n.setLocaleData(' . wp_json_encode($localeData) . ', "yatra");',
+            'before'
+        );
+    }
+
+    /**
+     * The loaded PHP catalogue, in the shape wp.i18n.setLocaleData() expects.
+     *
+     * Entries that were never translated are left out: they would only restate
+     * the English the bundle already carries. Contexts use the same NUL
+     * separator Jed and gettext use, so _x() resolves too.
+     *
+     * @return array<string, mixed>
+     */
+    private function localeDataFromTextdomain(string $domain): array
+    {
+        $translations = get_translations_for_domain($domain);
+        if (!is_object($translations)) {
+            return [];
+        }
+        // Deliberately duck-typed, and deliberately not isset()/??. WordPress
+        // returns Translations, NOOP_Translations or — since the performant
+        // translations work — WP_Translations, which neither extends
+        // Translations nor declares `entries`: it serves that property through
+        // __get() and defines no __isset(), so both instanceof and isset()
+        // report nothing is there and quietly disable this fallback. Only a
+        // direct read reaches the magic getter.
+        if (!property_exists($translations, 'entries') && !method_exists($translations, '__get')) {
+            return [];
+        }
+
+        $entries = $translations->entries;
+        if (!is_array($entries) || $entries === []) {
+            return [];
+        }
+
+        $data = [];
+        foreach ($entries as $entry) {
+            if (!is_object($entry) || (string) $entry->singular === '') {
+                continue;
+            }
+
+            $forms = array_values(array_filter(
+                (array) $entry->translations,
+                static fn($t) => is_string($t) && $t !== ''
+            ));
+            if ($forms === []) {
+                continue;
+            }
+            // Untranslated entries come back as the original string.
+            if (count($forms) === 1 && $forms[0] === $entry->singular) {
+                continue;
+            }
+
+            $key = ($entry->context !== null && $entry->context !== '')
+                ? $entry->context . "\u{0004}" . $entry->singular
+                : $entry->singular;
+
+            $data[$key] = $forms;
+        }
+
+        if ($data === []) {
+            return [];
+        }
+
+        // The catalogue's own plural rule (Polish, Russian, Arabic… have more than two forms).
+        $headers = $translations->headers;
+        $pluralForms = is_array($headers) && !empty($headers['Plural-Forms']) && is_string($headers['Plural-Forms'])
+            ? $headers['Plural-Forms']
+            : 'nplurals=2; plural=(n != 1);';
+
+        $data[''] = [
+            'domain' => $domain,
+            'lang' => determine_locale(),
+            'plural-forms' => $pluralForms,
+        ];
+
+        return $data;
+    }
+
+    public function enqueueSetupWizardAssets(): void
+    {
+        // Enqueue setup wizard CSS
+        $cssPath = YATRA_PLUGIN_PATH . 'assets/admin/css/setup-wizard.css';
+        if (file_exists($cssPath)) {
+            wp_enqueue_style(
+                'yatra-setup-wizard',
+                YATRA_PLUGIN_URL . 'assets/admin/css/setup-wizard.css',
+                [],
+                YATRA_VERSION
+            );
+        }
+
+        // Enqueue setup wizard JS
+        $jsPath = YATRA_PLUGIN_PATH . 'assets/admin/js/setup-wizard.js';
+        if (file_exists($jsPath)) {
+            wp_enqueue_script(
+                'yatra-setup-wizard',
+                YATRA_PLUGIN_URL . 'assets/admin/js/setup-wizard.js',
+                ['jquery'],
+                YATRA_VERSION,
+                true
+            );
+
+            // Localize setup wizard
+            wp_localize_script('yatra-setup-wizard', 'yatraSetupWizard', [
+                'ajaxurl' => admin_url('admin-ajax.php'),
+                'nonce' => wp_create_nonce('yatra-setup-wizard'),
+            ]);
+        }
+    }
+}

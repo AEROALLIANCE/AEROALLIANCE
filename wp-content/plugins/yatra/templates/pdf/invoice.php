@@ -1,0 +1,255 @@
+<?php
+
+$companyName = (string) ($company_name ?? '');
+if ($companyName === '' && function_exists('yatra_get_brand_name')) {
+    $companyName = yatra_get_brand_name();
+}
+$companyAddress = (string) ($company_address ?? '');
+// Settings keep the business address in separate fields (street, city, state,
+// postcode, country); documents only ever printed the street, so everything after
+// it was missing and the address looked cut off at its last line. Prefer the
+// composed lines, falling back to the raw street for any caller not passing them.
+$companyAddressLines = (isset($company_address_lines) && is_array($company_address_lines))
+    ? array_values(array_filter(array_map('strval', $company_address_lines), static function ($line) {
+        return trim($line) !== '';
+    }))
+    : array_values(array_filter(preg_split('/\R/', $companyAddress) ?: [], static function ($line) {
+        return trim($line) !== '';
+    }));
+$companyEmail = (string) ($company_email ?? '');
+$companyPhone = (string) ($company_phone ?? '');
+
+$customerName = (string) ($customer_name ?? '');
+$customerEmail = (string) ($customer_email ?? '');
+
+// The customer's postal address, one entry per line. Absent on older callers,
+// so an empty list simply renders nothing.
+$customerAddressLines = (isset($customer_address_lines) && is_array($customer_address_lines))
+    ? array_filter(array_map('strval', $customer_address_lines), static function ($line) {
+        return trim($line) !== '';
+    })
+    : [];
+
+$paymentRef = (string) ($payment_ref ?? '');
+$paymentDate = (string) ($payment_date ?? '');
+$paymentStatus = (string) ($payment_status ?? '');
+$statusClass = (string) ($status_class ?? 'pending');
+
+$tripTitle = (string) ($trip_title ?? '');
+$paymentMethod = (string) ($payment_method ?? '');
+$bookingRef = (string) ($booking_ref ?? '');
+$travelDate = (string) ($travel_date ?? '');
+
+$currencySymbol = (string) ($currency_symbol ?? '');
+$amount = (string) ($amount ?? '0.00');
+$bookingTotal = (string) ($booking_total ?? '0.00');
+$amountPaid = (string) ($amount_paid ?? '0.00');
+$amountDue = (string) ($amount_due ?? '0.00');
+
+// Structured payment instructions (e.g. bank-transfer details) provided by a
+// gateway via the yatra_invoice_payment_instructions filter. Shape:
+// ['title' => string, 'rows' => [['label'=>.., 'value'=>..], ...], 'note' => string]
+$paymentInstructions = (isset($payment_instructions) && is_array($payment_instructions)) ? $payment_instructions : [];
+
+
+// Optional logo + header colour supplied by the White Label module.
+// Unbranded sites keep this document's original header colour and show no logo.
+$pdfBranding = function_exists('yatra_get_pdf_branding')
+    ? yatra_get_pdf_branding('#1e40af')
+    : ['logo_url' => '', 'header_color' => '#1e40af'];
+$brandLogoUrl = (string) ($pdfBranding['logo_url'] ?? '');
+$brandHeaderColor = (string) ($pdfBranding['header_color'] ?? '#1e40af');
+
+?><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?php echo esc_html__('Invoice', 'yatra'); ?> - <?php echo htmlspecialchars($bookingRef !== '' ? $bookingRef : $paymentRef, ENT_QUOTES, 'UTF-8'); ?></title>
+    <style>
+        @page { size: A4 portrait; margin: 0mm; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { margin: 0; padding: 0; font-family: "Noto Sans Devanagari", "Noto Sans Arabic", "Noto Sans CJK", "DejaVu Sans", sans-serif; font-size: 12px; color: #111; }
+        .content { padding: 12mm 12mm 14mm 12mm; }
+
+        .header { width: 100%; border-collapse: collapse; }
+        .header td { vertical-align: top; }
+        .brand { background: <?php echo htmlspecialchars($brandHeaderColor, ENT_QUOTES, 'UTF-8'); ?>; color: #fff; padding: 6mm 6mm; }
+        .brand-logo { max-height: 18mm; max-width: 60mm; margin-bottom: 3mm; }
+        .brand h1 { font-size: 18px; font-weight: 700; margin: 0; }
+        .brand p { font-size: 11px; margin-top: 4px; }
+
+        .panel { width: 100%; border: 1px solid #e5e7eb; border-collapse: collapse; margin-top: 6mm; margin-bottom: 6mm; }
+        .panel td { padding: 5mm 5mm; vertical-align: top; }
+        .panel h3 { font-size: 11px; text-transform: uppercase; color: #6b7280; margin-bottom: 8px; letter-spacing: 0.5px; }
+        .muted { color: #6b7280; }
+
+        .details { width: 100%; border-collapse: collapse; }
+        .details td { padding: 1.5mm 0; vertical-align: top; }
+        .details .k { width: 18mm; white-space: nowrap; font-weight: 700; }
+        .details .v { white-space: nowrap; }
+        .details .v-wrap { white-space: normal; }
+
+        .badge { display: inline-block; padding: 2px 10px; font-size: 10px; border-radius: 12px; border: 1px solid #e5e7eb; margin-left: 6px; vertical-align: middle; line-height: 1.4; }
+        .badge-paid { background: #d1fae5; color: #065f46; border-color: #a7f3d0; }
+        .badge-partial { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
+        .badge-pending { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+
+        .items { width: 100%; border-collapse: collapse; margin-top: 4mm; }
+        .items th { text-align: left; font-size: 10px; text-transform: uppercase; color: #6b7280; background: #f9fafb; border-bottom: 1px solid #e5e7eb; padding: 10px 12px; }
+        .items td { border-bottom: 1px solid #e5e7eb; padding: 12px; vertical-align: top; }
+        .right { text-align: right; }
+
+        .totals { width: 100%; border-collapse: collapse; margin-top: 6mm; }
+        .totals td { padding: 7px 12px; }
+        .totals .label { color: #374151; }
+        .totals .value { text-align: right; }
+        .totals .grand { font-weight: 700; color: #1e40af; border-top: 2px solid #1e40af; padding-top: 12px; }
+    </style>
+</head>
+<body>
+<table class="header">
+    <tr>
+        <td class="brand">
+            <?php if ($brandLogoUrl !== ''): ?>
+                <img class="brand-logo" src="<?php echo htmlspecialchars($brandLogoUrl, ENT_QUOTES, 'UTF-8'); ?>" alt="">
+            <?php endif; ?>
+            <h1><?php echo htmlspecialchars($companyName, ENT_QUOTES, 'UTF-8'); ?></h1>
+            <p><?php esc_html_e('Payment Invoice', 'yatra'); ?></p>
+        </td>
+    </tr>
+</table>
+
+<div class="content">
+    <table class="panel">
+        <tr>
+            <td style="width: 40%;">
+                <h3><?php esc_html_e('Invoice To', 'yatra'); ?></h3>
+                <div><strong><?php echo htmlspecialchars($customerName, ENT_QUOTES, 'UTF-8'); ?></strong></div>
+                <?php foreach ($customerAddressLines as $addressLine): ?>
+                    <div class="muted"><?php echo htmlspecialchars($addressLine, ENT_QUOTES, 'UTF-8'); ?></div>
+                <?php endforeach; ?>
+                <div class="muted"><?php echo htmlspecialchars($customerEmail, ENT_QUOTES, 'UTF-8'); ?></div>
+            </td>
+            <td style="width: 30%;">
+                <h3><?php esc_html_e('Invoice Details', 'yatra'); ?></h3>
+                <table class="details">
+                    <tr>
+                        <td class="k"><?php esc_html_e('Invoice #:', 'yatra'); ?></td>
+                        <?php // Always the booking reference — consistent whether the invoice is
+                        // downloaded from the confirmation page or after a payment. Previously
+                        // this used $paymentRef, which the post-payment path set to the payment
+                        // number (PAY-xxxxxx), so the invoice number changed per download. ?>
+                        <td class="v-wrap"><?php echo htmlspecialchars($bookingRef !== '' ? $bookingRef : $paymentRef, ENT_QUOTES, 'UTF-8'); ?></td>
+                    </tr>
+                    <tr>
+                        <td class="k"><?php esc_html_e('Date:', 'yatra'); ?></td>
+                        <td class="v"><?php echo htmlspecialchars($paymentDate, ENT_QUOTES, 'UTF-8'); ?></td>
+                    </tr>
+                    <tr>
+                        <td class="k"><?php esc_html_e('Status:', 'yatra'); ?></td>
+                        <td class="v"><span class="badge badge-<?php echo htmlspecialchars($statusClass, ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($paymentStatus, ENT_QUOTES, 'UTF-8'); ?></span></td>
+                    </tr>
+                </table>
+            </td>
+            <td style="width: 30%;">
+                <h3><?php esc_html_e('Company', 'yatra'); ?></h3>
+                <div><?php echo htmlspecialchars($companyName, ENT_QUOTES, 'UTF-8'); ?></div>
+                <?php foreach ($companyAddressLines as $companyAddressLine): ?>
+                    <div class="muted"><?php echo htmlspecialchars($companyAddressLine, ENT_QUOTES, 'UTF-8'); ?></div>
+                <?php endforeach; ?>
+                <?php if ($companyEmail !== ''): ?>
+                    <div class="muted"><?php echo htmlspecialchars($companyEmail, ENT_QUOTES, 'UTF-8'); ?></div>
+                <?php endif; ?>
+                <?php if ($companyPhone !== ''): ?>
+                    <div class="muted"><?php echo htmlspecialchars($companyPhone, ENT_QUOTES, 'UTF-8'); ?></div>
+                <?php endif; ?>
+            </td>
+        </tr>
+    </table>
+
+    <table class="items">
+        <thead>
+        <tr>
+            <th><?php esc_html_e('Description', 'yatra'); ?></th>
+            <th><?php esc_html_e('Booking Ref', 'yatra'); ?></th>
+            <th><?php esc_html_e('Travel Date', 'yatra'); ?></th>
+            <th class="right"><?php esc_html_e('Amount', 'yatra'); ?></th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>
+                <div><strong><?php echo htmlspecialchars($tripTitle, ENT_QUOTES, 'UTF-8'); ?></strong></div>
+                <div class="muted"><?php esc_html_e('Payment via', 'yatra'); ?> <?php echo htmlspecialchars($paymentMethod, ENT_QUOTES, 'UTF-8'); ?></div>
+            </td>
+            <td><?php echo htmlspecialchars($bookingRef, ENT_QUOTES, 'UTF-8'); ?></td>
+            <td><?php echo htmlspecialchars($travelDate, ENT_QUOTES, 'UTF-8'); ?></td>
+            <td class="right"><strong><?php echo htmlspecialchars($amount, ENT_QUOTES, 'UTF-8'); ?></strong></td>
+        </tr>
+        </tbody>
+    </table>
+
+    <table class="totals">
+        <?php if (!empty($tax_breakdown)): ?>
+        <tr>
+            <td class="label"><?php esc_html_e('Subtotal', 'yatra'); ?></td>
+            <td class="value"><?php echo htmlspecialchars($subtotal, ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+        <?php foreach ($tax_breakdown as $tax): ?>
+        <tr>
+            <td class="label"><?php echo htmlspecialchars($tax['name'], ENT_QUOTES, 'UTF-8'); ?> (<?php echo htmlspecialchars($tax['rate'], ENT_QUOTES, 'UTF-8'); ?>%)</td>
+            <td class="value"><?php echo htmlspecialchars($tax['amount'], ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+        <?php endforeach; ?>
+        <?php endif; ?>
+        <tr>
+            <td class="label"><?php esc_html_e('Booking Total', 'yatra'); ?></td>
+            <td class="value"><?php echo htmlspecialchars($bookingTotal, ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+        <tr>
+            <td class="label"><?php esc_html_e('Total Paid', 'yatra'); ?></td>
+            <td class="value"><?php echo htmlspecialchars($amountPaid, ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+        <tr>
+            <td class="label"><?php esc_html_e('Balance Due', 'yatra'); ?></td>
+            <td class="value"><?php echo htmlspecialchars($amountDue, ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+        <tr>
+            <td class="label grand"><?php esc_html_e('This Payment', 'yatra'); ?></td>
+            <td class="value grand"><?php echo htmlspecialchars($amount, ENT_QUOTES, 'UTF-8'); ?></td>
+        </tr>
+    </table>
+
+    <?php if (!empty($paymentInstructions['rows']) && is_array($paymentInstructions['rows'])): ?>
+    <table class="panel" style="margin-top: 6mm;">
+        <tr>
+            <td>
+                <h3><?php echo htmlspecialchars((string) ($paymentInstructions['title'] ?? __('Payment Instructions', 'yatra')), ENT_QUOTES, 'UTF-8'); ?></h3>
+                <table class="details">
+                    <?php foreach ($paymentInstructions['rows'] as $piRow): ?>
+                        <?php if (!is_array($piRow)) { continue; } ?>
+                    <tr>
+                        <?php
+                        // A gateway may supply its label with or without a
+                        // trailing colon (Bank Transfer reuses the colon-suffixed
+                        // strings from the confirmation page so a single
+                        // translation covers both). Normalise so neither form
+                        // renders "Label::".
+                        $piLabel = rtrim(trim((string) ($piRow['label'] ?? '')), ':');
+                        ?>
+                        <td class="k" style="width: 40mm;"><?php echo htmlspecialchars($piLabel, ENT_QUOTES, 'UTF-8'); ?>:</td>
+                        <td class="v-wrap"><?php echo htmlspecialchars((string) ($piRow['value'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></td>
+                    </tr>
+                    <?php endforeach; ?>
+                </table>
+                <?php if (!empty($paymentInstructions['note'])): ?>
+                <p class="muted" style="margin-top: 4mm;"><?php echo htmlspecialchars((string) $paymentInstructions['note'], ENT_QUOTES, 'UTF-8'); ?></p>
+                <?php endif; ?>
+            </td>
+        </tr>
+    </table>
+    <?php endif; ?>
+</div>
+</body>
+</html>

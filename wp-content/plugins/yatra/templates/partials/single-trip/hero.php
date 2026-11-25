@@ -1,0 +1,342 @@
+<?php
+if (!defined('ABSPATH')) {
+    exit;
+}
+$booking_disabled = isset($trip) && method_exists($trip, 'isBookingDisabled') && $trip->isBookingDisabled();
+$yatra_hero_dp_flags = function_exists('yatra_get_dynamic_pricing_display_flags') ? yatra_get_dynamic_pricing_display_flags() : [
+    'show_savings_badge' => true,
+];
+?>
+<div class="yatra-trip-hero-new" itemscope itemtype="https://schema.org/TouristTrip">
+    <div class="yatra-hero-header">
+        <nav class="yatra-hero-breadcrumb" aria-label="<?php echo esc_attr__('Breadcrumb', 'yatra'); ?>" itemscope itemtype="https://schema.org/BreadcrumbList">
+            <span itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+                <a href="<?php echo esc_url(home_url('/')); ?>" itemprop="item">
+                    <span itemprop="name"><?php echo esc_html__('Home', 'yatra'); ?></span>
+                </a>
+                <meta itemprop="position" content="1" />
+            </span>
+            <span class="yatra-hero-breadcrumb-separator">›</span>
+            <span itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+                <a href="<?php echo esc_url(home_url('/' . \Yatra\Services\SettingsService::getTripBase() . '/')); ?>" itemprop="item">
+                    <span itemprop="name"><?php echo esc_html__('Trips', 'yatra'); ?></span>
+                </a>
+                <meta itemprop="position" content="2" />
+            </span>
+            <span class="yatra-hero-breadcrumb-separator">›</span>
+            <span itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
+                <span class="yatra-hero-breadcrumb-current" itemprop="name"><?php echo esc_html($trip->getTitle()); ?></span>
+                <meta itemprop="position" content="3" />
+            </span>
+        </nav>
+        <h1 class="yatra-trip-hero-title-new" itemprop="name"><?php echo esc_html($trip->getTitle()); ?></h1>
+        <div class="yatra-hero-meta">
+            <?php // Rating is expressed via JSON-LD (Product.aggregateRating) in SEOService — no microdata here, which Google rejected on a TouristTrip parent. ?>
+            <div class="yatra-hero-rating">
+                <?php if ($trip->getAverageRating() > 0 || $trip->getReviewCount() > 0): ?>
+                    <?php
+                    // Shared helper, so the hero, the reviews block below it and the
+                    // booking confirmation all draw the same rating identically.
+                    $hero_avg = (float) $trip->getAverageRating();
+                    $hero_parts = yatra_rating_star_parts($hero_avg);
+                    $hero_full = $hero_parts['full'];
+                    $hero_half = $hero_parts['half'];
+                    ?>
+                    <div class="yatra-rating-stars">
+                        <?php for ($i = 1; $i <= 5; $i++) : ?>
+                            <?php
+                            if ($i <= $hero_full) {
+                                $hero_star_class = 'yatra-star filled';
+                            } elseif ($i === $hero_full + 1 && $hero_half) {
+                                $hero_star_class = 'yatra-star half';
+                            } else {
+                                $hero_star_class = 'yatra-star';
+                            }
+                            ?>
+                            <span class="<?php echo esc_attr($hero_star_class); ?>" aria-label="<?php echo esc_attr(sprintf(
+                                /* translators: %d: star rating number (1-5). */
+                                _n('%d star', '%d stars', $i, 'yatra'),
+                                $i
+                            )); ?>">★</span>
+                        <?php endfor; ?>
+                    </div>
+                    <span class="yatra-rating-number"><?php echo esc_html(number_format($trip->getAverageRating(), 1)); ?></span>
+                    <span class="yatra-rating-text">
+                        <span><?php echo esc_html($trip->getReviewCount()); ?></span>
+                        <?php echo esc_html(_n('Review', 'Reviews', $trip->getReviewCount(), 'yatra')); ?>
+                    </span>
+                <?php else: ?>
+                    <div class="yatra-rating-stars yatra-no-rating">
+                        <?php for ($i = 1; $i <= 5; $i++): ?>
+                            <span class="yatra-star" aria-label="<?php echo esc_attr(sprintf(
+                                /* translators: %d: star rating number (1-5). */
+                                _n('%d star', '%d stars', $i, 'yatra'),
+                                $i
+                            )); ?>">★</span>
+                        <?php endfor; ?>
+                    </div>
+                    <span class="yatra-rating-text yatra-no-reviews"><?php echo esc_html__('No reviews yet', 'yatra'); ?></span>
+                <?php endif; ?>
+            </div>
+            <?php if (!empty($trip->getStartingLocation())): ?>
+                <div class="yatra-hero-location" itemprop="location" itemscope itemtype="https://schema.org/Place">
+                    <?php echo yatra_svg_icon('map-pin', 'yatra-icon-sm'); ?>
+                    <span itemprop="name"><?php echo esc_html($trip->getStartingLocation()); ?></span>
+                </div>
+            <?php endif; ?>
+            <?php if (!empty($trip->getDurationDays()) || $trip->getDurationHours() > 0): ?>
+                <div class="yatra-hero-duration" itemprop="duration">
+                    <?php echo yatra_svg_icon('clock', 'yatra-icon-sm'); ?>
+                    <span>
+                        <?php
+                        if ($trip->getDurationHours() > 0) {
+                            // Hour-based day tour: "8 hours", not "1 day" (matches quick-facts).
+                            echo esc_html(yatra_format_duration(0, null, $trip->getDurationHours()));
+                        } elseif (!empty($trip->getDurationNights()) && $trip->getDurationNights() > 0) {
+                            echo esc_html(sprintf(
+                                /* translators: 1: number of days, 2: number of nights. */
+                                _n('%1$d day %2$d night', '%1$d days %2$d nights', $trip->getDurationDays(), 'yatra'),
+                                $trip->getDurationDays(),
+                                $trip->getDurationNights()
+                            ));
+                        } else {
+                            echo esc_html(sprintf(
+                                /* translators: %d: number of days. */
+                                _n('%d day', '%d days', $trip->getDurationDays(), 'yatra'),
+                                $trip->getDurationDays()
+                            ));
+                        }
+                        ?>
+                    </span>
+                </div>
+            <?php endif; ?>
+            <?php if (!empty($trip->getSeasonalAvailability())): ?>
+                <div class="yatra-hero-season">
+                    <?php echo yatra_svg_icon('calendar', 'yatra-icon-sm'); ?>
+                    <span><?php echo esc_html($trip->getSeasonalAvailability()); ?></span>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <?php
+    // Determine hero images
+    // 1. If featured image is set, use it as main image
+    // 2. If no featured image, use first gallery image as main
+    // 3. Side images are gallery images (up to 3)
+    
+    // Gallery images are already URLs from SingleTripController
+    $gallery_image_urls = isset($trip->gallery_images) && is_array($trip->gallery_images) ? $trip->gallery_images : [];
+    
+    $has_featured = !empty($trip->featured_image_url);
+
+    // Main image: featured image OR first gallery image
+    $main_image_url = '';
+    if ($has_featured) {
+        $main_image_url = $trip->featured_image_url;
+        // If featured is set, side images are first 3 gallery images
+        $side_images = array_slice($gallery_image_urls, 0, 3);
+    } else {
+        // No featured image - use first gallery as main
+        $main_image_url = !empty($gallery_image_urls[0]) ? $gallery_image_urls[0] : '';
+        // Side images start from index 1
+        $side_images = array_slice($gallery_image_urls, 1, 3);
+    }
+
+    // Create combined gallery array for modal (featured + gallery images)
+    $all_gallery_images = [];
+    if ($has_featured) {
+        $all_gallery_images[] = $main_image_url;
+    }
+    $all_gallery_images = array_merge($all_gallery_images, $gallery_image_urls);
+    
+    // Set global variable for content-gallery template
+    global $yatra_hero_gallery_images;
+    $yatra_hero_gallery_images = $all_gallery_images;
+    
+    $total_images = count($all_gallery_images);
+    ?>
+    <div class="yatra-hero-images">
+        <div class="yatra-hero-main-image" itemprop="image" itemscope itemtype="https://schema.org/ImageObject">
+            <?php if (isset($trip->discount_percentage) && $trip->discount_percentage > 0 && !empty($yatra_hero_dp_flags['show_savings_badge'])): ?>
+                <div class="yatra-hero-discount-tag" itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+                    <?php echo esc_html__('SAVE UP TO', 'yatra'); ?> <?php echo esc_html($trip->discount_percentage); ?>%
+                    <meta itemprop="discount" content="<?php echo esc_attr($trip->discount_percentage); ?>">
+                    <meta itemprop="discountCurrency" content="<?php echo esc_attr(\Yatra\Services\SettingsService::getCurrency()); ?>">
+                </div>
+            <?php endif; ?>
+            
+            <!-- Media Badges -->
+            <div class="yatra-hero-media-badges">
+                <?php 
+                $image_count = count($all_gallery_images);
+                $video_count = count($trip->videos ?? []);
+                $youtube_count = count($trip->youtube_videos ?? []);
+                $tour_count = count($trip->virtual_tours ?? []);
+                $doc_count = count($trip->documents ?? []);
+                
+                if ($image_count > 0): ?>
+                    <span class="yatra-media-badge yatra-media-badge-image">
+                        <?php echo yatra_svg_icon('camera', 'yatra-media-badge-icon'); ?>
+                        <span class="yatra-media-badge-count"><?php echo esc_html($image_count); ?></span>
+                    </span>
+                <?php endif; ?>
+                
+                <?php if ($video_count > 0): ?>
+                    <span class="yatra-media-badge yatra-media-badge-video">
+                        <?php echo yatra_svg_icon('play', 'yatra-media-badge-icon'); ?>
+                        <span class="yatra-media-badge-count"><?php echo esc_html($video_count); ?></span>
+                    </span>
+                <?php endif; ?>
+                
+                <?php if ($youtube_count > 0): ?>
+                    <span class="yatra-media-badge yatra-media-badge-youtube">
+                        <?php echo yatra_svg_icon('video', 'yatra-media-badge-icon'); ?>
+                        <span class="yatra-media-badge-count"><?php echo esc_html($youtube_count); ?></span>
+                    </span>
+                <?php endif; ?>
+                
+                <?php if ($tour_count > 0): ?>
+                    <span class="yatra-media-badge yatra-media-badge-tour">
+                        <?php echo yatra_svg_icon('globe', 'yatra-media-badge-icon'); ?>
+                        <span class="yatra-media-badge-count"><?php echo esc_html($tour_count); ?></span>
+                    </span>
+                <?php endif; ?>
+                
+                <?php if ($doc_count > 0): ?>
+                    <span class="yatra-media-badge yatra-media-badge-document">
+                        <?php echo yatra_svg_icon('file-text', 'yatra-media-badge-icon'); ?>
+                        <span class="yatra-media-badge-count"><?php echo esc_html($doc_count); ?></span>
+                    </span>
+                <?php endif; ?>
+            </div>
+            
+            <?php if (!empty($main_image_url)): ?>
+                <a href="#" class="yatra-hero-main-img-link" data-gallery="hero-gallery" data-image-index="0">
+                    <img src="<?php echo esc_url($main_image_url); ?>"
+                         alt="<?php echo esc_attr(sprintf(
+                             /* translators: %s: trip title. */
+                             __('Main image for %s', 'yatra'),
+                             $trip->getTitle()
+                         )); ?>"
+                         title="<?php echo esc_attr($trip->getTitle()); ?>"
+                         itemprop="url" content="<?php echo esc_url($main_image_url); ?>"
+                         data-yatra-src="<?php echo esc_url($main_image_url); ?>"
+                         data-no-lazy="1"
+                         class="yatra-hero-main-img">
+                </a>
+                <meta itemprop="contentUrl" content="<?php echo esc_url($main_image_url); ?>">
+                <meta itemprop="encodingFormat" content="image/jpeg">
+                <meta itemprop="width" content="1200">
+                <meta itemprop="height" content="630">
+            <?php else: ?>
+                <img src="<?php echo esc_url(plugins_url('assets/images/trip-placeholder.svg', YATRA_PLUGIN_FILE)); ?>"
+                     alt="<?php echo esc_attr(sprintf(
+                         /* translators: %s: trip title. */
+                         __('Placeholder image for %s', 'yatra'),
+                         $trip->getTitle()
+                     )); ?>"
+                     title="<?php echo esc_attr($trip->getTitle()); ?>"
+                     itemprop="url" content="<?php echo esc_url(plugins_url('assets/images/trip-placeholder.svg', YATRA_PLUGIN_FILE)); ?>"
+                     class="yatra-hero-main-img">
+                <meta itemprop="contentUrl" content="<?php echo esc_url(plugins_url('assets/images/trip-placeholder.svg', YATRA_PLUGIN_FILE)); ?>">
+                <meta itemprop="encodingFormat" content="image/svg+xml">
+            <?php endif; ?>
+            
+            <!-- Quick Media Switcher -->
+            <div class="yatra-hero-media-switcher">
+                <button type="button" class="yatra-media-switcher-btn yatra-media-switcher-active" data-media="images">
+                    <?php echo yatra_svg_icon('camera', 'yatra-media-switcher-icon'); ?>
+                    <span><?php echo esc_html__('Images', 'yatra'); ?></span>
+                </button>
+                <?php if ($video_count > 0): ?>
+                    <button type="button" class="yatra-media-switcher-btn" data-media="videos">
+                        <?php echo yatra_svg_icon('play', 'yatra-media-switcher-icon'); ?>
+                        <span><?php echo esc_html__('Videos', 'yatra'); ?></span>
+                    </button>
+                <?php endif; ?>
+                <?php if ($youtube_count > 0): ?>
+                    <button type="button" class="yatra-media-switcher-btn" data-media="youtube">
+                        <?php echo yatra_svg_icon('video', 'yatra-media-switcher-icon'); ?>
+                    <span><?php echo esc_html__('Video', 'yatra'); ?></span>
+                    </button>
+                <?php endif; ?>
+                <?php if ($tour_count > 0): ?>
+                    <button type="button" class="yatra-media-switcher-btn" data-media="tours">
+                        <?php echo yatra_svg_icon('globe', 'yatra-media-switcher-icon'); ?>
+                    <span><?php echo esc_html__('360°', 'yatra'); ?></span>
+                    </button>
+                <?php endif; ?>
+                <?php if ($doc_count > 0): ?>
+                    <button type="button" class="yatra-media-switcher-btn" data-media="documents">
+                        <?php echo yatra_svg_icon('file-text', 'yatra-media-switcher-icon'); ?>
+                        <span><?php echo esc_html__('Documents', 'yatra'); ?></span>
+                    </button>
+                <?php endif; ?>
+            </div>
+            
+            <!-- Media Data for JavaScript -->
+            <script type="application/json" id="yatra-hero-media-data">
+                <?php echo json_encode([
+                    'images' => $all_gallery_images,
+                    'videos' => $trip->videos ?? [],
+                    'youtube_videos' => $trip->youtube_videos ?? [],
+                    'virtual_tours' => $trip->virtual_tours ?? [],
+                    'documents' => $trip->documents ?? []
+                ]); ?>
+            </script>
+            
+            <?php if (!$booking_disabled): ?>
+                <!-- Book Now Button on Right Side of Main Image -->
+                <div class="yatra-hero-book-now-container">
+                    <a href="#booking" id="yatra-hero-book-now-btn" class="yatra-hero-book-now-btn">
+                        <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                        </svg>
+                        <?php echo esc_html__('Book Now', 'yatra'); ?>
+                        - <?php echo esc_html(yatra_format_price($base_price)); ?>
+                    </a>
+                </div>
+            <?php endif; ?>
+        </div>
+        <div class="yatra-hero-side-images">
+            <?php if (!empty($side_images)): ?>
+                <?php foreach ($side_images as $index => $img_url): ?>
+                    <div class="yatra-side-image-item">
+                        <img src="<?php echo esc_url($img_url); ?>"
+                             alt="<?php echo esc_attr__('Gallery Image', 'yatra'); ?>"
+                             data-yatra-src="<?php echo esc_url($img_url); ?>"
+                             data-no-lazy="1">
+                        <?php if ($index === 0 && function_exists('yatra_wishlist_enabled') && yatra_wishlist_enabled() && !empty($trip->id)) : ?>
+                            <button type="button" class="yatra-favorite-btn"
+                                    data-trip-id="<?php echo esc_attr((string) $trip->id); ?>"
+                                    title="<?php esc_attr_e('Save to wishlist', 'yatra'); ?>"
+                                    aria-label="<?php echo esc_attr__('Save to wishlist', 'yatra'); ?>">
+                                <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"/>
+                                </svg>
+                            </button>
+                        <?php endif; ?>
+                        <?php if ($index === count($side_images) - 1 && $total_images > 4): ?>
+                            <button type="button" class="yatra-view-all-photos-btn yatra-gallery-play-btn"
+                                    data-gallery="hero-gallery">
+                                <?php echo yatra_svg_icon('camera', 'yatra-icon-sm'); ?>
+                                <?php echo sprintf(
+                                    /* translators: %d: total number of photos in the trip gallery. */
+                                    esc_html__('View all %d photos', 'yatra'),
+                                    $total_images
+                                ); ?>
+                            </button>
+                        <?php endif; ?>
+                    </div>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <div class="yatra-side-image-item">
+                    <img src="<?php echo esc_url(plugins_url('assets/images/trip-placeholder.svg', YATRA_PLUGIN_FILE)); ?>"
+                         alt="<?php echo esc_attr__('Gallery Image', 'yatra'); ?>">
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+</div>

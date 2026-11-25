@@ -1,0 +1,253 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yatra\Core\Routing;
+
+use Yatra\Services\SettingsService;
+
+/**
+ * Matches request paths served as path-based (pretty) URLs.
+ * Used for: plain-permalink mode 404 when path looks like a plugin pretty URL, and by {@see Router}.
+ */
+final class PrettyRouteMatcher
+{
+    /**
+     * @return array<string, mixed>|null Same shape as {@see Router} route_data
+     */
+    public static function match(string $path): ?array
+    {
+        $path = trim($path, '/');
+
+        /**
+         * Override pretty-path routing entirely (runs before built-in rules).
+         * Return a route array shaped like handler data: keys include `type` (trip|taxonomy|listing|…),
+         * and type-specific keys such as `slug`, `taxonomy_type`, `listing_type`, `base`, `paged`, etc.
+         *
+         * @param array<string,mixed>|null $route_data Resolved route or null to use core matching.
+         * @param string $path Trimmed relative path ({@see UrlParser::getCleanRequestPath()} after `yatra_frontend_request_path`).
+         */
+        $override = apply_filters('yatra_pretty_route_match', null, $path);
+        if (is_array($override) && isset($override['type']) && is_string($override['type']) && $override['type'] !== '') {
+            return $override;
+        }
+
+        $pb = SettingsService::getPermalinkBases();
+
+        // 1. Email verification
+        $evQuoted = preg_quote($pb['email_verification_prefix'], '/');
+        if (preg_match('/^' . $evQuoted . '\/([a-zA-Z0-9_-]+)$/', $path, $matches)) {
+            return [
+                'type' => 'email_verification',
+                'token' => $matches[1],
+            ];
+        }
+
+        // 2. Account page
+        $account_base = SettingsService::getAccountBase();
+        $account_route = self::matchAccountRoute($path, $account_base);
+        if ($account_route !== null) {
+            return $account_route;
+        }
+
+        // 3. Trip archive pagination: {trip_base}/page/{n}
+        $trip_base = SettingsService::getTripBase();
+        if (preg_match('/^' . preg_quote($trip_base, '/') . '\/page\/(\d+)\/?$/', $path, $matches)) {
+            return [
+                'type' => 'listing',
+                'listing_type' => 'trip',
+                'base' => $trip_base,
+                'paged' => max(1, (int) $matches[1]),
+            ];
+        }
+
+        // Captured slug segments come in as URL-encoded UTF-8 when the request
+        // path contains non-ASCII characters (e.g. Cyrillic "моя-семья"
+        // arrives here as `%D0%BC%D0%BE%D1%8F-...`). The DB stores the raw
+        // decoded slug, so we must decode + normalise once here before
+        // returning the route data — otherwise downstream handlers query
+        // `findBySlug('%D0%BC...')` and 404 every non-Latin URL. Mirrors WP
+        // core's behaviour in `get_page_by_path`.
+        $decodeSlug = static function (string $raw): string {
+            return \Yatra\Helpers\SlugHelper::generate($raw);
+        };
+
+        // 5. Single trip
+        if (preg_match('/^' . preg_quote($trip_base, '/') . '\/([^\/]+)\/?$/', $path, $matches)) {
+            if ($matches[1] !== 'page') {
+                return [
+                    'type' => 'trip',
+                    'slug' => $decodeSlug($matches[1]),
+                    'base' => $trip_base,
+                ];
+            }
+        }
+
+        // 6. Taxonomy (pagination before single slug)
+        $bases = [
+            'destination' => SettingsService::getDestinationBase(),
+            'activity' => SettingsService::getActivityBase(),
+            'category' => SettingsService::getTripCategoryBase(),
+        ];
+
+        foreach ($bases as $type => $base) {
+            if (preg_match('/^' . preg_quote($base, '/') . '\/([^\/]+)\/page\/(\d+)\/?$/', $path, $matches)) {
+                return [
+                    'type' => 'taxonomy',
+                    'taxonomy_type' => $type,
+                    'slug' => $decodeSlug($matches[1]),
+                    'base' => $base,
+                    'paged' => max(1, (int) $matches[2]),
+                ];
+            }
+        }
+
+        foreach ($bases as $type => $base) {
+            if (preg_match('/^' . preg_quote($base, '/') . '\/([^\/]+)\/?$/', $path, $matches)) {
+                return [
+                    'type' => 'taxonomy',
+                    'taxonomy_type' => $type,
+                    'slug' => $decodeSlug($matches[1]),
+                    'base' => $base,
+                ];
+            }
+        }
+
+        // 7. Listing roots
+        foreach ($bases as $type => $base) {
+            if ($path === $base) {
+                return [
+                    'type' => 'listing',
+                    'listing_type' => $type,
+                    'base' => $base,
+                ];
+            }
+        }
+
+        if ($path === $trip_base) {
+            return [
+                'type' => 'listing',
+                'listing_type' => 'trip',
+                'base' => $trip_base,
+            ];
+        }
+
+        // 8. Booking confirmation (pageless: /{booking_base}/{confirmation_segment}/{ref}/ + legacy slug)
+        $booking_base = SettingsService::getBookingBase();
+        $confirmSeg = preg_quote($pb['booking_flow_confirmation_segment'], '/');
+        if (preg_match('/^' . preg_quote($booking_base, '/') . '\/' . $confirmSeg . '\/([a-zA-Z0-9_-]+)$/', $path, $matches)) {
+            return [
+                'type' => 'booking_confirmation',
+                'confirmation_id' => $matches[1],
+            ];
+        }
+
+        $legacyConfQuoted = preg_quote($pb['legacy_booking_confirmation_prefix'], '/');
+        if (preg_match('/^' . $legacyConfQuoted . '\/([a-zA-Z0-9_-]+)$/', $path, $matches)) {
+            return [
+                'type' => 'booking_confirmation',
+                'confirmation_id' => $matches[1],
+            ];
+        }
+
+        // 9. Remaining checkout (rewrite) and legacy checkout/ path
+        $remQuoted = preg_quote($pb['remaining_checkout_prefix'], '/');
+        if (preg_match('/^' . $remQuoted . '\/([a-zA-Z0-9_-]+)$/', $path, $matches)) {
+            return [
+                'type' => 'checkout',
+                'token' => $matches[1],
+            ];
+        }
+
+        if (preg_match('/^checkout\/([a-zA-Z0-9_-]+)$/', $path, $matches)) {
+            return [
+                'type' => 'checkout',
+                'token' => $matches[1],
+            ];
+        }
+
+        // 10. Booking hub / trip booking
+        if (!SettingsService::useCustomBookingPage()) {
+            if (preg_match('/^' . preg_quote($booking_base, '/') . '\/([^\/]+)\/?$/', $path, $matches)) {
+                return [
+                    'type' => 'booking',
+                    'page' => 'main',
+                    'base' => $booking_base,
+                    'trip' => $matches[1],
+                ];
+            }
+            if ($path === $booking_base) {
+                return [
+                    'type' => 'booking',
+                    'page' => 'main',
+                    'base' => $booking_base,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return array{type: string, page: string, base: string}|null
+     */
+    private static function matchAccountRoute(string $path, string $account_base): ?array
+    {
+        $path_trim = rtrim($path, '/');
+        $base_trim = rtrim($account_base, '/');
+
+        if ($path_trim === $base_trim) {
+            $tab = isset($_GET['tab']) ? sanitize_key((string) $_GET['tab']) : '';
+
+            return [
+                'type' => 'account',
+                'page' => self::accountQueryTabToPage($tab),
+                'base' => $account_base,
+            ];
+        }
+
+        $quoted = preg_quote($account_base, '/');
+        if (preg_match('/^' . $quoted . '\/([^\/]+)/', $path, $m)) {
+            $page = self::accountPathSegmentToPage($m[1]);
+            if ($page === null) {
+                return null;
+            }
+
+            return [
+                'type' => 'account',
+                'page' => $page,
+                'base' => $account_base,
+            ];
+        }
+
+        return null;
+    }
+
+    private static function accountQueryTabToPage(string $tab): string
+    {
+        $allowed = ['dashboard', 'bookings', 'payments', 'documents', 'profile', 'saved-trips'];
+        if ($tab === '' || !in_array($tab, $allowed, true)) {
+            return 'dashboard';
+        }
+
+        return $tab;
+    }
+
+    private static function accountPathSegmentToPage(string $segment): ?string
+    {
+        $segment = sanitize_title($segment);
+        $map = [
+            'dashboard' => 'dashboard',
+            'profile' => 'profile',
+            'bookings' => 'bookings',
+            'payments' => 'payments',
+            'documents' => 'documents',
+            'support' => 'dashboard',
+            'saved-trips' => 'saved-trips',
+            'wishlist' => 'saved-trips',
+            'settings' => 'profile',
+        ];
+
+        return $map[$segment] ?? null;
+    }
+}

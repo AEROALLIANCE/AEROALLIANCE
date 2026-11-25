@@ -1,0 +1,1137 @@
+import React from "react";
+import {
+  Calendar as CalendarIcon,
+  Users,
+  DollarSign as DollarSignIcon,
+  CreditCard,
+  Mail,
+  Phone as PhoneIcon,
+  FileText as FileTextIcon,
+  AlertCircle,
+  ArrowRight,
+  ExternalLink,
+  Download,
+} from "lucide-react";
+import { __, sprintf } from "../../lib/i18n";
+import {
+  formatDate,
+  formatTravelDateRange,
+  getBadge,
+  getStatusLabel,
+  formatPriceForBooking,
+  getYatraAccountPageGlobals,
+} from "./utils";
+import TaxDisplay from "../../components/booking/TaxDisplay";
+
+const getCountryName = (code: string): string => {
+  if (!code || typeof code !== "string") {
+    return "";
+  }
+  const upperCode = code.trim().toUpperCase();
+  if (upperCode.length !== 2) {
+    return code;
+  }
+  try {
+    const locale = getYatraAccountPageGlobals().locale;
+    const tag = locale ? locale.replace(/_/g, "-") : undefined;
+    const display = new Intl.DisplayNames(tag ? [tag] : undefined, {
+      type: "region",
+    });
+    const name = display.of(upperCode);
+    return name && name !== upperCode ? name : code;
+  } catch {
+    return code;
+  }
+};
+
+/**
+ * Human, translatable label for a traveler / contact / emergency field.
+ *
+ * Traveler data is stored keyed by field id (e.g. "date_of_birth"), so the
+ * account page previously derived labels by de-snake-casing the id. That left
+ * them permanently English. Map the known standard fields to translatable
+ * strings (resolved via the account-page translations catalog) and fall back
+ * to the prettified id for any custom field an operator may have added.
+ *
+ * Keep the English source strings here in sync with the `getFrontendTranslations()`
+ * map in FrontendAssetsProvider so they resolve on the account page.
+ */
+// Built once on first use (lazily, so __() runs after the account-page
+// translations catalog is in place), then cached for every subsequent field.
+let knownFieldLabels: Record<string, string> | null = null;
+const getKnownFieldLabels = (): Record<string, string> => {
+  if (knownFieldLabels === null) {
+    knownFieldLabels = {
+      first_name: __("First Name", "yatra"),
+      last_name: __("Last Name", "yatra"),
+      full_name: __("Full Name", "yatra"),
+      name: __("Name", "yatra"),
+      email: __("Email", "yatra"),
+      phone: __("Phone", "yatra"),
+      mobile: __("Mobile", "yatra"),
+      date_of_birth: __("Date of Birth", "yatra"),
+      gender: __("Gender", "yatra"),
+      nationality: __("Nationality", "yatra"),
+      country: __("Country", "yatra"),
+      address: __("Address", "yatra"),
+      city: __("City", "yatra"),
+      state: __("State", "yatra"),
+      postal_code: __("Postal Code", "yatra"),
+      zip_code: __("Zip Code", "yatra"),
+      passport: __("Passport", "yatra"),
+      passport_number: __("Passport Number", "yatra"),
+      passport_expiry: __("Passport Expiry", "yatra"),
+      dietary_requirements: __("Dietary Requirements", "yatra"),
+      special_requirements: __("Special Requirements", "yatra"),
+      relationship: __("Relationship", "yatra"),
+      company: __("Company", "yatra"),
+    };
+  }
+  return knownFieldLabels;
+};
+
+const fieldLabel = (fieldId: string): string => {
+  const known = getKnownFieldLabels();
+  if (Object.prototype.hasOwnProperty.call(known, fieldId)) {
+    return known[fieldId];
+  }
+  return fieldId.replace(/_/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+};
+
+interface BookingDetailsData {
+  id: number;
+  booking_number: string;
+  customer_name: string;
+  customer_email?: string;
+  customer_phone?: string;
+  customer_country?: string;
+  trip_id: number;
+  trip_title: string;
+  trip_url?: string;
+  trip_image?: string;
+  trip_price: number;
+  booking_date: string;
+  travel_date: string;
+  end_date?: string | null;
+  start_date?: string | null;
+  travelers: number;
+  travelers_data?: any[];
+  total_amount: number;
+  amount_paid: number;
+  amount_due: number;
+  currency: string;
+  payment_schedule?: {
+    amount_due: number;
+    currency: string;
+    /** 'scheduled' = rows that will be charged/chased; 'projected' = implied by settings. */
+    source: "scheduled" | "projected" | "none";
+    next_due_date: string | null;
+    next_amount: number | null;
+    is_overdue: boolean;
+    installments: {
+      number: number | null;
+      amount: number;
+      due_date: string;
+      status: string;
+    }[];
+  } | null;
+  discount_amount?: number;
+  payment_status: string;
+  booking_status: string;
+  payment_method?: string;
+  payment_date?: string;
+  notes?: string;
+  emergency_contact?: any;
+  contact_data?: any;
+  payments?: any[];
+  itinerary_costs?: Array<{
+    id: number;
+    name: string;
+    description?: string;
+    price: number;
+    price_per: string;
+    total_cost: number;
+    cost_per_person: boolean;
+    item_type?: string;
+    day_number?: number;
+  }>;
+  itinerary_costs_total?: number;
+  downloads?: Array<{
+    id: string;
+    title: string;
+    url: string;
+    visibility?: string;
+    access_label?: string;
+    locked?: boolean;
+    locked_reason?: string;
+  }>;
+  created_at: string;
+  updated_at?: string;
+}
+
+interface BookingDetailsProps {
+  booking: BookingDetailsData | null;
+  isLoading: boolean;
+  onBack: () => void;
+}
+
+const BookingDetails: React.FC<BookingDetailsProps> = ({
+  booking,
+  isLoading,
+  onBack,
+}) => {
+  if (isLoading) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
+              {__("Booking Details", "yatra")}
+            </h2>
+          </div>
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={onBack}
+            className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
+          >
+            <ArrowRight className="w-4 h-4 rotate-180" />
+            {__("Back to Bookings", "yatra")}
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+          <div className="animate-pulse space-y-4">
+            <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4"></div>
+            <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/2"></div>
+            <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-2/3"></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!booking) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
+              {__("Booking Details", "yatra")}
+            </h2>
+          </div>
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={onBack}
+            className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
+          >
+            <ArrowRight className="w-4 h-4 rotate-180" />
+            {__("Back to Bookings", "yatra")}
+          </div>
+        </div>
+        <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6 text-center text-red-500">
+          {__("Booking not found or error loading booking", "yatra")}
+        </div>
+      </div>
+    );
+  }
+
+  const normalizeRecord = (value: any): Record<string, any> | null => {
+    if (!value) return null;
+    if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+          return parsed as Record<string, any>;
+      } catch {
+        return null;
+      }
+      return null;
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+      return value as Record<string, any>;
+    }
+    return null;
+  };
+
+  const emergencyContact = normalizeRecord((booking as any).emergency_contact);
+  const contactData = normalizeRecord((booking as any).contact_data);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
+            {__("Booking Details", "yatra")}
+          </h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+            {__("Complete booking information", "yatra")}
+          </p>
+        </div>
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={onBack}
+          className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
+        >
+          <ArrowRight className="w-4 h-4 rotate-180" />
+          {__("Back to Bookings", "yatra")}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Main Content */}
+        <div className="lg:col-span-2 space-y-6">
+          {/* Booking Overview.
+              The header used to render two bare status badges side-by-side
+              — `booking_status` and `payment_status` — which both read
+              "Pending" with no label, so the user couldn't tell which was
+              which. Both statuses now live in the right sidebar with
+              explicit "Booking Status" / "Payment Status" labels (see
+              the Payment Information card below), so we drop the
+              ambiguous badges from this header. */}
+          <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                {__("Booking Overview", "yatra")}
+              </h3>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Booking Number", "yatra")}
+                </div>
+                <div className="text-lg font-semibold text-gray-900 dark:text-white">
+                  {booking.booking_number || `#${booking.id}`}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Trip", "yatra")}
+                </div>
+                <div className="text-lg font-semibold text-gray-900 dark:text-white">
+                  {booking.trip_title}
+                </div>
+                {booking.trip_url ? (
+                  <a
+                    href={booking.trip_url}
+                    className="mt-2 inline-flex items-center gap-2 text-sm text-yatra-primary dark:text-yatra-on-dark hover:underline"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    {__("View Trip", "yatra")}
+                  </a>
+                ) : null}
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                  <CalendarIcon className="w-3 h-3" />
+                  {__("Booking Date", "yatra")}
+                </div>
+                <div className="text-sm text-gray-900 dark:text-white">
+                  {formatDate(booking.booking_date || booking.created_at)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                  <CalendarIcon className="w-3 h-3" />
+                  {__("Travel Date", "yatra")}
+                </div>
+                <div className="text-sm text-gray-900 dark:text-white">
+                  {formatTravelDateRange(booking.travel_date, booking.end_date)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                  <Users className="w-3 h-3" />
+                  {__("Number of Travelers", "yatra")}
+                </div>
+                <div className="text-sm text-gray-900 dark:text-white">
+                  {(() => {
+                    // The detail endpoint REPLACES `travelers` (which the
+                    // list endpoint sent as an integer count) with an array
+                    // of full traveler objects from getBookingTravelers().
+                    // Always read `travelers_count` — it's preserved as an
+                    // integer in both list and detail shapes, and falling
+                    // back to `travelers.length` covers the array case if
+                    // the count was missing from the payload.
+                    const t: any = (booking as any).travelers;
+                    const n =
+                      Number(
+                        (booking as any).travelers_count ??
+                          (Array.isArray(t) ? t.length : t) ??
+                          0,
+                      ) || 0;
+                    // Two __() strings instead of _n(): wp-cli make-pot's
+                    // scan of the MINIFIED account-page bundle extracts __()
+                    // calls but misses _n(), so a plural here never gets an
+                    // account-page.js catalog entry and stays English on the
+                    // frontend. Mirrors the traveler-list label below.
+                    return n === 1
+                      ? sprintf(__("%d Traveler", "yatra"), n)
+                      : sprintf(__("%d Travelers", "yatra"), n);
+                  })()}
+                </div>
+              </div>
+            </div>
+
+            {/* Payment Summary with Gross/Net and Tax Breakdown */}
+            <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+              <h4 className="text-sm font-semibold text-gray-900 dark:text-white mb-3">
+                {__("Payment Summary", "yatra")}
+              </h4>
+              <div className="space-y-2">
+                {/* Gross Total */}
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-600 dark:text-gray-400">
+                    {__("Gross Total", "yatra")}
+                  </span>
+                  <span className="text-gray-900 dark:text-white">
+                    {formatPriceForBooking(
+                      (booking as any).subtotal || booking.total_amount,
+                      booking.currency,
+                    )}
+                  </span>
+                </div>
+
+                {/* Taxable Amount (SubTotal) */}
+                {typeof (booking as any).taxable_amount === "number" &&
+                  (booking as any).taxable_amount > 0 &&
+                  ((booking as any).tax_amount > 0 ||
+                    (booking as any).tax_breakdown?.length > 0) && (
+                    <div className="flex justify-between text-sm font-medium">
+                      <span className="text-gray-600 dark:text-gray-400">
+                        {__("Subtotal (Taxable Amount)", "yatra")}
+                      </span>
+                      <span className="text-gray-900 dark:text-white">
+                        {formatPriceForBooking(
+                          (booking as any).taxable_amount,
+                          booking.currency,
+                        )}
+                      </span>
+                    </div>
+                  )}
+
+                {/* Discount if any */}
+                {booking.discount_amount && booking.discount_amount > 0 && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-gray-600 dark:text-gray-400">
+                      {__("Discount", "yatra")}
+                    </span>
+                    <span className="text-green-600 dark:text-green-400">
+                      -
+                      {formatPriceForBooking(
+                        booking.discount_amount,
+                        booking.currency,
+                      )}
+                    </span>
+                  </div>
+                )}
+
+                {/* Itinerary Costs */}
+                {booking.itinerary_costs &&
+                  booking.itinerary_costs.length > 0 && (
+                    <>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600 dark:text-gray-400 font-medium">
+                          {__("Itinerary Costs", "yatra")}
+                        </span>
+                      </div>
+                      {booking.itinerary_costs.map((cost, index) => (
+                        <div
+                          key={index}
+                          className="flex justify-between text-sm ml-4"
+                        >
+                          <span className="text-gray-600 dark:text-gray-400">
+                            {cost.name}
+                            {cost.price_per === "person" && (
+                              <span className="text-xs text-gray-500 dark:text-gray-500 ml-1">
+                                ({__("per person", "yatra")})
+                              </span>
+                            )}
+                            {cost.price_per === "group" && (
+                              <span className="text-xs text-gray-500 dark:text-gray-500 ml-1">
+                                ({__("per booking", "yatra")})
+                              </span>
+                            )}
+                          </span>
+                          <span className="text-gray-900 dark:text-white">
+                            {formatPriceForBooking(
+                              cost.total_cost,
+                              booking.currency,
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+
+                {/* Tax Breakdown */}
+                {(booking as any).tax_amount > 0 && (
+                  <>
+                    {(() => {
+                      // Use tax_breakdown if available (already parsed by backend)
+                      const taxBreakdown = (booking as any).tax_breakdown;
+
+                      if (
+                        Array.isArray(taxBreakdown) &&
+                        taxBreakdown.length > 0
+                      ) {
+                        return taxBreakdown.map((tax: any, index: number) => (
+                          <div
+                            key={index}
+                            className="flex justify-between text-sm"
+                          >
+                            <span className="text-gray-600 dark:text-gray-400">
+                              {tax.name} ({tax.rate}%)
+                            </span>
+                            <span className="text-gray-900 dark:text-white">
+                              {formatPriceForBooking(
+                                tax.amount,
+                                booking.currency,
+                              )}
+                            </span>
+                          </div>
+                        ));
+                      }
+
+                      // Fallback: try parsing tax_details JSON string
+                      const taxDetails = (booking as any).tax_details;
+                      if (taxDetails) {
+                        try {
+                          const taxes =
+                            typeof taxDetails === "string"
+                              ? JSON.parse(taxDetails)
+                              : taxDetails;
+
+                          if (Array.isArray(taxes) && taxes.length > 0) {
+                            return taxes.map((tax: any, index: number) => (
+                              <div
+                                key={index}
+                                className="flex justify-between text-sm"
+                              >
+                                <span className="text-gray-600 dark:text-gray-400">
+                                  {tax.name} ({tax.rate}%)
+                                </span>
+                                <span className="text-gray-900 dark:text-white">
+                                  {formatPriceForBooking(
+                                    tax.amount,
+                                    booking.currency,
+                                  )}
+                                </span>
+                              </div>
+                            ));
+                          }
+                        } catch (e) {
+                          console.error("Failed to parse tax_details:", e);
+                        }
+                      }
+
+                      // Final fallback: show single tax line
+                      if ((booking as any).tax_amount > 0) {
+                        return (
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600 dark:text-gray-400">
+                              {__("Tax", "yatra")} ({(booking as any).tax_rate}
+                              %)
+                            </span>
+                            <span className="text-gray-900 dark:text-white">
+                              {formatPriceForBooking(
+                                (booking as any).tax_amount,
+                                booking.currency,
+                              )}
+                            </span>
+                          </div>
+                        );
+                      }
+
+                      return null;
+                    })()}
+                  </>
+                )}
+
+                {/* Net Amount (Total with tax) */}
+                <div className="flex justify-between text-base font-semibold pt-2 border-t border-gray-200 dark:border-gray-700">
+                  <span className="text-gray-900 dark:text-white">
+                    {__("Net Amount", "yatra")}
+                  </span>
+                  <span className="text-gray-900 dark:text-white">
+                    {formatPriceForBooking(
+                      booking.total_amount,
+                      booking.currency,
+                    )}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Customer Information.
+              The API (CustomerService::getBookingDetailsForUser) returns
+              the booking's CONTACT fields — `contact_first_name`,
+              `contact_last_name`, `contact_email`, `contact_phone`,
+              `contact_country` — straight from the bookings table. This
+              card was previously reading `customer_name`/`customer_email`
+              /`customer_phone`, which the API never set, so the section
+              was always blank.
+
+              Also fall back to the trip's lead-traveler fields (first
+              entry in `travelers_data`) when the contact_* columns are
+              empty, since some legacy flows wrote the lead traveler's
+              info there instead. */}
+          <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              {__("Customer Information", "yatra")}
+            </h3>
+            {(() => {
+              const leadTraveler =
+                Array.isArray(booking.travelers_data) &&
+                booking.travelers_data.length > 0
+                  ? booking.travelers_data[0]
+                  : null;
+              const leadFields =
+                leadTraveler && typeof leadTraveler === "object"
+                  ? (leadTraveler as any).fields || (leadTraveler as any)
+                  : null;
+
+              const firstName =
+                (booking as any).contact_first_name ||
+                (leadFields && leadFields.first_name) ||
+                "";
+              const lastName =
+                (booking as any).contact_last_name ||
+                (leadFields && leadFields.last_name) ||
+                "";
+              const fullName =
+                [firstName, lastName].filter(Boolean).join(" ").trim() ||
+                (booking as any).customer_name ||
+                "";
+              const email =
+                (booking as any).contact_email ||
+                (booking as any).customer_email ||
+                (leadFields && leadFields.email) ||
+                "";
+              const phone =
+                (booking as any).contact_phone ||
+                (booking as any).customer_phone ||
+                (leadFields && leadFields.phone) ||
+                "";
+              const country =
+                (booking as any).contact_country ||
+                (leadFields && leadFields.country) ||
+                "";
+
+              const hasAny = fullName || email || phone || country;
+
+              if (!hasAny) {
+                return (
+                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                    {__("No customer information recorded.", "yatra")}
+                  </p>
+                );
+              }
+
+              return (
+                <div className="space-y-3">
+                  <div>
+                    {fullName && (
+                      <div className="text-sm font-medium text-gray-900 dark:text-white mb-1">
+                        {fullName}
+                      </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-gray-600 dark:text-gray-400">
+                      {email && (
+                        <div className="flex items-center gap-1.5">
+                          <Mail className="w-4 h-4" />
+                          <a
+                            href={`mailto:${email}`}
+                            className="hover:text-yatra-primary dark:hover:text-yatra-on-dark"
+                          >
+                            {email}
+                          </a>
+                        </div>
+                      )}
+                      {phone && (
+                        <div className="flex items-center gap-1.5">
+                          <PhoneIcon className="w-4 h-4" />
+                          <a
+                            href={`tel:${String(phone).replace(/\s+/g, "")}`}
+                            className="hover:text-yatra-primary dark:hover:text-yatra-on-dark"
+                          >
+                            {phone}
+                          </a>
+                        </div>
+                      )}
+                      {country && <div>{getCountryName(country)}</div>}
+                    </div>
+                  </div>
+
+                  {/* Custom / extra contact fields (nationality, address, and
+                      any Dynamic Form custom contact field), pulled from the
+                      contact_data JSON. Core fields above are excluded. */}
+                  {(() => {
+                    const CORE = [
+                      "first_name",
+                      "last_name",
+                      "email",
+                      "phone",
+                      "country",
+                    ];
+                    const extras = contactData
+                      ? Object.entries(contactData).filter(
+                          ([k, v]) =>
+                            !CORE.includes(k) &&
+                            v != null &&
+                            String(v).trim() !== "",
+                        )
+                      : [];
+                    if (extras.length === 0) return null;
+                    return (
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3 pt-3 border-t border-gray-100 dark:border-gray-700">
+                        {extras.map(([fieldId, value]) => {
+                          const label = fieldLabel(fieldId);
+                          let displayValue = String(value);
+                          if (
+                            (fieldId === "nationality" ||
+                              fieldId === "country") &&
+                            typeof value === "string" &&
+                            value.length === 2
+                          ) {
+                            displayValue = getCountryName(value);
+                          }
+                          return (
+                            <div key={fieldId}>
+                              <div className="text-xs text-gray-500 dark:text-gray-400 mb-0.5">
+                                {label}
+                              </div>
+                              <div className="text-sm text-gray-900 dark:text-white">
+                                {displayValue}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Travelers Information */}
+          {booking.travelers_data && booking.travelers_data.length > 0 && (
+            <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+                <Users className="w-5 h-5" />
+                {__("Travelers Information", "yatra")}
+                <span className="text-sm font-normal text-gray-500 dark:text-gray-400">
+                  ({booking.travelers_data.length}{" "}
+                  {booking.travelers_data.length === 1
+                    ? __("traveler", "yatra")
+                    : __("travelers", "yatra")}
+                  )
+                </span>
+              </h3>
+              <div className="space-y-4">
+                {booking.travelers_data.map((traveler: any, index: number) => {
+                  // Extract fields from traveler - handle both flat structure and nested fields property
+                  const travelerFieldsData = traveler.fields || traveler;
+                  const systemFields = [
+                    "id",
+                    "booking_id",
+                    "traveller_index",
+                    "is_lead",
+                    "created_at",
+                    "updated_at",
+                    "fields",
+                  ];
+
+                  // Get all non-empty fields from the traveler data, excluding system fields
+                  const travelerEntries = Object.entries(
+                    travelerFieldsData,
+                  ).filter(([key, value]) => {
+                    // Exclude system fields
+                    if (systemFields.includes(key)) return false;
+                    // Exclude empty values
+                    if (
+                      !value ||
+                      (typeof value === "string" && value.trim() === "")
+                    )
+                      return false;
+                    // Exclude objects (they should be in fields)
+                    if (typeof value === "object" && !Array.isArray(value))
+                      return false;
+                    return true;
+                  });
+
+                  // Get name from fields or direct properties
+                  const firstName =
+                    travelerFieldsData.first_name || traveler.first_name || "";
+                  const lastName =
+                    travelerFieldsData.last_name || traveler.last_name || "";
+
+                  return (
+                    <div
+                      key={index}
+                      className={`p-4 rounded-lg ${index === 0 ? "bg-yatra-soft dark:bg-yatra-surface-dark-muted border border-yatra-border-subtle dark:border-yatra-border-dark" : "bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700"}`}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-white">
+                          {index === 0
+                            ? __("Lead Traveler", "yatra")
+                            : `${__("Traveler", "yatra")} ${index + 1}`}
+                          {(firstName || lastName) && (
+                            <span className="font-normal text-gray-500 dark:text-gray-400 ml-2">
+                              -{" "}
+                              {[firstName, lastName].filter(Boolean).join(" ")}
+                            </span>
+                          )}
+                        </h4>
+                        {index === 0 && (
+                          <span className="text-xs bg-yatra-chip-bg text-yatra-primary-dark dark:bg-yatra-surface-dark dark:text-yatra-primary-light px-2 py-0.5 rounded">
+                            {__("Primary Contact", "yatra")}
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {travelerEntries.map(([fieldId, fieldValue]) => {
+                          if (
+                            fieldId === "first_name" ||
+                            fieldId === "last_name"
+                          )
+                            return null;
+                          const label = fieldLabel(fieldId);
+                          let displayValue = String(fieldValue);
+                          if (
+                            fieldId.includes("date") ||
+                            fieldId.includes("expiry")
+                          ) {
+                            try {
+                              displayValue = formatDate(fieldValue as string);
+                            } catch {
+                              displayValue = String(fieldValue);
+                            }
+                          }
+
+                          // Format country/nationality fields - convert code to full name
+                          if (
+                            (fieldId === "nationality" ||
+                              fieldId === "country") &&
+                            fieldValue &&
+                            typeof fieldValue === "string" &&
+                            fieldValue.length === 2
+                          ) {
+                            displayValue = getCountryName(fieldValue);
+                          }
+                          return (
+                            <div key={fieldId}>
+                              <div className="text-xs text-gray-500 dark:text-gray-400 mb-0.5">
+                                {label}
+                              </div>
+                              <div
+                                className={`text-sm text-gray-900 dark:text-white ${fieldId === "passport" ? "font-mono" : ""}`}
+                              >
+                                {displayValue}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Emergency Contact */}
+          {emergencyContact &&
+            Object.values(emergencyContact).some(
+              (v: any) => v && String(v).trim() !== "",
+            ) && (
+              <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+                  <AlertCircle className="w-5 h-5" />
+                  {__("Emergency Contact", "yatra")}
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {Object.entries(emergencyContact)
+                    .filter(
+                      ([_, value]) => value && String(value).trim() !== "",
+                    )
+                    .map(([fieldId, fieldValue]) => {
+                      const label = fieldLabel(fieldId);
+                      return (
+                        <div key={fieldId}>
+                          <div className="text-xs text-gray-500 dark:text-gray-400 mb-0.5">
+                            {label}
+                          </div>
+                          <div className="text-sm font-medium text-gray-900 dark:text-white">
+                            {String(fieldValue)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
+
+          {/* Special Requests */}
+          {booking.notes && (
+            <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+                <FileTextIcon className="w-5 h-5" />
+                {__("Special Requests", "yatra")}
+              </h3>
+              <p className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap">
+                {booking.notes}
+              </p>
+            </div>
+          )}
+
+          {/* Downloads */}
+          {Array.isArray((booking as any).downloads) &&
+            (booking as any).downloads.length > 0 && (
+              <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
+                  <Download className="w-5 h-5" />
+                  {__("Downloads", "yatra")}
+                </h3>
+                <div className="space-y-3">
+                  {(booking as any).downloads.map((d: any) => (
+                    <div
+                      key={d.id}
+                      className="flex items-center justify-between gap-3 p-3 rounded-lg border border-gray-200 dark:border-gray-700"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                          {d.title}
+                        </div>
+                        {d.access_label ? (
+                          <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            {d.access_label}
+                          </div>
+                        ) : null}
+                        {d.locked && d.locked_reason ? (
+                          <div className="text-xs text-amber-700 dark:text-amber-300 mt-1">
+                            {d.locked_reason}
+                          </div>
+                        ) : null}
+                      </div>
+                      {d.locked || !d.url ? (
+                        <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300 text-sm font-medium cursor-not-allowed">
+                          <Download className="w-4 h-4" />
+                          {__("Not Available", "yatra")}
+                        </div>
+                      ) : (
+                        <a
+                          href={d.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-yatra-primary text-white hover:bg-yatra-primary-dark transition-colors text-sm font-medium"
+                        >
+                          <Download className="w-4 h-4" />
+                          {__("Download", "yatra")}
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+        </div>
+
+        {/* Sidebar */}
+        <div className="space-y-6">
+          {/* Payment Information.
+              Hosts BOTH the booking-status and the payment-status
+              badges, each with an explicit label, so the previous
+              "two unlabelled Pending pills in the overview header"
+              ambiguity is gone — the user can tell at a glance which
+              status is which. */}
+          <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              {__("Payment Information", "yatra")}
+            </h3>
+            <div className="space-y-3">
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Booking Status", "yatra")}
+                </div>
+                <div className="mt-1">
+                  <span className={getBadge(booking.booking_status)}>
+                    {getStatusLabel(booking.booking_status)}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Payment Status", "yatra")}
+                </div>
+                <div className="mt-1">
+                  <span className={getBadge(booking.payment_status)}>
+                    {getStatusLabel(booking.payment_status)}
+                  </span>
+                </div>
+              </div>
+              {booking.payment_method && (
+                <div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1 flex items-center gap-1">
+                    <CreditCard className="w-3 h-3" />
+                    {__("Payment Method", "yatra")}
+                  </div>
+                  <div className="text-sm text-gray-900 dark:text-white">
+                    {booking.payment_method}
+                  </div>
+                </div>
+              )}
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Total Amount", "yatra")}
+                </div>
+                <div className="text-lg font-semibold text-gray-900 dark:text-white">
+                  {formatPriceForBooking(
+                    booking.total_amount,
+                    booking.currency,
+                  )}
+                </div>
+              </div>
+              {booking.amount_paid > 0 && (
+                <div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                    {__("Amount Paid", "yatra")}
+                  </div>
+                  <div className="text-sm text-gray-900 dark:text-white">
+                    {formatPriceForBooking(
+                      booking.amount_paid,
+                      booking.currency,
+                    )}
+                  </div>
+                </div>
+              )}
+              {booking.amount_due > 0 && (
+                <div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                    {__("Amount Due", "yatra")}
+                  </div>
+                  <div className="text-sm font-semibold text-amber-600 dark:text-amber-400">
+                    {formatPriceForBooking(
+                      booking.amount_due,
+                      booking.currency,
+                    )}
+                  </div>
+                </div>
+              )}
+              {booking.payment_schedule?.next_due_date && (
+                <div>
+                  <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                    {booking.payment_schedule.is_overdue
+                      ? __("Payment Overdue", "yatra")
+                      : __("Next Payment Due", "yatra")}
+                  </div>
+                  <div
+                    className={`text-sm font-semibold ${
+                      booking.payment_schedule.is_overdue
+                        ? "text-red-600 dark:text-red-400"
+                        : "text-gray-900 dark:text-white"
+                    }`}
+                  >
+                    {formatDate(booking.payment_schedule.next_due_date)}
+                  </div>
+                  {booking.payment_schedule.next_amount !== null && (
+                    <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {formatPriceForBooking(
+                        booking.payment_schedule.next_amount,
+                        booking.payment_schedule.currency || booking.currency,
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Instalment breakdown. Only worth a table when there is more than
+                one; a single balance is already shown above. */}
+            {(booking.payment_schedule?.installments?.length ?? 0) > 1 && (
+              <div className="mt-5 pt-5 border-t border-gray-100 dark:border-gray-700">
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+                  {__("Payment Schedule", "yatra")}
+                </div>
+                <ul className="divide-y divide-gray-100 dark:divide-gray-700">
+                  {booking.payment_schedule!.installments.map((item, index) => (
+                    <li
+                      key={`${item.due_date}-${index}`}
+                      className="flex items-center justify-between py-2 text-sm"
+                    >
+                      <span className="text-gray-600 dark:text-gray-300">
+                        {item.number !== null
+                          ? sprintf(
+                              /* translators: %d: instalment number. */
+                              __("Instalment %d", "yatra"),
+                              item.number,
+                            )
+                          : __("Balance", "yatra")}
+                        <span className="text-gray-400 dark:text-gray-500 ml-2">
+                          {formatDate(item.due_date)}
+                        </span>
+                      </span>
+                      <span className="text-gray-900 dark:text-white font-medium">
+                        {formatPriceForBooking(
+                          item.amount,
+                          booking.payment_schedule!.currency ||
+                            booking.currency,
+                        )}
+                        {item.status === "paid" && (
+                          <span className="text-green-600 dark:text-green-400 ml-2 text-xs">
+                            {__("Paid", "yatra")}
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                {booking.payment_schedule!.source === "projected" && (
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                    {__(
+                      "Expected dates based on the payment terms for this booking.",
+                      "yatra",
+                    )}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Timeline */}
+          <div className="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl shadow-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              {__("Timeline", "yatra")}
+            </h3>
+            <div className="space-y-3">
+              <div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                  {__("Created", "yatra")}
+                </div>
+                <div className="text-sm text-gray-900 dark:text-white">
+                  {formatDate(booking.created_at || booking.booking_date)}
+                </div>
+              </div>
+              {booking.updated_at &&
+                booking.updated_at !== booking.created_at && (
+                  <div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+                      {__("Last Updated", "yatra")}
+                    </div>
+                    <div className="text-sm text-gray-900 dark:text-white">
+                      {formatDate(booking.updated_at)}
+                    </div>
+                  </div>
+                )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default BookingDetails;
